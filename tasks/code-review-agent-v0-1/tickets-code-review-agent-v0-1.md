@@ -51,21 +51,21 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] **E2E checkpoint A — local webhook product path:** start the service on a real local socket, send signed GitHub-shaped HTTP requests without `TestClient` or a direct ASGI call, and assert the actual status/body plus eventual fake-publisher comment.
 - [x] Checkpoint A also exercises actual HTTP responses for invalid signature, ignored event, malformed eligible payload, and queue-full behavior.
 
-## [ ] Use GitHub App credentials for exact checkout and publication
+## [x] Use GitHub App credentials for exact checkout and publication
 
 **What to build:** The product path can authenticate as the configured GitHub App, materialize the exact accepted revision from the configured base repository—including fork pull requests—and create one real top-level pull-request comment without exposing or persisting credentials.
 
 **Blocked by:** Turn a signed GitHub webhook into an asynchronous review comment.
 
-- [ ] A narrow GitHub adapter obtains an ephemeral installation credential using the configured App identity and private key and scopes operations to the configured repository.
-- [ ] Repository materialization clones the configured base repository, fetches the accepted base commit and `refs/pull/<number>/head`, verifies the event's exact head commit exists, and checks it out detached.
-- [ ] A moved branch or newer PR head cannot replace `ReviewRequest.head_sha`, and failure to obtain either commit or their merge base fails the review.
-- [ ] Fork PRs work through the base repository's GitHub pull-request head ref without assuming the source branch exists in that repository.
-- [ ] Installation credentials never remain in clone URLs, Git configuration, prompts, logs, exceptions, sandbox mounts, or webhook responses.
-- [ ] The production publisher posts exactly one deterministic top-level comment after a successful review and performs no inline review, approval, requested-change, merge-state, or prior-comment update operation.
-- [ ] Mocked GitHub API contract tests cover authentication, credential failure, repository reads, comment creation, response failure, permission failure, and secret redaction without network access.
-- [ ] A real local-Git test proves checkout, manifest, runner input, grounding, typed result, and rendered comment all use the same merge-base-to-exact-head range.
-- [ ] **E2E checkpoint B prerequisite:** an opt-in profile can use a dedicated GitHub test repository and real GitHub App request/responses while substituting the deterministic fake Codex runner.
+- [x] A narrow GitHub adapter obtains an ephemeral installation credential using the configured App identity and private key and scopes operations to the configured repository.
+- [x] Repository materialization clones the configured base repository, fetches the accepted base commit and `refs/pull/<number>/head`, verifies the event's exact head commit exists, and checks it out detached.
+- [x] A moved branch or newer PR head cannot replace `ReviewRequest.head_sha`, and failure to obtain either commit or their merge base fails the review.
+- [x] Fork PRs work through the base repository's GitHub pull-request head ref without assuming the source branch exists in that repository.
+- [x] Installation credentials never remain in clone URLs, Git configuration, prompts, logs, exceptions, sandbox mounts, or webhook responses.
+- [x] The production publisher posts exactly one deterministic top-level comment after a successful review and performs no inline review, approval, requested-change, merge-state, or prior-comment update operation.
+- [x] Mocked GitHub API contract tests cover authentication, credential failure, repository reads, comment creation, response failure, permission failure, and secret redaction without network access.
+- [x] A real local-Git test proves checkout, manifest, runner input, grounding, typed result, and rendered comment all use the same merge-base-to-exact-head range.
+- [x] **E2E checkpoint B prerequisite:** an opt-in profile can use a dedicated GitHub test repository and real GitHub App request/responses while substituting the deterministic fake Codex runner.
 
 ## [ ] Reject reviews that exceed trusted input and output bounds
 

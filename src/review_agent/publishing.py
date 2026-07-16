@@ -7,7 +7,14 @@ GITHUB_COMMENT_MAX_BYTES = 65_536
 
 
 class ReviewPublisher(Protocol):
-    def publish(self, *, repository: str, pr_number: int, body: str) -> None: ...
+    def publish(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> None: ...
 
 
 def _longest_backtick_run(value: str) -> int:
@@ -109,9 +116,15 @@ def render_review_comment(result: ReviewResult) -> str:
     return comment
 
 
-def publish_review_result(result: ReviewResult, publisher: ReviewPublisher) -> None:
+def publish_review_result(
+    result: ReviewResult,
+    publisher: ReviewPublisher,
+    *,
+    installation_id: int,
+) -> None:
     publisher.publish(
         repository=result.repository,
         pr_number=result.pr_number,
+        installation_id=installation_id,
         body=render_review_comment(result),
     )

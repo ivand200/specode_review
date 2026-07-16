@@ -11,6 +11,7 @@ from review_agent import (
     DiffRange,
     FailureCategory,
     Finding,
+    GitHubRepository,
     Location,
     ReviewContext,
     Reviewer,
@@ -77,6 +78,25 @@ def _grounding_repository(root: Path) -> tuple[Path, str, str]:
     return repository, base_sha, head_sha
 
 
+def _github_pull_ref_repository(root: Path) -> tuple[Path, str, str, str, str]:
+    repository = root / "github-origin"
+    repository.mkdir()
+    _git(repository, "init", "--initial-branch=main")
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.com")
+    merge_base = _commit(repository, "shared.txt", "base\n", "base")
+
+    _git(repository, "switch", "-c", "fork-feature")
+    accepted_head = _commit(repository, "feature.txt", "accepted\n", "accepted head")
+    newer_head = _commit(repository, "feature.txt", "newer\n", "newer head")
+    _git(repository, "update-ref", "refs/pull/17/head", newer_head)
+
+    _git(repository, "switch", "main")
+    base_sha = _commit(repository, "main.txt", "main\n", "accepted base")
+    _git(repository, "branch", "-D", "fork-feature")
+    return repository, merge_base, base_sha, accepted_head, newer_head
+
+
 class CapturingRunner:
     def __init__(self) -> None:
         self.context: ReviewContext | None = None
@@ -124,11 +144,41 @@ class HistoryRunner:
         return AgentReview(findings=())
 
 
+class GitHubCapturingRunner:
+    def __init__(self) -> None:
+        self.context: ReviewContext | None = None
+        self.checked_out_head: str | None = None
+        self.remote_url: str | None = None
+
+    def run(self, context: ReviewContext) -> AgentReview:
+        self.context = context
+        self.checked_out_head = _git(context.checkout, "rev-parse", "HEAD")
+        self.remote_url = _git(context.checkout, "remote", "get-url", "origin")
+        return AgentReview(findings=(_finding(),))
+
+
+class FakeInstallationCredentials:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, int]] = []
+
+    def installation_token(self, *, repository: str, installation_id: int) -> str:
+        self.requests.append((repository, installation_id))
+        return "ghs_test_installation_token"
+
+
 class CapturingPublisher:
     def __init__(self) -> None:
         self.comments: list[tuple[str, int, str]] = []
 
-    def publish(self, *, repository: str, pr_number: int, body: str) -> None:
+    def publish(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> None:
+        del installation_id
         self.comments.append((repository, pr_number, body))
 
 
@@ -192,6 +242,80 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
     assert result.status == "no_important_issues"
     assert result.findings == ()
     assert not runner.context.workspace.exists()
+
+
+def test_github_materialization_uses_pull_ref_but_reviews_the_accepted_head(
+    tmp_path: Path,
+) -> None:
+    source, merge_base, base_sha, accepted_head, newer_head = _github_pull_ref_repository(tmp_path)
+    credentials = FakeInstallationCredentials()
+    runner = GitHubCapturingRunner()
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+        source_repository=GitHubRepository(
+            credentials=credentials,
+            clone_url=str(source),
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=accepted_head,
+        title="Fork contribution",
+    )
+
+    result = reviewer.review(request)
+    comment = render_review_comment(result)
+
+    assert credentials.requests == [("octo-org/example", 23)]
+    assert runner.context is not None
+    assert runner.checked_out_head == accepted_head
+    assert runner.checked_out_head != newer_head
+    assert runner.context.diff_range.start_sha == merge_base
+    assert runner.context.diff_range.end_sha == accepted_head
+    assert runner.context.manifest.diff_range is runner.context.diff_range
+    assert runner.context.manifest.paths == ("feature.txt",)
+    assert result.diff_range is runner.context.diff_range
+    assert result.findings == (_finding(),)
+    assert f"{merge_base}..{accepted_head}" in comment
+    assert runner.remote_url == str(source)
+    assert "ghs_test_installation_token" not in runner.remote_url
+
+
+def test_github_materialization_failure_redacts_credentials_and_cleans_workspace(
+    tmp_path: Path,
+) -> None:
+    credentials = FakeInstallationCredentials()
+    workspace_root = tmp_path / "workspaces"
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        workspace_root=workspace_root,
+        runner=CapturingRunner(),
+        source_repository=GitHubRepository(
+            credentials=credentials,
+            clone_url=str(tmp_path / "missing-origin"),
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="Unavailable repository",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.REPOSITORY_MATERIALIZATION
+    assert "ghs_test_installation_token" not in str(failure.value)
+    assert "ghs_test_installation_token" not in repr(failure.value.__cause__)
+    assert list(workspace_root.iterdir()) == []
 
 
 def test_repository_failure_is_normalized_and_cleans_the_workspace(tmp_path: Path) -> None:
@@ -640,11 +764,11 @@ def test_publish_review_result_creates_exactly_one_comment_for_each_success() ->
         update={"status": "issues_found", "findings": (_finding(),)},
     )
 
-    publish_review_result(clean_result, publisher)
+    publish_review_result(clean_result, publisher, installation_id=23)
     assert publisher.comments == [("octo-org/example", 17, render_review_comment(clean_result))]
 
     publisher.comments.clear()
-    publish_review_result(findings_result, publisher)
+    publish_review_result(findings_result, publisher, installation_id=23)
     assert publisher.comments == [("octo-org/example", 17, render_review_comment(findings_result))]
 
 

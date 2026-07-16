@@ -9,11 +9,8 @@ from typing import Protocol
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from review_agent.models import ReviewRequest, ReviewResult
+from review_agent.models import ReviewRequest, ReviewResult, bound_description
 from review_agent.publishing import ReviewPublisher, publish_review_result
-
-DESCRIPTION_MAX_CHARS = 10_000
-DESCRIPTION_TRUNCATION_MARKER = "\n\n[truncated]"
 
 
 class ReviewService(Protocol):
@@ -29,7 +26,12 @@ async def _review_worker(
         request = await queue.get()
         try:
             result = await asyncio.to_thread(reviewer.review, request)
-            await asyncio.to_thread(publish_review_result, result, publisher)
+            await asyncio.to_thread(
+                publish_review_result,
+                result,
+                publisher,
+                installation_id=request.installation_id,
+            )
         finally:
             queue.task_done()
 
@@ -41,15 +43,6 @@ def _review_request_from_payload(payload: object) -> ReviewRequest:
     pull_request = payload["pull_request"]
     installation = payload["installation"]
     repository = payload["repository"]
-    description = pull_request.get("body")
-    if description is None:
-        description = ""
-    if not isinstance(description, str):
-        msg = "pull request description must be a string or null"
-        raise TypeError(msg)
-    if len(description) > DESCRIPTION_MAX_CHARS:
-        prefix_length = DESCRIPTION_MAX_CHARS - len(DESCRIPTION_TRUNCATION_MARKER)
-        description = f"{description[:prefix_length]}{DESCRIPTION_TRUNCATION_MARKER}"
     return ReviewRequest(
         repository=repository["full_name"],
         pr_number=pull_request["number"],
@@ -57,7 +50,7 @@ def _review_request_from_payload(payload: object) -> ReviewRequest:
         base_sha=pull_request["base"]["sha"],
         head_sha=pull_request["head"]["sha"],
         title=pull_request["title"],
-        description=description,
+        description=bound_description(pull_request.get("body")),
     )
 
 

@@ -65,7 +65,15 @@ class CapturingPublisher:
         self.comments: list[tuple[str, int, str]] = []
         self.published = threading.Event()
 
-    def publish(self, *, repository: str, pr_number: int, body: str) -> None:
+    def publish(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> None:
+        del installation_id
         self.comments.append((repository, pr_number, body))
         self.published.set()
 

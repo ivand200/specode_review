@@ -1,5 +1,12 @@
-from review_agent.core import ChangedPathManifest, ReviewContext, Reviewer, ReviewRunner
+from review_agent.core import (
+    ChangedPathManifest,
+    GitHubRepository,
+    ReviewContext,
+    Reviewer,
+    ReviewRunner,
+)
 from review_agent.errors import FailureCategory, ReviewError
+from review_agent.github import GitHubAppClient, GitHubError
 from review_agent.models import (
     AgentReview,
     DiffRange,
@@ -20,6 +27,9 @@ __all__ = [
     "DiffRange",
     "FailureCategory",
     "Finding",
+    "GitHubAppClient",
+    "GitHubError",
+    "GitHubRepository",
     "Location",
     "ReviewContext",
     "ReviewError",

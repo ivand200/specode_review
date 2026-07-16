@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tempfile
@@ -31,14 +32,24 @@ class ReviewRunner(Protocol):
     def run(self, context: ReviewContext) -> AgentReview: ...
 
 
+class InstallationCredentials(Protocol):
+    def installation_token(self, *, repository: str, installation_id: int) -> str: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubRepository:
+    credentials: InstallationCredentials
+    clone_url: str | None = None
+
+
 class Reviewer:
     def __init__(
         self,
         *,
         repository: str,
-        source_repository: Path,
         workspace_root: Path,
         runner: ReviewRunner,
+        source_repository: Path | GitHubRepository,
     ) -> None:
         self._repository = repository
         self._source_repository = source_repository
@@ -62,7 +73,7 @@ class Reviewer:
         checkout = workspace / "checkout"
         try:
             try:
-                self._clone(checkout)
+                self._materialize_repository(workspace, checkout, request)
                 self._git(checkout, "cat-file", "-e", f"{request.base_sha}^{{commit}}")
                 self._git(checkout, "cat-file", "-e", f"{request.head_sha}^{{commit}}")
                 self._git(checkout, "checkout", "--detach", request.head_sha)
@@ -80,7 +91,7 @@ class Reviewer:
                     diff_range=diff_range,
                     paths=self._changed_paths(checkout, diff_range),
                 )
-            except (OSError, subprocess.SubprocessError, ValueError) as error:
+            except Exception as error:
                 raise ReviewError(
                     FailureCategory.REPOSITORY_MATERIALIZATION,
                     stage="repository_materialization",
@@ -131,7 +142,21 @@ class Reviewer:
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
 
-    def _clone(self, checkout: Path) -> None:
+    def _materialize_repository(
+        self,
+        workspace: Path,
+        checkout: Path,
+        request: ReviewRequest,
+    ) -> None:
+        if isinstance(self._source_repository, Path):
+            self._clone_local(checkout)
+            return
+        self._clone_github(workspace, checkout, request, self._source_repository)
+
+    def _clone_local(self, checkout: Path) -> None:
+        if not isinstance(self._source_repository, Path):
+            message = "local repository source is not configured"
+            raise TypeError(message)
         subprocess.run(  # noqa: S603 - arguments are structured and commit SHAs are validated.
             [
                 self._git_executable,
@@ -144,6 +169,81 @@ class Reviewer:
             check=True,
             capture_output=True,
             text=True,
+        )
+
+    def _clone_github(
+        self,
+        workspace: Path,
+        checkout: Path,
+        request: ReviewRequest,
+        source: GitHubRepository,
+    ) -> None:
+        token = source.credentials.installation_token(
+            repository=request.repository,
+            installation_id=request.installation_id,
+        )
+        clone_url = source.clone_url or f"https://github.com/{self._repository}.git"
+        askpass = workspace / "github-askpass.sh"
+        askpass.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  *Username*) printf "%s\\n" "x-access-token" ;;\n'
+            '  *Password*) printf "%s\\n" "$REVIEW_AGENT_GITHUB_TOKEN" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        askpass.chmod(0o700)
+        environment = {
+            **os.environ,
+            "GIT_ASKPASS": str(askpass),
+            "GIT_TERMINAL_PROMPT": "0",
+            "REVIEW_AGENT_GITHUB_TOKEN": token,
+        }
+        try:
+            self._authenticated_git(
+                environment,
+                "clone",
+                "--no-checkout",
+                "--no-local",
+                clone_url,
+                str(checkout),
+            )
+            self._authenticated_git(
+                environment,
+                "-C",
+                str(checkout),
+                "fetch",
+                "--no-tags",
+                "origin",
+                request.base_sha,
+            )
+            self._authenticated_git(
+                environment,
+                "-C",
+                str(checkout),
+                "fetch",
+                "--no-tags",
+                "origin",
+                f"refs/pull/{request.pr_number}/head",
+            )
+        finally:
+            askpass.unlink(missing_ok=True)
+
+    def _authenticated_git(self, environment: dict[str, str], *arguments: str) -> None:
+        subprocess.run(  # noqa: S603 - never invokes a shell and keeps credentials out of argv.
+            [
+                self._git_executable,
+                "-c",
+                "credential.helper=",
+                "-c",
+                "core.hooksPath=/dev/null",
+                *arguments,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
         )
 
     def _git(self, repository: Path, *arguments: str) -> str:
