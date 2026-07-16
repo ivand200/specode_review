@@ -9,6 +9,8 @@ import httpx
 import jwt
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from review_agent.deadline import remaining_review_time
+from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import ReviewRequest, Sha, bound_description
 
 GITHUB_API_VERSION = "2026-03-10"
@@ -114,16 +116,31 @@ class GitHubAppClient:
             "Authorization": f"Bearer {request.bearer}",
             "X-GitHub-Api-Version": GITHUB_API_VERSION,
         }
+        timeout = remaining_review_time(stage=request.operation.value)
+        request_options: dict[str, Any] = {}
+        if timeout is not None:
+            request_options["timeout"] = timeout
         try:
             if request.json_body is None:
-                response = self._http.request(request.method, request.path, headers=headers)
+                response = self._http.request(
+                    request.method,
+                    request.path,
+                    headers=headers,
+                    **request_options,
+                )
             else:
                 response = self._http.request(
                     request.method,
                     request.path,
                     headers=headers,
                     json=request.json_body,
+                    **request_options,
                 )
+        except httpx.TimeoutException:
+            raise ReviewError(
+                FailureCategory.TIMEOUT,
+                stage=request.operation.value,
+            ) from None
         except httpx.HTTPError:
             raise GitHubError(request.operation) from None
         if response.status_code != request.expected_status:

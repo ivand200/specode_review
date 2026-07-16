@@ -81,21 +81,21 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] Tests prove each boundary at its exact limit and immediately beyond it, including binary changes and multibyte text where byte and character limits differ.
 - [x] Configuration and documentation claim only limits the implementation can enforce; unsupported Codex request or tool-call limits are not presented as guarantees.
 
-## [ ] Keep the single worker bounded and failure-isolated
+## [x] Keep the single worker bounded and failure-isolated
 
 **What to build:** A burst or failed attempt cannot create parallel review work, block the worker forever, or prevent later queued requests from completing. Operators receive bounded HTTP behavior and normalized diagnostics while the in-memory, non-durable V0.1 contract remains explicit.
 
 **Blocked by:** Turn a signed GitHub webhook into an asynchronous review comment.
 
-- [ ] The queue capacity is exactly ten `ReviewRequest` values, preserves FIFO order, and returns `503 Service Unavailable` without claiming acceptance when full.
-- [ ] Scheduler tests prove no more than one invocation of the review Interface—including publication—is active at a time.
-- [ ] One configured deadline, defaulting to 15 minutes, covers credential acquisition, materialization, sandbox work, validation, publication, and normal cleanup; every operation receives only its remaining time.
-- [ ] Review, validation, timeout, cancellation, and publication failures publish no final comment for that attempt, call `task_done`, and do not stop later queued work.
-- [ ] Failures are logged with repository, PR number, exact head SHA, stage, and normalized error category, without credentials, source content, prompt contents, or raw model output.
-- [ ] Graceful shutdown stops accepting new work and gives the active review a bounded opportunity to finish; abrupt termination and lost queued/active work remain documented limitations.
-- [ ] Cleanup remains in the review Module's `finally` path so a scheduler timeout cannot bypass forced sandbox and workspace removal during normal process operation.
-- [ ] **E2E checkpoint B — live GitHub transport with controlled review:** run the service on a real local socket, send a signed webhook referencing a real PR in the dedicated test repository, and assert the actual `202` response, exact accepted head SHA, real GitHub App clone/fetch and comment request/responses, and expected PR comment from the fake runner.
-- [ ] Checkpoint B is opt-in, isolated to the dedicated repository, records created external resources for cleanup, and requires no Docker Sandbox, OpenAI authentication, or model budget.
+- [x] The queue capacity is exactly ten `ReviewRequest` values, preserves FIFO order, and returns `503 Service Unavailable` without claiming acceptance when full.
+- [x] Scheduler tests prove no more than one invocation of the review Interface—including publication—is active at a time.
+- [x] One configured deadline, defaulting to 15 minutes, covers credential acquisition, materialization, sandbox work, validation, publication, and normal cleanup; every operation receives only its remaining time.
+- [x] Review, validation, timeout, cancellation, and publication failures publish no final comment for that attempt, call `task_done`, and do not stop later queued work.
+- [x] Failures are logged with repository, PR number, exact head SHA, stage, and normalized error category, without credentials, source content, prompt contents, or raw model output.
+- [x] Graceful shutdown stops accepting new work and gives the active review a bounded opportunity to finish; abrupt termination and lost queued/active work remain documented limitations.
+- [x] Cleanup remains in the review Module's `finally` path so a scheduler timeout cannot bypass forced sandbox and workspace removal during normal process operation.
+- [x] **E2E checkpoint B — live GitHub transport with controlled review:** run the service on a real local socket, send a signed webhook referencing a real PR in the dedicated test repository, and assert the actual `202` response, exact accepted head SHA, real GitHub App clone/fetch and comment request/responses, and expected PR comment from the fake runner.
+- [x] Checkpoint B is opt-in, isolated to the dedicated repository, records created external resources for cleanup, and requires no Docker Sandbox, OpenAI authentication, or model budget.
 
 ## [ ] Prove disposable sandbox lifecycle without a model call
 

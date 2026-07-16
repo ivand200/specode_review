@@ -9,6 +9,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from review_agent import DiffRange, ReviewResult, publish_review_result, render_review_comment
+from review_agent.deadline import ReviewDeadline, review_deadline_scope
+from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient, GitHubError
 
 
@@ -184,6 +186,37 @@ def test_credential_failure_is_normalized_without_secret_material(tmp_path: Path
     assert failure.value.status_code == 403
     assert str(failure.value) == "GitHub installation_token failed with status 403"
     assert leaked_material not in str(failure.value)
+
+
+def test_github_transport_timeout_preserves_the_review_deadline_category(tmp_path: Path) -> None:
+    private_key_path, _ = _private_key(tmp_path)
+
+    def time_out(request: httpx.Request) -> httpx.Response:
+        message = "untrusted response detail"
+        raise httpx.ReadTimeout(message, request=request)
+
+    github = GitHubAppClient(
+        repository="octo-org/example",
+        app_id=12345,
+        private_key_path=private_key_path,
+        http_client=httpx.Client(
+            base_url="https://api.github.test",
+            transport=httpx.MockTransport(time_out),
+        ),
+    )
+
+    with (
+        review_deadline_scope(ReviewDeadline.after(1)),
+        pytest.raises(ReviewError) as failure,
+    ):
+        github.installation_token(
+            repository="octo-org/example",
+            installation_id=23,
+        )
+
+    assert failure.value.category is FailureCategory.TIMEOUT
+    assert failure.value.stage == "installation_token"
+    assert "untrusted response detail" not in str(failure.value)
 
 
 def test_publication_permission_failure_is_normalized_and_redacted(tmp_path: Path) -> None:

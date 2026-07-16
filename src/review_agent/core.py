@@ -11,6 +11,7 @@ from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
+from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
 
@@ -103,6 +104,7 @@ class Reviewer:
         self._git_executable = git_executable
 
     def review(self, request: ReviewRequest) -> ReviewResult:
+        remaining_review_time(stage="review")
         if request.repository != self._repository:
             msg = "request repository does not match the configured repository"
             raise ValueError(msg)
@@ -114,7 +116,9 @@ class Reviewer:
             context = self._prepare_context(workspace, checkout, request)
             candidate = self._candidate_from_runner(context)
             try:
+                remaining_review_time(stage="candidate_grounding")
                 self._ground_candidate(checkout, context.manifest, candidate)
+                remaining_review_time(stage="candidate_grounding")
             except (OSError, RuntimeError, ValueError) as error:
                 raise ReviewError(
                     FailureCategory.INVALID_MODEL_OUTPUT,
@@ -155,6 +159,8 @@ class Reviewer:
                 changed_files=len(changed_paths),
                 changed_text_lines=self._changed_text_lines(checkout, diff_range),
             )
+        except ReviewError:
+            raise
         except Exception as error:
             raise ReviewError(
                 FailureCategory.REPOSITORY_MATERIALIZATION,
@@ -175,10 +181,12 @@ class Reviewer:
         )
 
     def _candidate_from_runner(self, context: ReviewContext) -> AgentReview:
+        remaining_review_time(stage="review_runner")
         try:
             raw_candidate = self._runner.run(context)
         except TimeoutError as error:
             raise ReviewError(FailureCategory.TIMEOUT, stage="review_runner") from error
+        remaining_review_time(stage="review_runner")
         try:
             candidate_bytes = self._candidate_bytes(raw_candidate)
         except (TypeError, ValueError) as error:
@@ -320,6 +328,7 @@ class Reviewer:
         *,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
+        remaining_review_time(stage="repository_materialization")
         process = subprocess.Popen(  # noqa: S603 - arguments are structured and never use a shell.
             arguments,
             stdout=subprocess.PIPE,
@@ -338,7 +347,8 @@ class Reviewer:
         exceeded = False
         try:
             while selector.get_map():
-                for key, _events in selector.select():
+                timeout = remaining_review_time(stage="repository_materialization")
+                for key, _events in selector.select(timeout):
                     remaining = self._limits.process_output_max_bytes - total_bytes
                     chunk = os.read(key.fd, min(65_536, remaining + 1))
                     if not chunk:
@@ -352,7 +362,7 @@ class Reviewer:
                     captured[str(key.data)].extend(chunk)
                 if exceeded:
                     break
-            return_code = process.wait()
+            return_code = self._wait_for_process(process)
         finally:
             selector.close()
             if process.poll() is None:
@@ -377,6 +387,17 @@ class Reviewer:
                 stderr=completed.stderr,
             )
         return completed
+
+    @staticmethod
+    def _wait_for_process(process: subprocess.Popen[bytes]) -> int:
+        wait_timeout = remaining_review_time(stage="repository_materialization")
+        try:
+            return process.wait(timeout=wait_timeout)
+        except subprocess.TimeoutExpired as error:
+            raise ReviewError(
+                FailureCategory.TIMEOUT,
+                stage="repository_materialization",
+            ) from error
 
     @staticmethod
     def _ensure_exact_head(actual_head: str, expected_head: str) -> None:
