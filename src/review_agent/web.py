@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Protocol
 
@@ -220,13 +220,15 @@ async def _accept_github_webhook(
     return JSONResponse({"status": "accepted"}, status_code=status.HTTP_202_ACCEPTED)
 
 
-def create_app(
+def create_app(  # noqa: PLR0913 - explicit application boundary dependencies.
     *,
     repository: str,
     webhook_secret: str,
     reviewer: ReviewService,
     publisher: ReviewPublisher,
     review_timeout_seconds: float = DEFAULT_REVIEW_TIMEOUT_SECONDS,
+    startup_check: Callable[[], None] | None = None,
+    shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
     if review_timeout_seconds <= 0:
         message = "review timeout must be positive"
@@ -234,6 +236,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if startup_check is not None:
+            startup_check()
         queue: asyncio.Queue[ReviewRequest | None] = asyncio.Queue(maxsize=10)
         stopping = asyncio.Event()
         app.state.review_queue = queue
@@ -250,19 +254,23 @@ def create_app(
         try:
             yield
         finally:
-            app.state.accepting_reviews = False
-            stopping.set()
-            if queue.empty():
-                queue.put_nowait(None)
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(worker),
-                    timeout=review_timeout_seconds,
-                )
-            except TimeoutError:
-                worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker
+                app.state.accepting_reviews = False
+                stopping.set()
+                if queue.empty():
+                    queue.put_nowait(None)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(worker),
+                        timeout=review_timeout_seconds,
+                    )
+                except TimeoutError:
+                    worker.cancel()
+                with suppress(asyncio.CancelledError):
+                    await worker
+            finally:
+                if shutdown_callback is not None:
+                    shutdown_callback()
 
     app = FastAPI(lifespan=lifespan)
 

@@ -11,6 +11,9 @@ dependencies = [
     "uvicorn>=0.35,<1",
 ]
 
+[project.scripts]
+review-agent = "review_agent.production:main"
+
 [dependency-groups]
 dev = [
     "mypy>=1.18,<2",
@@ -28,6 +31,7 @@ addopts = "-ra"
 markers = [
     "docker_sandbox: opt-in tests that create disposable Docker Sandbox microVMs without a model call",
     "live_github: opt-in tests that use a dedicated GitHub repository and create comments",
+    "live_full: cost-bearing opt-in test of GitHub, Docker Sandbox, Codex, and publication",
 ]
 
 [tool.ruff]
