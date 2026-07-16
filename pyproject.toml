@@ -26,6 +26,7 @@ build-backend = "uv_build"
 testpaths = ["tests"]
 addopts = "-ra"
 markers = [
+    "docker_sandbox: opt-in tests that create disposable Docker Sandbox microVMs without a model call",
     "live_github: opt-in tests that use a dedicated GitHub repository and create comments",
 ]
 

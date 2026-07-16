@@ -27,3 +27,15 @@ result and appends its repository, pull-request number, and cleanup instruction 
 `E2E_CREATED_RESOURCES_PATH`. Remove the recorded comment manually when it is no longer
 useful. Abrupt termination can occur after GitHub creates the comment but before the
 cleanup record is written, so inspect the dedicated pull request after any interrupted run.
+
+## Docker Sandbox lifecycle profile
+
+The no-model Docker profile creates disposable shell sandboxes, denies their outbound
+network access, verifies the host checkout mount is read-only, copies it into writable VM
+storage, checks the exact Git head, mutates the VM-local copy, and proves removal, timeout
+cleanup, fresh sequential state, and strict orphan sweeping. It requires a working, signed-in
+Docker Sandboxes runtime but no OpenAI authentication or model budget.
+
+Run it explicitly with:
+
+    RUN_DOCKER_SANDBOX_E2E=1 uv run pytest tests/integration/test_sandbox_lifecycle.py -q

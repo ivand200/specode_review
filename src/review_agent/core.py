@@ -1,13 +1,14 @@
 import json
 import os
+import re
 import selectors
 import shutil
 import subprocess
-import tempfile
+import uuid
 from dataclasses import dataclass, field
 from os.path import lexists
 from pathlib import Path, PurePosixPath
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import ValidationError
 
@@ -19,6 +20,8 @@ MAX_CHANGED_FILES = 100
 MAX_CHANGED_TEXT_LINES = 5_000
 CANDIDATE_OUTPUT_MAX_BYTES = 65_536
 PROCESS_OUTPUT_MAX_BYTES = 1_048_576
+WORKSPACE_PREFIX = "review-agent-workspace-"
+_OWNED_WORKSPACE = re.compile(rf"^{re.escape(WORKSPACE_PREFIX)}[0-9a-f]{{32}}$")
 
 
 class _ProcessOutputLimitError(Exception):
@@ -70,6 +73,11 @@ class ReviewRunner(Protocol):
     def run(self, context: ReviewContext) -> object: ...
 
 
+@runtime_checkable
+class _OrphanSweeper(Protocol):
+    def sweep_orphans(self) -> None: ...
+
+
 class InstallationCredentials(Protocol):
     def installation_token(self, *, repository: str, installation_id: int) -> str: ...
 
@@ -95,6 +103,10 @@ class Reviewer:
         self._workspace_root = workspace_root
         self._runner = runner
         self._limits = limits or ReviewLimits()
+        self._workspace_root.mkdir(parents=True, exist_ok=True)
+        self._sweep_orphan_workspaces()
+        if isinstance(self._runner, _OrphanSweeper):
+            self._runner.sweep_orphans()
         git_executable = shutil.which("git")
         if git_executable is None:
             raise ReviewError(
@@ -109,8 +121,7 @@ class Reviewer:
             msg = "request repository does not match the configured repository"
             raise ValueError(msg)
 
-        self._workspace_root.mkdir(parents=True, exist_ok=True)
-        workspace = Path(tempfile.mkdtemp(prefix="review-", dir=self._workspace_root))
+        workspace = self._create_workspace()
         checkout = workspace / "checkout"
         try:
             context = self._prepare_context(workspace, checkout, request)
@@ -136,6 +147,29 @@ class Reviewer:
             )
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    def _create_workspace(self) -> Path:
+        for _attempt in range(10):
+            workspace = self._workspace_root / f"{WORKSPACE_PREFIX}{uuid.uuid4().hex}"
+            try:
+                workspace.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            return workspace
+        message = "could not allocate a unique review workspace"
+        raise ReviewError(
+            FailureCategory.REVIEW_FAILURE,
+            stage="workspace_allocation",
+        ) from RuntimeError(message)
+
+    def _sweep_orphan_workspaces(self) -> None:
+        for entry in self._workspace_root.iterdir():
+            if (
+                _OWNED_WORKSPACE.fullmatch(entry.name) is not None
+                and entry.is_dir()
+                and not entry.is_symlink()
+            ):
+                shutil.rmtree(entry)
 
     def _prepare_context(
         self,

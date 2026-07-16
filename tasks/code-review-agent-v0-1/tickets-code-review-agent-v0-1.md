@@ -97,20 +97,20 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] **E2E checkpoint B — live GitHub transport with controlled review:** run the service on a real local socket, send a signed webhook referencing a real PR in the dedicated test repository, and assert the actual `202` response, exact accepted head SHA, real GitHub App clone/fetch and comment request/responses, and expected PR comment from the fake runner.
 - [x] Checkpoint B is opt-in, isolated to the dedicated repository, records created external resources for cleanup, and requires no Docker Sandbox, OpenAI authentication, or model budget.
 
-## [ ] Prove disposable sandbox lifecycle without a model call
+## [x] Prove disposable sandbox lifecycle without a model call
 
 **What to build:** The service can create and destroy a uniquely named Docker Sandbox around a frozen review checkout while proving the host checkout is read-only, the VM-local working copy is writable and exact, and no state crosses review attempts. This integration slice does not call a model.
 
 **Blocked by:** Review an exact local PR revision through the typed Interface.
 
-- [ ] Each attempt creates one sandbox under the application-owned naming prefix and mounts only the frozen checkout read-only plus a request-specific application control directory read-write.
-- [ ] Setup copies the checkout into VM-local writable storage and verifies its `HEAD` equals `ReviewRequest.head_sha` before any autonomous execution could start.
-- [ ] The sandbox applies configured CPU, memory, process/output, and deny-by-default network limits without placing GitHub or raw OpenAI credentials in its filesystem or environment.
-- [ ] Success, setup failure, command failure, timeout, cancellation, and validation failure all attempt `sbx rm --force` and host-workspace cleanup from a `finally` path.
-- [ ] The host checkout's content and Git state are unchanged after mutation and deletion inside the VM-local copy.
-- [ ] Two sequential attempts use distinct fresh sandboxes and prove that a marker written by the first is absent from the second.
-- [ ] Startup sweeping removes only abandoned sandboxes and workspace directories matching both the dedicated root/prefix and the application's strict naming convention.
-- [ ] The no-model integration test exercises forced timeout cleanup and orphan sweeping and is separately marked from normal tests that require no Docker runtime.
+- [x] Each attempt creates one sandbox under the application-owned naming prefix and mounts only the frozen checkout read-only plus a request-specific application control directory read-write.
+- [x] Setup copies the checkout into VM-local writable storage and verifies its `HEAD` equals `ReviewRequest.head_sha` before any autonomous execution could start.
+- [x] The sandbox applies configured CPU, memory, process/output, and deny-by-default network limits without placing GitHub or raw OpenAI credentials in its filesystem or environment.
+- [x] Success, setup failure, command failure, timeout, cancellation, and validation failure all attempt `sbx rm --force` and host-workspace cleanup from a `finally` path.
+- [x] The host checkout's content and Git state are unchanged after mutation and deletion inside the VM-local copy.
+- [x] Two sequential attempts use distinct fresh sandboxes and prove that a marker written by the first is absent from the second.
+- [x] Startup sweeping removes only abandoned sandboxes and workspace directories matching both the dedicated root/prefix and the application's strict naming convention.
+- [x] The no-model integration test exercises forced timeout cleanup and orphan sweeping and is separately marked from normal tests that require no Docker runtime.
 
 ## [ ] Return a typed Codex review from the isolated sandbox
 

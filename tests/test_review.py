@@ -22,6 +22,7 @@ from review_agent import (
     publish_review_result,
     render_review_comment,
 )
+from review_agent.sandbox import SandboxLifecycleRunner
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -173,6 +174,63 @@ class HistoryRunner:
         return AgentReview(findings=())
 
 
+class RecordingSandboxClient:
+    def __init__(  # noqa: PLR0913 - test boundary controls independent failure modes.
+        self,
+        *,
+        head_sha: str,
+        existing_names: tuple[str, ...] = (),
+        command_outputs: dict[tuple[str, ...], bytes] | None = None,
+        command_errors: dict[tuple[str, ...], BaseException] | None = None,
+        create_error: Exception | None = None,
+        remove_error: Exception | None = None,
+    ) -> None:
+        self.head_sha = head_sha
+        self.existing_names = existing_names
+        self.command_outputs = command_outputs or {}
+        self.command_errors = command_errors or {}
+        self.create_error = create_error
+        self.remove_error = remove_error
+        self.created: list[tuple[str, Path, Path, SandboxResourceLimits]] = []
+        self.executed: list[tuple[str, tuple[str, ...], str | None, int]] = []
+        self.removed: list[str] = []
+
+    def create(
+        self,
+        *,
+        name: str,
+        control: Path,
+        checkout: Path,
+        resources: SandboxResourceLimits,
+    ) -> None:
+        self.created.append((name, control, checkout, resources))
+        if self.create_error is not None:
+            raise self.create_error
+
+    def execute(
+        self,
+        *,
+        name: str,
+        command: tuple[str, ...],
+        workdir: str | None,
+        process_limit: int,
+    ) -> bytes:
+        self.executed.append((name, command, workdir, process_limit))
+        if error := self.command_errors.get(command):
+            raise error
+        if command == ("git", "rev-parse", "HEAD"):
+            return f"{self.head_sha}\n".encode()
+        return self.command_outputs.get(command, b"")
+
+    def remove(self, name: str) -> None:
+        self.removed.append(name)
+        if self.remove_error is not None:
+            raise self.remove_error
+
+    def list_names(self) -> tuple[str, ...]:
+        return self.existing_names
+
+
 class GitHubCapturingRunner:
     def __init__(self) -> None:
         self.context: ReviewContext | None = None
@@ -295,6 +353,315 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
     assert result.status == "no_important_issues"
     assert result.findings == ()
     assert not runner.context.workspace.exists()
+
+
+def test_review_creates_exact_writable_sandbox_copy_and_removes_it(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    client = RecordingSandboxClient(head_sha=head_sha)
+    runner = SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-")
+    resources = SandboxResourceLimits(cpus=3, memory_mib=2_048, pids=64)
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+        limits=ReviewLimits(sandbox_resources=resources),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Isolate the review",
+    )
+
+    result = reviewer.review(request)
+
+    assert result.status == "no_important_issues"
+    assert len(client.created) == 1
+    sandbox_name, control, checkout, applied_resources = client.created[0]
+    assert sandbox_name.startswith("review-agent-")
+    assert control.name == "control"
+    assert checkout.name == "checkout"
+    assert applied_resources is resources
+    assert client.executed == [
+        (
+            sandbox_name,
+            (
+                "sh",
+                "-c",
+                'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
+                "review-agent-read-only-check",
+                str(checkout),
+            ),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("mkdir", "-p", "/home/agent/review/repo"),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("cp", "-a", f"{checkout}/.", "/home/agent/review/repo"),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("git", "rev-parse", "HEAD"),
+            "/home/agent/review/repo",
+            64,
+        ),
+    ]
+    assert client.removed == [sandbox_name]
+
+
+def test_review_rejects_an_inexact_sandbox_copy_after_forced_removal(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    client = RecordingSandboxClient(head_sha="f" * 40)
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Reject an inexact sandbox copy",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "sandbox_head_verification"
+    assert len(client.removed) == 1
+    assert client.removed[0] == client.created[0][0]
+
+
+def test_sandbox_startup_sweep_removes_only_strictly_owned_names(tmp_path: Path) -> None:
+    owned = "review-agent-" + "a" * 32
+    client = RecordingSandboxClient(
+        head_sha="f" * 40,
+        existing_names=(
+            owned,
+            "review-agent-not-a-uuid",
+            "other-" + "b" * 32,
+        ),
+    )
+    runner = SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-")
+
+    Reviewer(
+        repository="octo-org/example",
+        source_repository=tmp_path / "unused-origin",
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+    )
+
+    assert client.removed == [owned]
+
+
+def test_reviewer_startup_sweep_removes_only_strictly_owned_workspaces(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    owned = workspace_root / ("review-agent-workspace-" + "a" * 32)
+    similarly_named = workspace_root / "review-agent-workspace-not-a-uuid"
+    unrelated = workspace_root / ("other-" + "b" * 32)
+    owned.mkdir()
+    similarly_named.mkdir()
+    unrelated.mkdir()
+
+    Reviewer(
+        repository="octo-org/example",
+        source_repository=tmp_path / "unused-origin",
+        workspace_root=workspace_root,
+        runner=CapturingRunner(),
+    )
+
+    assert not owned.exists()
+    assert similarly_named.exists()
+    assert unrelated.exists()
+
+
+def test_review_returns_only_the_candidate_from_the_vm_local_copy(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    review_command = ("sh", "-c", "rm feature.txt; printf '{\"findings\":[]}'")
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        command_outputs={review_command: b'{"findings":[]}'},
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(
+            client=client,
+            sandbox_prefix="review-agent-",
+            review_command=review_command,
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Run a no-model sandbox probe",
+    )
+
+    result = reviewer.review(request)
+
+    assert result.status == "no_important_issues"
+    assert client.executed[-1][1] == review_command
+    assert client.executed[-1][2] == "/home/agent/review/repo"
+    assert _git(source, "show", f"{head_sha}:feature.txt") == "feature"
+    assert _git(source, "status", "--short") == ""
+    assert len(client.removed) == 1
+
+
+def test_review_fails_when_forced_sandbox_removal_fails(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        remove_error=RuntimeError("untrusted cleanup detail"),
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Require sandbox cleanup",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "sandbox_cleanup"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type", "expected_category"),
+    [
+        (RuntimeError("command failed"), ReviewError, FailureCategory.SANDBOX_LIFECYCLE),
+        (TimeoutError(), ReviewError, FailureCategory.TIMEOUT),
+        (asyncio.CancelledError(), asyncio.CancelledError, None),
+    ],
+)
+def test_sandbox_command_terminal_failures_force_removal(
+    tmp_path: Path,
+    error: BaseException,
+    expected_type: type[BaseException],
+    expected_category: FailureCategory | None,
+) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    review_command = ("probe",)
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        command_errors={review_command: error},
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(
+            client=client,
+            sandbox_prefix="review-agent-",
+            review_command=review_command,
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Exercise terminal sandbox failure",
+    )
+
+    with pytest.raises(expected_type) as failure:
+        reviewer.review(request)
+
+    if expected_category is not None:
+        assert isinstance(failure.value, ReviewError)
+        assert failure.value.category is expected_category
+    assert len(client.removed) == 1
+
+
+def test_invalid_sandbox_candidate_is_rejected_after_forced_removal(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    review_command = ("probe",)
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        command_outputs={review_command: b"not-json"},
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(
+            client=client,
+            sandbox_prefix="review-agent-",
+            review_command=review_command,
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Reject invalid sandbox output",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
+    assert client.removed == [client.created[0][0]]
+
+
+def test_sandbox_setup_failure_still_attempts_forced_removal(tmp_path: Path) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        create_error=RuntimeError("setup failed"),
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Fail sandbox setup safely",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert client.removed == [client.created[0][0]]
 
 
 def test_review_rejects_more_than_one_hundred_changed_files_before_the_runner(
