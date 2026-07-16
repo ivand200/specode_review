@@ -112,20 +112,20 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] Startup sweeping removes only abandoned sandboxes and workspace directories matching both the dedicated root/prefix and the application's strict naming convention.
 - [x] The no-model integration test exercises forced timeout cleanup and orphan sweeping and is separately marked from normal tests that require no Docker runtime.
 
-## [ ] Return a typed Codex review from the isolated sandbox
+## [x] Return a typed Codex review from the isolated sandbox
 
 **What to build:** The production `CodexSandboxRunner` invokes Codex once inside a disposable microVM using trusted application-owned review policy, then returns only a bounded schema-constrained candidate to the existing validation, grounding, result, and publication path.
 
 **Blocked by:** Publish only grounded findings as deterministic Markdown; Reject reviews that exceed trusted input and output bounds; Keep the single worker bounded and failure-isolated; Prove disposable sandbox lifecycle without a model call.
 
-- [ ] The pinned application-owned mixin kit supplies root instructions, `.agents/skills/code-review`, required local tooling, and OpenAI-only network policy and passes `sbx kit validate`.
-- [ ] Codex starts from the application-owned control workspace, ignores user configuration and rules, loads no repository-provided hooks, skills, MCP declarations, `AGENTS.md`, or `.codex` configuration, and treats repository content as untrusted data.
-- [ ] The runner uses non-interactive, ephemeral, schema-constrained Codex execution with internal approvals/sandboxing bypassed only inside the outer Docker Sandbox boundary.
-- [ ] Trusted inputs include the fixed diff range, deterministic changed-path manifest, review policy, and bounded untrusted PR title/description; neither the model nor repository can redefine revisions, publication, network policy, or capabilities.
-- [ ] Codex can inspect, mutate, build, test, and execute only within the disposable VM-local copy, with network access restricted to OpenAI through Docker's host-managed OAuth credential proxy.
-- [ ] The runner captures bounded JSONL diagnostics and a bounded final artifact, returns only the candidate `AgentReview`, and normalizes CLI exit, output, limit, and sandbox failures.
-- [ ] Candidate parsing, Pydantic validation, deterministic grounding, status derivation, and safe comment rendering reuse the same path proven with the fake runner; there is no corrective rerun or loose-text fallback.
-- [ ] Tests prove that a malicious repository-owned instruction cannot alter the trusted control workspace, access credentials, change the fixed revisions, or inject unvalidated publication content.
+- [x] The pinned application-owned mixin kit supplies root instructions, `.agents/skills/code-review`, required local tooling, and OpenAI-only network policy and passes `sbx kit validate`.
+- [x] Codex starts from the application-owned control workspace, ignores user configuration and rules, loads no repository-provided hooks, skills, MCP declarations, `AGENTS.md`, or `.codex` configuration, and treats repository content as untrusted data.
+- [x] The runner uses non-interactive, ephemeral, schema-constrained Codex execution with internal approvals/sandboxing bypassed only inside the outer Docker Sandbox boundary.
+- [x] Trusted inputs include the fixed diff range, deterministic changed-path manifest, review policy, and bounded untrusted PR title/description; neither the model nor repository can redefine revisions, publication, network policy, or capabilities.
+- [x] Codex can inspect, mutate, build, test, and execute only within the disposable VM-local copy, with network access restricted to OpenAI through Docker's host-managed OAuth credential proxy.
+- [x] The runner captures bounded JSONL diagnostics and a bounded final artifact, returns only the candidate `AgentReview`, and normalizes CLI exit, output, limit, and sandbox failures.
+- [x] Candidate parsing, Pydantic validation, deterministic grounding, status derivation, and safe comment rendering reuse the same path proven with the fake runner; there is no corrective rerun or loose-text fallback.
+- [x] Tests prove that a malicious repository-owned instruction cannot alter the trusted control workspace, access credentials, change the fixed revisions, or inject unvalidated publication content.
 
 ## [ ] Fail startup safely and verify production readiness
 

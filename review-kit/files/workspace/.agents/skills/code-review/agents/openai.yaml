@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Review a fixed pull-request diff for defects"
+  default_prompt: "Use $code-review to inspect the supplied fixed diff and return only grounded important findings."
