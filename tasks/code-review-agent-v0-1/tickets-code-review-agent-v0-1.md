@@ -35,21 +35,21 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] Model-authored strings cannot inject mentions, HTML, hidden markers, or application-owned headings, and every valid comment remains below GitHub's size limit.
 - [x] A fake publisher captures exactly one top-level comment for both findings and clean results and captures no comment for a failed review.
 
-## [ ] Turn a signed GitHub webhook into an asynchronous review comment
+## [x] Turn a signed GitHub webhook into an asynchronous review comment
 
 **What to build:** A running FastAPI application accepts a correctly signed, eligible GitHub pull-request webhook, converts it into a `ReviewRequest`, enqueues it, returns without waiting for review work, and lets its lifespan-owned worker produce one captured comment using fake external adapters.
 
 **Blocked by:** Publish only grounded findings as deterministic Markdown.
 
-- [ ] The handler reads the raw body and verifies `X-Hub-Signature-256` with constant-time comparison before parsing trusted fields or enqueueing work.
-- [ ] Only `X-GitHub-Event: pull_request`, action `opened`, a non-draft PR, and the configured canonical repository are eligible; all other valid events are successful no-ops.
-- [ ] Invalid signatures return an authentication error, malformed eligible payloads return a client error, and neither path enqueues work or exposes secrets or internal exceptions.
-- [ ] An eligible payload maps repository, PR number, installation ID, exact base/head SHAs, title, and bounded description into a typed `ReviewRequest`.
-- [ ] The request receives `202 Accepted` only after `put_nowait` succeeds; clone, model, and publication work never execute in the request handler.
-- [ ] Application lifespan owns one bounded queue and exactly one consumer task, without introducing persistence, retries, or delivery deduplication.
-- [ ] Duplicate valid deliveries may enqueue duplicate reviews and comments, matching the explicit V0.1 limitation.
-- [ ] **E2E checkpoint A — local webhook product path:** start the service on a real local socket, send signed GitHub-shaped HTTP requests without `TestClient` or a direct ASGI call, and assert the actual status/body plus eventual fake-publisher comment.
-- [ ] Checkpoint A also exercises actual HTTP responses for invalid signature, ignored event, malformed eligible payload, and queue-full behavior.
+- [x] The handler reads the raw body and verifies `X-Hub-Signature-256` with constant-time comparison before parsing trusted fields or enqueueing work.
+- [x] Only `X-GitHub-Event: pull_request`, action `opened`, a non-draft PR, and the configured canonical repository are eligible; all other valid events are successful no-ops.
+- [x] Invalid signatures return an authentication error, malformed eligible payloads return a client error, and neither path enqueues work or exposes secrets or internal exceptions.
+- [x] An eligible payload maps repository, PR number, installation ID, exact base/head SHAs, title, and bounded description into a typed `ReviewRequest`.
+- [x] The request receives `202 Accepted` only after `put_nowait` succeeds; clone, model, and publication work never execute in the request handler.
+- [x] Application lifespan owns one bounded queue and exactly one consumer task, without introducing persistence, retries, or delivery deduplication.
+- [x] Duplicate valid deliveries may enqueue duplicate reviews and comments, matching the explicit V0.1 limitation.
+- [x] **E2E checkpoint A — local webhook product path:** start the service on a real local socket, send signed GitHub-shaped HTTP requests without `TestClient` or a direct ASGI call, and assert the actual status/body plus eventual fake-publisher comment.
+- [x] Checkpoint A also exercises actual HTTP responses for invalid signature, ignored event, malformed eligible payload, and queue-full behavior.
 
 ## [ ] Use GitHub App credentials for exact checkout and publication
 
