@@ -273,7 +273,7 @@ def _finding() -> Finding:
     return Finding(
         severity="important",
         title="Feature data can be lost",
-        locations=(Location(path="feature.txt", line=1),),
+        locations=(Location(path="feature.txt", line=1, description=None),),
         evidence="The new write replaces existing data.",
         impact="A user can lose saved data.",
         suggested_fix="Preserve and merge the existing data.",
@@ -406,7 +406,7 @@ def test_review_creates_exact_writable_sandbox_copy_and_removes_it(tmp_path: Pat
         ),
         (
             sandbox_name,
-            ("cp", "-a", f"{checkout}/.", "/home/agent/review/repo"),
+            ("cp", "-R", f"{checkout}/.", "/home/agent/review/repo"),
             None,
             64,
         ),
@@ -1016,7 +1016,7 @@ def test_review_rejects_a_candidate_immediately_beyond_the_byte_limit(tmp_path: 
 def test_grounding_rejects_a_traversal_location(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
     finding = _finding().model_copy(
-        update={"locations": (Location(path="../outside.txt"),)},
+        update={"locations": (Location(path="../outside.txt", line=None, description=None),)},
     )
     reviewer = Reviewer(
         repository="octo-org/example",
@@ -1045,8 +1045,12 @@ def test_grounding_accepts_head_files_and_deleted_changed_paths(tmp_path: Path) 
     finding = _finding().model_copy(
         update={
             "locations": (
-                Location(path="feature.txt", line=2),
-                Location(path="deleted.txt", description="Deleted by this change"),
+                Location(path="feature.txt", line=2, description=None),
+                Location(
+                    path="deleted.txt",
+                    line=None,
+                    description="Deleted by this change",
+                ),
             )
         },
     )
@@ -1103,13 +1107,13 @@ def test_review_preserves_the_fake_runners_finding_order(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     "location",
     [
-        Location(path="/feature.txt"),
-        Location(path="missing.txt"),
-        Location(path="shared.txt"),
-        Location(path="feature.txt", line=3),
-        Location(path="binary.bin", line=1),
-        Location(path="deleted.txt", line=1),
-        Location(path="escape-link"),
+        Location(path="/feature.txt", line=None, description=None),
+        Location(path="missing.txt", line=None, description=None),
+        Location(path="shared.txt", line=None, description=None),
+        Location(path="feature.txt", line=3, description=None),
+        Location(path="binary.bin", line=1, description=None),
+        Location(path="deleted.txt", line=1, description=None),
+        Location(path="escape-link", line=None, description=None),
     ],
     ids=[
         "absolute",
@@ -1254,12 +1258,12 @@ def test_typed_models_enforce_identity_and_result_bounds() -> None:
     with pytest.raises(ValidationError):
         DiffRange(start_sha="not-a-sha", end_sha="b" * 40)
     with pytest.raises(ValidationError):
-        Location(path="feature.txt", line=0)
+        Location(path="feature.txt", line=0, description=None)
     with pytest.raises(ValidationError):
         Finding(
             severity="important",
             title="x" * 161,
-            locations=(Location(path="feature.txt"),),
+            locations=(Location(path="feature.txt", line=None, description=None),),
             evidence="Evidence",
             impact="Impact",
             suggested_fix="Fix",
@@ -1279,7 +1283,7 @@ def test_typed_models_enforce_identity_and_result_bounds() -> None:
 
 
 def test_finding_models_enforce_all_declared_string_and_collection_bounds() -> None:
-    location = Location(path="feature.txt")
+    location = Location(path="feature.txt", line=None, description=None)
     valid_finding = {
         "severity": "important",
         "title": "Title",
@@ -1290,9 +1294,9 @@ def test_finding_models_enforce_all_declared_string_and_collection_bounds() -> N
     }
 
     with pytest.raises(ValidationError):
-        Location(path="x" * 513)
+        Location(path="x" * 513, line=None, description=None)
     with pytest.raises(ValidationError):
-        Location(path="feature.txt", description="x" * 241)
+        Location(path="feature.txt", line=None, description="x" * 241)
     with pytest.raises(ValidationError):
         Finding.model_validate({**valid_finding, "locations": (location,) * 4})
     with pytest.raises(ValidationError):
@@ -1331,7 +1335,7 @@ def test_render_review_comment_neutralizes_model_authored_markdown() -> None:
     finding = _finding().model_copy(
         update={
             "title": payload,
-            "locations": (Location(path="feature.txt", description=payload),),
+            "locations": (Location(path="feature.txt", line=None, description=payload),),
             "evidence": payload,
             "impact": payload,
             "suggested_fix": payload,
@@ -1361,7 +1365,10 @@ def test_every_maximum_sized_review_renders_below_githubs_comment_limit(fill: st
     finding = Finding(
         severity="important",
         title=fill * 160,
-        locations=tuple(Location(path=fill * 512, description=fill * 240) for _ in range(3)),
+        locations=tuple(
+            Location(path=fill * 512, line=None, description=fill * 240)
+            for _ in range(3)
+        ),
         evidence=fill * 1_200,
         impact=fill * 600,
         suggested_fix=fill * 600,
@@ -1412,7 +1419,11 @@ def test_a_failed_review_produces_no_publishable_comment(tmp_path: Path) -> None
             AgentReview(
                 findings=(
                     _finding().model_copy(
-                        update={"locations": (Location(path="not-real.txt"),)},
+                        update={
+                            "locations": (
+                                Location(path="not-real.txt", line=None, description=None),
+                            )
+                        },
                     ),
                 )
             )

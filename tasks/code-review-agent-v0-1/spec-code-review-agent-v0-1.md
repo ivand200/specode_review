@@ -56,7 +56,7 @@ A GitHub publisher adapter deterministically renders the successful `ReviewResul
 - The queue is deliberately not durable. Process termination may lose queued or active work and may require manual GitHub webhook redelivery. This is an accepted V0.1 limitation, not an unreported guarantee.
 - Graceful shutdown stops accepting new work and allows the active review a bounded opportunity to finish. Abrupt process termination has no recovery guarantee.
 - Configuration is validated before the application accepts traffic. Required configuration covers the repository, GitHub App credentials, webhook secret, Codex model, application-owned review kit, workspace root, a 15-minute default end-to-end review timeout, sandbox resource limits, and subprocess/output limits. Startup readiness also checks the pinned `sbx` and Codex versions and validates the mixin kit.
-- OpenAI authentication uses Docker Sandbox host-managed OAuth and its credential proxy. GitHub and raw OpenAI credentials must not enter the sandbox or appear in clone URLs, logs, prompts, exceptions returned to webhook callers, or model-visible output.
+- OpenAI authentication uses the Docker Sandbox host-managed credential proxy. OAuth is preferred; a proxy-stored OpenAI API key is a supported fallback. GitHub and raw OpenAI credentials must not enter the sandbox or appear in clone URLs, logs, prompts, exceptions returned to webhook callers, or model-visible output.
 
 ### Webhook adapter
 
@@ -227,8 +227,8 @@ The only persistent user-visible success state is the pull-request comment. `Pen
 - Limit tests prove that more than 100 changed files or 5,000 changed text lines fails before sandbox creation, and that queue, description, captured subprocess output, request, finding, comment, and end-to-end timeout bounds are enforced.
 - Configuration tests prove that missing or invalid required settings, incompatible pinned runtime versions, or an invalid review kit fail startup before traffic is accepted and that secrets are absent from observable errors and logs.
 - A sandbox lifecycle integration test, without a model call, proves read-only host mounting, writable VM-local copying, exact-HEAD verification, forced timeout cleanup, orphan sweeping, and absence of cross-review state across two sequential sandboxes.
-- An opt-in live test proves that the trusted review kit and skill load, repository-owned `AGENTS.md` and `.codex` content do not become configuration, OAuth remains proxy-managed, OpenAI is the only reachable network service, output is Pydantic-valid, and the host checkout remains unchanged.
-- Normal tests never call GitHub, Docker Sandboxes, or OpenAI and require no production credentials. The live test is opt-in because it requires Docker Sandbox readiness, host OAuth, time, and model budget.
+- An opt-in live test proves that the trusted review kit and skill load, repository-owned `AGENTS.md` and `.codex` content do not become configuration, the OpenAI credential remains proxy-managed, OpenAI is the only reachable network service, output is Pydantic-valid, and the host checkout remains unchanged.
+- Normal tests never call GitHub, Docker Sandboxes, or OpenAI and require no production credentials. The live test is opt-in because it requires Docker Sandbox readiness, a host-managed OpenAI credential, time, and model budget.
 - The existing `libero` project provides prior art for pytest fixtures, Pydantic validation, fake external clients, clone/review/publish orchestration, and typed review artifacts. V0.1 reuses those testing ideas where useful but does not inherit its multi-provider, artifact-storage, inline-comment, or role-bundle scope.
 
 ## Out of Scope

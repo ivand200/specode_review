@@ -122,12 +122,12 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] Codex starts from the application-owned control workspace, ignores user configuration and rules, loads no repository-provided hooks, skills, MCP declarations, `AGENTS.md`, or `.codex` configuration, and treats repository content as untrusted data.
 - [x] The runner uses non-interactive, ephemeral, schema-constrained Codex execution with internal approvals/sandboxing bypassed only inside the outer Docker Sandbox boundary.
 - [x] Trusted inputs include the fixed diff range, deterministic changed-path manifest, review policy, and bounded untrusted PR title/description; neither the model nor repository can redefine revisions, publication, network policy, or capabilities.
-- [x] Codex can inspect, mutate, build, test, and execute only within the disposable VM-local copy, with network access restricted to OpenAI through Docker's host-managed OAuth credential proxy.
+- [x] Codex can inspect, mutate, build, test, and execute only within the disposable VM-local copy, with network access restricted to OpenAI through Docker's host-managed credential proxy.
 - [x] The runner captures bounded JSONL diagnostics and a bounded final artifact, returns only the candidate `AgentReview`, and normalizes CLI exit, output, limit, and sandbox failures.
 - [x] Candidate parsing, Pydantic validation, deterministic grounding, status derivation, and safe comment rendering reuse the same path proven with the fake runner; there is no corrective rerun or loose-text fallback.
 - [x] Tests prove that a malicious repository-owned instruction cannot alter the trusted control workspace, access credentials, change the fixed revisions, or inject unvalidated publication content.
 
-## [ ] Fail startup safely and verify production readiness
+## [x] Fail startup safely and verify production readiness
 
 **What to build:** The complete service accepts traffic only when its one-repository GitHub, bounded worker, trusted review kit, Docker Sandbox, and Codex runtime configuration is valid. Operators can run an explicit live test that exercises the full signed-webhook-to-real-comment path and proves the selected isolation contract before rollout.
 
@@ -135,10 +135,10 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 
 - [x] Startup validates the canonical repository, GitHub App settings and secret paths, webhook secret, Codex model, workspace root, review timeout, sandbox resources, subprocess/output bounds, application-owned kit path, and ownership prefixes before accepting traffic.
 - [x] Startup readiness checks the pinned compatible `sbx` and Codex versions, validates the mixin kit, verifies required host capabilities, and reports normalized redacted failures.
-- [x] The example environment and operator documentation match the specification: 15-minute default end-to-end timeout, host-managed OpenAI OAuth/proxying, no `pydantic-ai`, no raw OpenAI credential in the sandbox, and no unenforceable model/tool-call guarantees.
+- [x] The example environment and operator documentation match the specification: 15-minute default end-to-end timeout, host-managed OpenAI credential proxying, no `pydantic-ai`, no raw OpenAI credential in the sandbox, and no unenforceable model/tool-call guarantees.
 - [x] Normal CI runs fake-adapter unit/contract tests and the mocked product-flow test without GitHub, Docker, OpenAI credentials, network, or model cost.
 - [x] Docker lifecycle integration and live tests are clearly separated and opt-in, use generated fixture repositories, and cannot target an important working copy by default.
 - [x] Observable logs and errors are checked for GitHub credentials, raw OpenAI credentials, clone credential material, prompt/source contents, and unbounded model diagnostics.
-- [ ] **E2E checkpoint C — full live sandboxed review:** run the service on a real local socket and send a signed webhook for a deliberately defective PR in the dedicated GitHub test repository, exercising the real queue, GitHub App, Git operations, Docker Sandbox, Codex CLI, validation, and GitHub publication.
-- [ ] Checkpoint C asserts the actual HTTP response, exact reviewed range and expected material finding in the real PR comment, host-checkout immutability, sandbox/workspace removal, trusted-kit loading, repository-config isolation, OpenAI-only networking, and absence of secret leakage.
+- [x] **E2E checkpoint C — full live sandboxed review:** run the service on a real local socket and send a signed webhook for a deliberately defective PR in the dedicated GitHub test repository, exercising the real queue, GitHub App, Git operations, Docker Sandbox, Codex CLI, validation, and GitHub publication.
+- [x] Checkpoint C asserts the actual HTTP response, exact reviewed range and expected material finding in the real PR comment, host-checkout immutability, sandbox/workspace removal, trusted-kit loading, repository-config isolation, OpenAI-only networking, and absence of secret leakage.
 - [x] Checkpoint C is an explicit cost-bearing opt-in action requiring dedicated GitHub credentials, Docker Sandbox readiness, host-managed OpenAI authentication, time, and model budget; failure blocks operational rollout rather than changing the core Interface.

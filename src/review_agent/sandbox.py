@@ -488,7 +488,7 @@ class CodexSandboxRunner:
         self._execute(
             sandbox_name,
             context,
-            ("cp", "-a", f"{context.checkout}/.", _VM_CHECKOUT),
+            ("cp", "-R", f"{context.checkout}/.", _VM_CHECKOUT),
         )
         copied_head = self._execute(
             sandbox_name,
@@ -714,7 +714,7 @@ class SandboxLifecycleRunner:
             self._execute(
                 sandbox_name,
                 context,
-                ("cp", "-a", f"{context.checkout}/.", _VM_CHECKOUT),
+                ("cp", "-R", f"{context.checkout}/.", _VM_CHECKOUT),
             )
             copied_head = self._execute(
                 sandbox_name,

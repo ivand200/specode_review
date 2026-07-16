@@ -138,7 +138,7 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     git = "/usr/bin/git"
     runner = RecordingReadinessProcessRunner(
         {
-            (sbx, "version"): b"sbx version: v0.34.0 build\n",
+            (sbx, "version"): b"sbx version: v0.35.0 build\n",
             (codex, "--version"): b"codex-cli 0.144.5\n",
             (git, "--version"): b"git version 2.50.1\n",
             (sbx, "diagnose"): b"Docker Sandboxes is ready\n",
@@ -193,7 +193,7 @@ def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     codex = "/bin/codex"
     git = "/bin/git"
     successful = {
-        (sbx, "version"): b"sbx version: v0.34.0\n",
+        (sbx, "version"): b"sbx version: v0.35.0\n",
         (codex, "--version"): b"codex-cli 0.144.5\n",
         (git, "--version"): b"git version 2.50.1\n",
         (sbx, "diagnose"): b"ready\n",
@@ -337,9 +337,9 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
         "SANDBOX_NAME_PREFIX",
     ):
         assert setting in example
-    assert "sbx 0.34.0" in operator_guide
+    assert "sbx 0.35.0" in operator_guide
     assert "Codex CLI 0.144.5" in operator_guide
-    assert "host-managed OAuth" in operator_guide
+    assert "host-managed credential proxy" in operator_guide
     assert "one process" in operator_guide
     assert "RUN_FULL_LIVE_E2E=1" in live_guide
     assert "ACKNOWLEDGE_MODEL_COST=1" in live_guide

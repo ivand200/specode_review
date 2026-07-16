@@ -178,6 +178,10 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert "installation_id" not in request_payload
     assert output_schema["additionalProperties"] is False
     assert set(output_schema["properties"]) == {"findings"}
+    location_schema = output_schema["$defs"]["Location"]
+    assert set(location_schema["required"]) == {"path", "line", "description"}
+    assert "default" not in location_schema["properties"]["line"]
+    assert "default" not in location_schema["properties"]["description"]
 
 
 def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(

@@ -19,16 +19,19 @@ uv run review-agent
 
 Startup fails before the socket accepts traffic unless all settings and secret paths are valid,
 the dedicated workspace root is writable, Git is available, Docker Sandboxes diagnostics pass,
-the application-owned kit validates, and the runtime versions exactly match `sbx 0.34.0` and
+the application-owned kit validates, and the runtime versions exactly match `sbx 0.35.0` and
 `Codex CLI 0.144.5`. Startup errors contain a normalized stage only; subprocess output and secret
 values are not logged.
 
-The Docker Sandboxes host must support microVM sandboxes and must already be signed in for
-host-managed OAuth and credential proxying. Do not set `OPENAI_API_KEY`: no raw OpenAI credential
-is passed to the application-created sandbox. The GitHub private key stays on the host, GitHub
-installation tokens are ephemeral, and the sandbox receives neither credential. The service does
-not use `pydantic-ai` and does not claim model-request, tool-call, or token limits that Codex CLI
-cannot enforce.
+The Docker Sandboxes host must support microVM sandboxes, be signed in, and have an OpenAI
+credential configured in its host-managed credential proxy. Prefer OAuth with
+`sbx secret set -g openai --oauth`; a proxy-stored API key configured with
+`sbx secret set -g openai` or `sbx secret import openai --force` is also supported. Do not leave
+`OPENAI_API_KEY` in the application environment after importing it. The proxy keeps the raw
+credential on the host and gives the sandbox only a placeholder. The GitHub private key stays on
+the host, GitHub installation tokens are ephemeral, and the sandbox receives neither credential.
+The service does not use `pydantic-ai` and does not claim model-request, tool-call, or token limits
+that Codex CLI cannot enforce.
 
 The queue is in memory and has capacity ten. V0.1 has no delivery deduplication, retries, or crash
 recovery. An abrupt restart can lose queued or active work; redeliver the webhook manually.

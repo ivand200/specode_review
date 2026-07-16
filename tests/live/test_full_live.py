@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,7 +21,13 @@ from review_agent.core import GitHubRepository, ReviewContext, Reviewer, ReviewL
 from review_agent.github import GitHubAppClient
 from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
-from review_agent.sandbox import CodexSandboxRunner, DockerSandboxClient, DockerSandboxConfig
+from review_agent.sandbox import (
+    CodexSandboxRunner,
+    DockerSandboxClient,
+    DockerSandboxConfig,
+    ProcessOptions,
+    _run_bounded_process,
+)
 from review_agent.web import create_app
 
 
@@ -94,6 +100,67 @@ class RecordingRunner:
         return head, status
 
 
+class ReviewFailureHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.failed = threading.Event()
+        self.message: str | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name == "review_agent.web" and record.getMessage().startswith(
+            "review failed "
+        ):
+            self.message = record.getMessage()
+            self.failed.set()
+
+
+class RecordingProcessRunner:
+    def __init__(self) -> None:
+        self.operation = "not_started"
+        self.failed_operation = "none"
+        self.error = "none"
+
+    def __call__(
+        self,
+        arguments: tuple[str, ...],
+        options: ProcessOptions,
+    ) -> subprocess.CompletedProcess[bytes]:
+        command = Path(arguments[0]).name
+        if len(arguments) > 1:
+            command = f"{command} {arguments[1]}"
+        if "--" in arguments:
+            inner_index = arguments.index("--") + 1
+            if inner_index < len(arguments):
+                command = f"{command} {arguments[inner_index]}"
+        self.operation = f"{options.stage}:{command}"
+        try:
+            return _run_bounded_process(arguments, options)
+        except subprocess.CalledProcessError as error:
+            if self.error == "none":
+                self.failed_operation = self.operation
+                self.error = f"CalledProcessError({error.returncode})"
+            raise
+        except Exception as error:
+            if self.error == "none":
+                self.failed_operation = self.operation
+                self.error = type(error).__name__
+            raise
+
+    def diagnostics(self) -> str:
+        return f"operation={self.failed_operation} error={self.error}"
+
+
+@contextmanager
+def _watch_review_failures() -> Iterator[ReviewFailureHandler]:
+    failure_handler = ReviewFailureHandler()
+    worker_logger = logging.getLogger("review_agent.web")
+    worker_logger.addHandler(failure_handler)
+    try:
+        yield failure_handler
+    finally:
+        worker_logger.removeHandler(failure_handler)
+
+
 def _required_environment(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -146,6 +213,24 @@ def _send_signed_webhook(url: str, payload: dict[str, object], secret: str) -> t
         return response.status, response.read().decode()
 
 
+def _wait_for_publication_or_failure(
+    publisher: RecordingPublisher,
+    failure_handler: ReviewFailureHandler,
+    *,
+    timeout_seconds: float,
+    diagnostics: Callable[[], str],
+) -> None:
+    wait_deadline = time.monotonic() + timeout_seconds
+    while not publisher.published.wait(timeout=0.1):
+        if failure_handler.failed.is_set():
+            pytest.fail(
+                f"checkpoint C worker failed: {failure_handler.message}; {diagnostics()}",
+                pytrace=False,
+            )
+        if time.monotonic() >= wait_deadline:
+            pytest.fail("checkpoint C publication timed out", pytrace=False)
+
+
 @pytest.mark.live_full
 def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     caplog: pytest.LogCaptureFixture,
@@ -178,7 +263,9 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
+    process_runner = RecordingProcessRunner()
     sandbox_client = DockerSandboxClient(
+        process_runner=process_runner,
         config=DockerSandboxConfig(
             process_output_max_bytes=settings.process_output_max_bytes,
             cleanup_timeout_seconds=settings.sandbox_cleanup_timeout_seconds,
@@ -227,13 +314,18 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     }
     caplog.set_level(logging.INFO)
 
-    with _serve(app) as url:
+    with _watch_review_failures() as failure_handler, _serve(app) as url:
         status_code, response_body = _send_signed_webhook(
             url,
             payload,
             settings.webhook_secret,
         )
-        assert publisher.published.wait(timeout=settings.review_timeout_seconds)
+        _wait_for_publication_or_failure(
+            publisher,
+            failure_handler,
+            timeout_seconds=settings.review_timeout_seconds,
+            diagnostics=process_runner.diagnostics,
+        )
 
     assert status_code == 202
     assert json.loads(response_body) == {"status": "accepted"}
