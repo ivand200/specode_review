@@ -1,7 +1,6 @@
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -16,8 +15,10 @@ from review_agent import (
     ReviewContext,
     Reviewer,
     ReviewError,
+    ReviewLimits,
     ReviewRequest,
     ReviewResult,
+    SandboxResourceLimits,
     publish_review_result,
     render_review_comment,
 )
@@ -78,6 +79,34 @@ def _grounding_repository(root: Path) -> tuple[Path, str, str]:
     return repository, base_sha, head_sha
 
 
+def _changed_repository(
+    root: Path,
+    changes: dict[str, bytes],
+    *,
+    base_files: dict[str, bytes] | None = None,
+) -> tuple[Path, str, str]:
+    repository = root / "sized-origin"
+    repository.mkdir()
+    _git(repository, "init", "--initial-branch=main")
+    _git(repository, "config", "user.name", "Test User")
+    _git(repository, "config", "user.email", "test@example.com")
+    for filename, contents in (base_files or {}).items():
+        path = repository / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    _git(repository, "add", "--all")
+    _git(repository, "commit", "--allow-empty", "-m", "base")
+    base_sha = _git(repository, "rev-parse", "HEAD")
+    for filename, contents in changes.items():
+        path = repository / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    _git(repository, "add", "--all")
+    _git(repository, "commit", "-m", "sized change")
+    head_sha = _git(repository, "rev-parse", "HEAD")
+    return repository, base_sha, head_sha
+
+
 def _github_pull_ref_repository(root: Path) -> tuple[Path, str, str, str, str]:
     repository = root / "github-origin"
     repository.mkdir()
@@ -120,9 +149,9 @@ class ReturningRunner:
         self.candidate = candidate
         self.workspace: Path | None = None
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def run(self, context: ReviewContext) -> object:
         self.workspace = context.workspace
-        return cast("AgentReview", self.candidate)
+        return self.candidate
 
 
 class RaisingRunner:
@@ -208,6 +237,30 @@ def test_review_request_is_typed_and_immutable() -> None:
         request.pr_number = 18  # type: ignore[misc]
 
 
+def test_review_request_counts_unicode_text_by_character_and_truncates_description() -> None:
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="😀" * 256,
+        description="😀" * 10_001,
+    )
+
+    assert len(request.title) == 256
+    assert len(request.title.encode("utf-8")) == 1_024
+    assert len(request.description) == 10_000
+    assert request.description.endswith("\n\n[truncated]")
+    with pytest.raises(ValidationError):
+        ReviewRequest.model_validate(
+            {
+                **request.model_dump(),
+                "title": "😀" * 257,
+            }
+        )
+
+
 def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> None:
     source, merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
     workspace_root = tmp_path / "workspaces"
@@ -242,6 +295,105 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
     assert result.status == "no_important_issues"
     assert result.findings == ()
     assert not runner.context.workspace.exists()
+
+
+def test_review_rejects_more_than_one_hundred_changed_files_before_the_runner(
+    tmp_path: Path,
+) -> None:
+    source, base_sha, head_sha = _changed_repository(
+        tmp_path,
+        {f"changed-{index:03}.txt": b"changed\n" for index in range(101)},
+    )
+    runner = CapturingRunner()
+    workspace_root = tmp_path / "workspaces"
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=workspace_root,
+        runner=runner,
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Large change",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.REVIEW_TOO_LARGE
+    assert failure.value.stage == "review_size"
+    assert runner.context is None
+    assert list(workspace_root.iterdir()) == []
+
+
+def test_review_accepts_exact_file_and_text_line_limits_without_counting_binary_lines(
+    tmp_path: Path,
+) -> None:
+    changes = {f"binary-{index:03}.bin": b"content\x00binary\n" for index in range(99)}
+    changes["text.txt"] = b"new line\n" * 2_500
+    source, base_sha, head_sha = _changed_repository(
+        tmp_path,
+        changes,
+        base_files={"text.txt": b"old line\n" * 2_500},
+    )
+    runner = CapturingRunner()
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Boundary-sized change",
+    )
+
+    result = reviewer.review(request)
+
+    assert result.status == "no_important_issues"
+    assert runner.context is not None
+    assert runner.context.manifest.changed_files == 100
+    assert runner.context.manifest.changed_text_lines == 5_000
+    assert runner.context.manifest.paths[-1] == "text.txt"
+
+
+def test_review_rejects_more_than_five_thousand_changed_text_lines_before_the_runner(
+    tmp_path: Path,
+) -> None:
+    source, base_sha, head_sha = _changed_repository(
+        tmp_path,
+        {"text.txt": b"line\n" * 5_001},
+    )
+    runner = CapturingRunner()
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Line-heavy change",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.REVIEW_TOO_LARGE
+    assert failure.value.stage == "review_size"
+    assert runner.context is None
 
 
 def test_github_materialization_uses_pull_ref_but_reviews_the_accepted_head(
@@ -344,6 +496,63 @@ def test_repository_failure_is_normalized_and_cleans_the_workspace(tmp_path: Pat
     assert list(workspace_root.iterdir()) == []
 
 
+def test_review_bounds_captured_git_process_output(tmp_path: Path) -> None:
+    source, _, base_sha, head_sha = _diverged_repository(tmp_path)
+    runner = CapturingRunner()
+    workspace_root = tmp_path / "workspaces"
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=workspace_root,
+        runner=runner,
+        limits=ReviewLimits(process_output_max_bytes=1),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Bound process diagnostics",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.REPOSITORY_MATERIALIZATION
+    assert failure.value.stage == "repository_materialization"
+    assert runner.context is None
+    assert list(workspace_root.iterdir()) == []
+
+
+def test_review_carries_validated_sandbox_resource_limits_to_the_runner(tmp_path: Path) -> None:
+    source, _, base_sha, head_sha = _diverged_repository(tmp_path)
+    runner = CapturingRunner()
+    sandbox_resources = SandboxResourceLimits(cpus=2, memory_mib=4_096, pids=256)
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+        limits=ReviewLimits(sandbox_resources=sandbox_resources),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Bound sandbox resources",
+    )
+
+    reviewer.review(request)
+
+    assert runner.context is not None
+    assert runner.context.sandbox_resources is sandbox_resources
+    with pytest.raises(ValueError, match="sandbox resource limits must be positive"):
+        SandboxResourceLimits(cpus=0, memory_mib=4_096, pids=256)
+
+
 def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
     runner = ReturningRunner(
@@ -380,6 +589,59 @@ def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path
 
     assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
     assert failure.value.stage == "candidate_validation"
+    assert runner.workspace is not None
+    assert not runner.workspace.exists()
+
+
+def test_review_accepts_a_candidate_at_the_exact_byte_limit(tmp_path: Path) -> None:
+    source, _, base_sha, head_sha = _diverged_repository(tmp_path)
+    candidate = b'{"findings":[]}'
+    candidate += b" " * (65_536 - len(candidate))
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=ReturningRunner(candidate),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Bound candidate bytes",
+    )
+
+    result = reviewer.review(request)
+
+    assert result.status == "no_important_issues"
+
+
+def test_review_rejects_a_candidate_immediately_beyond_the_byte_limit(tmp_path: Path) -> None:
+    source, _, base_sha, head_sha = _diverged_repository(tmp_path)
+    candidate = b'{"findings":[]}'
+    candidate += b" " * (65_537 - len(candidate))
+    runner = ReturningRunner(candidate)
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=runner,
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Reject oversized candidate bytes",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
+    assert failure.value.stage == "candidate_output"
     assert runner.workspace is not None
     assert not runner.workspace.exists()
 

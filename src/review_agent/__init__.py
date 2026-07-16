@@ -3,7 +3,9 @@ from review_agent.core import (
     GitHubRepository,
     ReviewContext,
     Reviewer,
+    ReviewLimits,
     ReviewRunner,
+    SandboxResourceLimits,
 )
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient, GitHubError
@@ -33,11 +35,13 @@ __all__ = [
     "Location",
     "ReviewContext",
     "ReviewError",
+    "ReviewLimits",
     "ReviewPublisher",
     "ReviewRequest",
     "ReviewResult",
     "ReviewRunner",
     "Reviewer",
+    "SandboxResourceLimits",
     "publish_review_result",
     "render_review_comment",
 ]

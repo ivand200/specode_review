@@ -1,8 +1,10 @@
+import json
 import os
+import selectors
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os.path import lexists
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
@@ -12,11 +14,45 @@ from pydantic import ValidationError
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
 
+MAX_CHANGED_FILES = 100
+MAX_CHANGED_TEXT_LINES = 5_000
+CANDIDATE_OUTPUT_MAX_BYTES = 65_536
+PROCESS_OUTPUT_MAX_BYTES = 1_048_576
+
+
+class _ProcessOutputLimitError(Exception):
+    pass
+
 
 @dataclass(frozen=True, slots=True)
 class ChangedPathManifest:
     diff_range: DiffRange
     paths: tuple[str, ...]
+    changed_files: int
+    changed_text_lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxResourceLimits:
+    cpus: int = 2
+    memory_mib: int = 4_096
+    pids: int = 256
+
+    def __post_init__(self) -> None:
+        if self.cpus <= 0 or self.memory_mib <= 0 or self.pids <= 0:
+            message = "sandbox resource limits must be positive"
+            raise ValueError(message)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewLimits:
+    process_output_max_bytes: int = PROCESS_OUTPUT_MAX_BYTES
+    sandbox_resources: SandboxResourceLimits = field(default_factory=SandboxResourceLimits)
+
+    def __post_init__(self) -> None:
+        if self.process_output_max_bytes <= 0:
+            message = "process output limit must be positive"
+            raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,10 +62,11 @@ class ReviewContext:
     checkout: Path
     diff_range: DiffRange
     manifest: ChangedPathManifest
+    sandbox_resources: SandboxResourceLimits
 
 
 class ReviewRunner(Protocol):
-    def run(self, context: ReviewContext) -> AgentReview: ...
+    def run(self, context: ReviewContext) -> object: ...
 
 
 class InstallationCredentials(Protocol):
@@ -50,11 +87,13 @@ class Reviewer:
         workspace_root: Path,
         runner: ReviewRunner,
         source_repository: Path | GitHubRepository,
+        limits: ReviewLimits | None = None,
     ) -> None:
         self._repository = repository
         self._source_repository = source_repository
         self._workspace_root = workspace_root
         self._runner = runner
+        self._limits = limits or ReviewLimits()
         git_executable = shutil.which("git")
         if git_executable is None:
             raise ReviewError(
@@ -72,58 +111,10 @@ class Reviewer:
         workspace = Path(tempfile.mkdtemp(prefix="review-", dir=self._workspace_root))
         checkout = workspace / "checkout"
         try:
+            context = self._prepare_context(workspace, checkout, request)
+            candidate = self._candidate_from_runner(context)
             try:
-                self._materialize_repository(workspace, checkout, request)
-                self._git(checkout, "cat-file", "-e", f"{request.base_sha}^{{commit}}")
-                self._git(checkout, "cat-file", "-e", f"{request.head_sha}^{{commit}}")
-                self._git(checkout, "checkout", "--detach", request.head_sha)
-                checked_out_head = self._git(checkout, "rev-parse", "HEAD")
-                self._ensure_exact_head(checked_out_head, request.head_sha)
-
-                merge_base = self._git(
-                    checkout,
-                    "merge-base",
-                    request.base_sha,
-                    request.head_sha,
-                )
-                diff_range = DiffRange(start_sha=merge_base, end_sha=request.head_sha)
-                manifest = ChangedPathManifest(
-                    diff_range=diff_range,
-                    paths=self._changed_paths(checkout, diff_range),
-                )
-            except Exception as error:
-                raise ReviewError(
-                    FailureCategory.REPOSITORY_MATERIALIZATION,
-                    stage="repository_materialization",
-                ) from error
-            context = ReviewContext(
-                request=request,
-                workspace=workspace,
-                checkout=checkout,
-                diff_range=diff_range,
-                manifest=manifest,
-            )
-            try:
-                raw_candidate = self._runner.run(context)
-            except TimeoutError as error:
-                raise ReviewError(
-                    FailureCategory.TIMEOUT,
-                    stage="review_runner",
-                ) from error
-            try:
-                candidate_input = (
-                    raw_candidate.model_dump(mode="python")
-                    if isinstance(raw_candidate, AgentReview)
-                    else raw_candidate
-                )
-                candidate = AgentReview.model_validate(candidate_input)
-            except ValidationError as error:
-                raise ReviewError(
-                    FailureCategory.INVALID_MODEL_OUTPUT,
-                    stage="candidate_validation",
-                ) from error
-            try:
-                self._ground_candidate(checkout, manifest, candidate)
+                self._ground_candidate(checkout, context.manifest, candidate)
             except (OSError, RuntimeError, ValueError) as error:
                 raise ReviewError(
                     FailureCategory.INVALID_MODEL_OUTPUT,
@@ -135,12 +126,89 @@ class Reviewer:
             return ReviewResult(
                 repository=request.repository,
                 pr_number=request.pr_number,
-                diff_range=diff_range,
+                diff_range=context.diff_range,
                 status=status,
                 findings=candidate.findings,
             )
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
+
+    def _prepare_context(
+        self,
+        workspace: Path,
+        checkout: Path,
+        request: ReviewRequest,
+    ) -> ReviewContext:
+        try:
+            self._materialize_repository(workspace, checkout, request)
+            self._git(checkout, "cat-file", "-e", f"{request.base_sha}^{{commit}}")
+            self._git(checkout, "cat-file", "-e", f"{request.head_sha}^{{commit}}")
+            self._git(checkout, "checkout", "--detach", request.head_sha)
+            checked_out_head = self._git(checkout, "rev-parse", "HEAD")
+            self._ensure_exact_head(checked_out_head, request.head_sha)
+            merge_base = self._git(checkout, "merge-base", request.base_sha, request.head_sha)
+            diff_range = DiffRange(start_sha=merge_base, end_sha=request.head_sha)
+            changed_paths = self._changed_paths(checkout, diff_range)
+            manifest = ChangedPathManifest(
+                diff_range=diff_range,
+                paths=changed_paths,
+                changed_files=len(changed_paths),
+                changed_text_lines=self._changed_text_lines(checkout, diff_range),
+            )
+        except Exception as error:
+            raise ReviewError(
+                FailureCategory.REPOSITORY_MATERIALIZATION,
+                stage="repository_materialization",
+            ) from error
+        if (
+            manifest.changed_files > MAX_CHANGED_FILES
+            or manifest.changed_text_lines > MAX_CHANGED_TEXT_LINES
+        ):
+            raise ReviewError(FailureCategory.REVIEW_TOO_LARGE, stage="review_size")
+        return ReviewContext(
+            request=request,
+            workspace=workspace,
+            checkout=checkout,
+            diff_range=diff_range,
+            manifest=manifest,
+            sandbox_resources=self._limits.sandbox_resources,
+        )
+
+    def _candidate_from_runner(self, context: ReviewContext) -> AgentReview:
+        try:
+            raw_candidate = self._runner.run(context)
+        except TimeoutError as error:
+            raise ReviewError(FailureCategory.TIMEOUT, stage="review_runner") from error
+        try:
+            candidate_bytes = self._candidate_bytes(raw_candidate)
+        except (TypeError, ValueError) as error:
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="candidate_validation",
+            ) from error
+        if len(candidate_bytes) > CANDIDATE_OUTPUT_MAX_BYTES:
+            raise ReviewError(FailureCategory.CODEX_OR_LIMIT, stage="candidate_output")
+        try:
+            return AgentReview.model_validate_json(candidate_bytes)
+        except ValidationError as error:
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="candidate_validation",
+            ) from error
+
+    @staticmethod
+    def _candidate_bytes(raw_candidate: object) -> bytes:
+        if isinstance(raw_candidate, bytes):
+            return raw_candidate
+        if isinstance(raw_candidate, str):
+            return raw_candidate.encode("utf-8")
+        if isinstance(raw_candidate, AgentReview):
+            return raw_candidate.model_dump_json().encode("utf-8")
+        return json.dumps(
+            raw_candidate,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     def _materialize_repository(
         self,
@@ -157,18 +225,15 @@ class Reviewer:
         if not isinstance(self._source_repository, Path):
             message = "local repository source is not configured"
             raise TypeError(message)
-        subprocess.run(  # noqa: S603 - arguments are structured and commit SHAs are validated.
-            [
+        self._run_process(
+            (
                 self._git_executable,
                 "clone",
                 "--no-checkout",
                 "--no-local",
                 str(self._source_repository),
                 str(checkout),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+            ),
         )
 
     def _clone_github(
@@ -231,29 +296,87 @@ class Reviewer:
             askpass.unlink(missing_ok=True)
 
     def _authenticated_git(self, environment: dict[str, str], *arguments: str) -> None:
-        subprocess.run(  # noqa: S603 - never invokes a shell and keeps credentials out of argv.
-            [
+        self._run_process(
+            (
                 self._git_executable,
                 "-c",
                 "credential.helper=",
                 "-c",
                 "core.hooksPath=/dev/null",
                 *arguments,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
+            ),
             env=environment,
         )
 
     def _git(self, repository: Path, *arguments: str) -> str:
-        completed = subprocess.run(  # noqa: S603 - never invokes a shell.
-            [self._git_executable, "-C", str(repository), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
+        completed = self._run_process(
+            (self._git_executable, "-C", str(repository), *arguments),
         )
-        return completed.stdout.strip()
+        return completed.stdout.decode("utf-8").strip()
+
+    def _run_process(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        process = subprocess.Popen(  # noqa: S603 - arguments are structured and never use a shell.
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        if process.stdout is None or process.stderr is None:
+            message = "bounded process capture requires stdout and stderr pipes"
+            raise RuntimeError(message)
+
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        total_bytes = 0
+        exceeded = False
+        try:
+            while selector.get_map():
+                for key, _events in selector.select():
+                    remaining = self._limits.process_output_max_bytes - total_bytes
+                    chunk = os.read(key.fd, min(65_536, remaining + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total_bytes += len(chunk)
+                    if total_bytes > self._limits.process_output_max_bytes:
+                        exceeded = True
+                        process.kill()
+                        break
+                    captured[str(key.data)].extend(chunk)
+                if exceeded:
+                    break
+            return_code = process.wait()
+        finally:
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+            process.stderr.close()
+
+        if exceeded:
+            raise _ProcessOutputLimitError
+        completed = subprocess.CompletedProcess(
+            arguments,
+            return_code,
+            stdout=bytes(captured["stdout"]),
+            stderr=bytes(captured["stderr"]),
+        )
+        if return_code != 0:
+            raise subprocess.CalledProcessError(
+                return_code,
+                arguments,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
 
     @staticmethod
     def _ensure_exact_head(actual_head: str, expected_head: str) -> None:
@@ -274,6 +397,27 @@ class Reviewer:
         if not output:
             return ()
         return tuple(output.removesuffix("\0").split("\0"))
+
+    def _changed_text_lines(self, checkout: Path, diff_range: DiffRange) -> int:
+        output = self._git(
+            checkout,
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "-z",
+            diff_range.start_sha,
+            diff_range.end_sha,
+        )
+        if not output:
+            return 0
+
+        changed_lines = 0
+        for record in output.removesuffix("\0").split("\0"):
+            added, deleted, _path = record.split("\t", maxsplit=2)
+            if added == "-" or deleted == "-":
+                continue
+            changed_lines += int(added) + int(deleted)
+        return changed_lines
 
     @staticmethod
     def _ground_candidate(

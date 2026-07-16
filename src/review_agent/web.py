@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from typing import Protocol
@@ -9,8 +10,11 @@ from typing import Protocol
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from review_agent.errors import ReviewError
 from review_agent.models import ReviewRequest, ReviewResult, bound_description
 from review_agent.publishing import ReviewPublisher, publish_review_result
+
+logger = logging.getLogger(__name__)
 
 
 class ReviewService(Protocol):
@@ -31,6 +35,15 @@ async def _review_worker(
                 result,
                 publisher,
                 installation_id=request.installation_id,
+            )
+        except ReviewError as error:
+            logger.warning(
+                "review failed repository=%s pr_number=%d head_sha=%s stage=%s category=%s",
+                request.repository,
+                request.pr_number,
+                request.head_sha,
+                error.stage,
+                error.category.value,
             )
         finally:
             queue.task_done()

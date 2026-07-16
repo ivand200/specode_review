@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import socket
 import subprocess
 import threading
@@ -12,9 +13,18 @@ from copy import deepcopy
 from pathlib import Path
 from urllib.error import HTTPError
 
+import pytest
 import uvicorn
 
-from review_agent import AgentReview, ReviewContext, Reviewer
+from review_agent import (
+    AgentReview,
+    FailureCategory,
+    ReviewContext,
+    Reviewer,
+    ReviewError,
+    ReviewRequest,
+    ReviewResult,
+)
 from review_agent.web import create_app
 
 
@@ -76,6 +86,16 @@ class CapturingPublisher:
         del installation_id
         self.comments.append((repository, pr_number, body))
         self.published.set()
+
+
+class LimitFailingReviewer:
+    def __init__(self) -> None:
+        self.called = threading.Event()
+
+    def review(self, request: ReviewRequest) -> ReviewResult:
+        del request
+        self.called.set()
+        raise ReviewError(FailureCategory.REVIEW_TOO_LARGE, stage="review_size")
 
 
 @contextmanager
@@ -486,6 +506,49 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(tmp_path: 
     assert response == (202, '{"status":"accepted"}')
     assert len(description) == 10_000
     assert description.endswith("\n\n[truncated]")
+
+
+def test_review_size_failure_is_logged_and_publishes_no_comment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reviewer = LimitFailingReviewer()
+    publisher = CapturingPublisher()
+    caplog.set_level(logging.WARNING, logger="review_agent.web")
+    app = create_app(
+        repository="octo-org/example",
+        webhook_secret="correct horse battery staple",
+        reviewer=reviewer,
+        publisher=publisher,
+    )
+    payload: dict[str, object] = {
+        "action": "opened",
+        "installation": {"id": 23},
+        "repository": {"full_name": "octo-org/example"},
+        "pull_request": {
+            "number": 17,
+            "draft": False,
+            "title": "Too large",
+            "body": "untrusted source context",
+            "base": {"sha": "a" * 40},
+            "head": {"sha": "b" * 40},
+        },
+    }
+
+    with _serve(app) as url:
+        response = _signed_request(url, payload, "correct horse battery staple")
+        assert reviewer.called.wait(timeout=5)
+        deadline = time.monotonic() + 1
+        while not caplog.records and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert response == (202, '{"status":"accepted"}')
+    assert publisher.comments == []
+    assert messages == [
+        "review failed repository=octo-org/example pr_number=17 "
+        f"head_sha={'b' * 40} stage=review_size category=review_too_large"
+    ]
+    assert "untrusted source context" not in messages[0]
 
 
 def test_duplicate_deliveries_can_create_duplicate_comments(tmp_path: Path) -> None:

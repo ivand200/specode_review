@@ -67,19 +67,19 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] A real local-Git test proves checkout, manifest, runner input, grounding, typed result, and rendered comment all use the same merge-base-to-exact-head range.
 - [x] **E2E checkpoint B prerequisite:** an opt-in profile can use a dedicated GitHub test repository and real GitHub App request/responses while substituting the deterministic fake Codex runner.
 
-## [ ] Reject reviews that exceed trusted input and output bounds
+## [x] Reject reviews that exceed trusted input and output bounds
 
 **What to build:** Expensive or unbounded reviews fail before inference or publication, while permitted reviews carry visibly bounded untrusted context through the same webhook-to-result path.
 
 **Blocked by:** Turn a signed GitHub webhook into an asynchronous review comment.
 
-- [ ] A deterministic manifest counts changed paths and added/deleted text lines from the immutable diff; binary files count toward the file limit but not the text-line limit.
-- [ ] More than 100 changed files or more than 5,000 changed text lines produces a `review_too_large` failure before the first runner/model request or sandbox creation.
-- [ ] Pull-request descriptions are limited to 10,000 characters with a visible truncation marker, while titles and all request fields enforce their declared limits.
-- [ ] Captured subprocess diagnostics, candidate result bytes, Pydantic strings and collections, rendered comments, sandbox resources, and configured process output are bounded.
-- [ ] Limit failures are logged with normalized context and publish no partial, clean, or potentially misleading comment.
-- [ ] Tests prove each boundary at its exact limit and immediately beyond it, including binary changes and multibyte text where byte and character limits differ.
-- [ ] Configuration and documentation claim only limits the implementation can enforce; unsupported Codex request or tool-call limits are not presented as guarantees.
+- [x] A deterministic manifest counts changed paths and added/deleted text lines from the immutable diff; binary files count toward the file limit but not the text-line limit.
+- [x] More than 100 changed files or more than 5,000 changed text lines produces a `review_too_large` failure before the first runner/model request or sandbox creation.
+- [x] Pull-request descriptions are limited to 10,000 characters with a visible truncation marker, while titles and all request fields enforce their declared limits.
+- [x] Captured subprocess diagnostics, candidate result bytes, Pydantic strings and collections, rendered comments, sandbox resources, and configured process output are bounded.
+- [x] Limit failures are logged with normalized context and publish no partial, clean, or potentially misleading comment.
+- [x] Tests prove each boundary at its exact limit and immediately beyond it, including binary changes and multibyte text where byte and character limits differ.
+- [x] Configuration and documentation claim only limits the implementation can enforce; unsupported Codex request or tool-call limits are not presented as guarantees.
 
 ## [ ] Keep the single worker bounded and failure-isolated
 

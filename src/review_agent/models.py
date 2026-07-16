@@ -1,6 +1,13 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 Sha = Annotated[str, StringConstraints(pattern=r"^[0-9a-fA-F]{40}$")]
 DESCRIPTION_MAX_CHARS = 10_000
@@ -37,6 +44,11 @@ class ReviewRequest(BaseModel):
     head_sha: Sha
     title: str = Field(min_length=1, max_length=256)
     description: str = Field(default="", max_length=DESCRIPTION_MAX_CHARS)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def truncate_description(cls, value: object) -> str:
+        return bound_description(value)
 
 
 class DiffRange(BaseModel):
