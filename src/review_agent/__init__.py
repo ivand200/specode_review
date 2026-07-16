@@ -8,6 +8,11 @@ from review_agent.models import (
     ReviewRequest,
     ReviewResult,
 )
+from review_agent.publishing import (
+    ReviewPublisher,
+    publish_review_result,
+    render_review_comment,
+)
 
 __all__ = [
     "AgentReview",
@@ -18,8 +23,11 @@ __all__ = [
     "Location",
     "ReviewContext",
     "ReviewError",
+    "ReviewPublisher",
     "ReviewRequest",
     "ReviewResult",
     "ReviewRunner",
     "Reviewer",
+    "publish_review_result",
+    "render_review_comment",
 ]

@@ -19,21 +19,21 @@ Work the **frontier**: any ticket whose blockers are all done. Tickets 4, 5, 6, 
 - [x] Unique temporary workspaces under the dedicated workspace root are removed after success, repository failure, runner failure, validation failure, timeout/cancellation, and unexpected exceptions.
 - [x] Expected core failures use normalized categories and are never converted into a successful empty review.
 
-## [ ] Publish only grounded findings as deterministic Markdown
+## [x] Publish only grounded findings as deterministic Markdown
 
 **What to build:** A review with valid important findings travels from the fake runner through structural and repository grounding validation into a deterministic, safely rendered top-level comment. A clean review produces an explicit no-important-issues comment, while any invalid candidate fails the whole attempt and produces no publishable result.
 
 **Blocked by:** Review an exact local PR revision through the typed Interface.
 
-- [ ] The fake runner can return zero to five ordered findings with only `blocking` or `important` severity and all declared string and collection bounds enforced.
-- [ ] Every finding has one to three locations, at least one location names a changed path, and all paths remain inside the frozen checkout.
-- [ ] Grounding accepts files present at the reviewed head and deleted changed paths, and validates supplied one-based lines against referenced head text files.
-- [ ] Grounding rejects traversal, absolute paths, symlink escapes, nonexistent paths, out-of-range lines, binary line references, and findings with no changed-path location.
-- [ ] Parsing, schema, or grounding failure rejects the complete candidate immediately; invalid findings are neither dropped nor converted into a clean result.
-- [ ] Application code derives `issues_found` only when validated findings exist and copies repository, PR, and commit identity only from trusted request and diff values.
-- [ ] Deterministic Markdown includes the automated-review notice, exact `start_sha..end_sha`, derived status, and each finding's severity, title, locations, evidence, impact, and suggested fix.
-- [ ] Model-authored strings cannot inject mentions, HTML, hidden markers, or application-owned headings, and every valid comment remains below GitHub's size limit.
-- [ ] A fake publisher captures exactly one top-level comment for both findings and clean results and captures no comment for a failed review.
+- [x] The fake runner can return zero to five ordered findings with only `blocking` or `important` severity and all declared string and collection bounds enforced.
+- [x] Every finding has one to three locations, at least one location names a changed path, and all paths remain inside the frozen checkout.
+- [x] Grounding accepts files present at the reviewed head and deleted changed paths, and validates supplied one-based lines against referenced head text files.
+- [x] Grounding rejects traversal, absolute paths, symlink escapes, nonexistent paths, out-of-range lines, binary line references, and findings with no changed-path location.
+- [x] Parsing, schema, or grounding failure rejects the complete candidate immediately; invalid findings are neither dropped nor converted into a clean result.
+- [x] Application code derives `issues_found` only when validated findings exist and copies repository, PR, and commit identity only from trusted request and diff values.
+- [x] Deterministic Markdown includes the automated-review notice, exact `start_sha..end_sha`, derived status, and each finding's severity, title, locations, evidence, impact, and suggested fix.
+- [x] Model-authored strings cannot inject mentions, HTML, hidden markers, or application-owned headings, and every valid comment remains below GitHub's size limit.
+- [x] A fake publisher captures exactly one top-level comment for both findings and clean results and captures no comment for a failed review.
 
 ## [ ] Turn a signed GitHub webhook into an asynchronous review comment
 

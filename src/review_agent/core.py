@@ -2,13 +2,14 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from os.path import lexists
+from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
 from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import AgentReview, DiffRange, ReviewRequest, ReviewResult
+from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,11 +100,23 @@ class Reviewer:
                     stage="review_runner",
                 ) from error
             try:
-                candidate = AgentReview.model_validate(raw_candidate)
+                candidate_input = (
+                    raw_candidate.model_dump(mode="python")
+                    if isinstance(raw_candidate, AgentReview)
+                    else raw_candidate
+                )
+                candidate = AgentReview.model_validate(candidate_input)
             except ValidationError as error:
                 raise ReviewError(
                     FailureCategory.INVALID_MODEL_OUTPUT,
                     stage="candidate_validation",
+                ) from error
+            try:
+                self._ground_candidate(checkout, manifest, candidate)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ReviewError(
+                    FailureCategory.INVALID_MODEL_OUTPUT,
+                    stage="candidate_grounding",
                 ) from error
             status: Literal["issues_found", "no_important_issues"] = (
                 "issues_found" if candidate.findings else "no_important_issues"
@@ -161,3 +174,68 @@ class Reviewer:
         if not output:
             return ()
         return tuple(output.removesuffix("\0").split("\0"))
+
+    @staticmethod
+    def _ground_candidate(
+        checkout: Path,
+        manifest: ChangedPathManifest,
+        candidate: AgentReview,
+    ) -> None:
+        checkout_root = checkout.resolve()
+        changed_paths = frozenset(manifest.paths)
+        for finding in candidate.findings:
+            has_changed_location = False
+            for location in finding.locations:
+                is_changed = Reviewer._ground_location(
+                    checkout,
+                    checkout_root,
+                    changed_paths,
+                    location,
+                )
+                has_changed_location = has_changed_location or is_changed
+
+            if not has_changed_location:
+                msg = "each finding requires at least one changed-path location"
+                raise ValueError(msg)
+
+    @staticmethod
+    def _ground_location(
+        checkout: Path,
+        checkout_root: Path,
+        changed_paths: frozenset[str],
+        location: Location,
+    ) -> bool:
+        relative_path = PurePosixPath(location.path)
+        if relative_path.is_absolute() or ".." in relative_path.parts or "\x00" in location.path:
+            msg = "location path must remain inside the checkout"
+            raise ValueError(msg)
+
+        candidate_path = checkout.joinpath(*relative_path.parts)
+        try:
+            candidate_path.resolve(strict=False).relative_to(checkout_root)
+        except ValueError as error:
+            msg = "location path escapes the checkout"
+            raise ValueError(msg) from error
+
+        is_changed = location.path in changed_paths
+        path_exists = lexists(candidate_path)
+        if not path_exists and not is_changed:
+            msg = "location path does not exist at the reviewed head"
+            raise ValueError(msg)
+        if path_exists and not (candidate_path.is_file() or candidate_path.is_symlink()):
+            msg = "location path must identify a file"
+            raise ValueError(msg)
+
+        if location.line is None:
+            return is_changed
+        if not path_exists or not candidate_path.is_file():
+            msg = "line locations require a file at the reviewed head"
+            raise ValueError(msg)
+        contents = candidate_path.read_bytes()
+        if b"\x00" in contents:
+            msg = "line locations cannot reference binary files"
+            raise ValueError(msg)
+        if location.line > len(contents.splitlines()):
+            msg = "location line is outside the reviewed head file"
+            raise ValueError(msg)
+        return is_changed
