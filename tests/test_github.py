@@ -306,3 +306,40 @@ def test_repository_installation_is_discovered_with_app_authentication(tmp_path:
     )
 
     assert github.repository_installation_id() == 23
+
+
+def test_webhook_url_is_read_with_app_authentication(tmp_path: Path) -> None:
+    private_key_path, public_key = _private_key(tmp_path)
+
+    def github_api(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/app/hook/config"
+        authorization = request.headers["Authorization"]
+        claims = jwt.decode(
+            authorization.removeprefix("Bearer "),
+            public_key,
+            algorithms=["RS256"],
+            options={"verify_exp": False, "verify_iat": False},
+        )
+        assert claims["iss"] == "12345"
+        return httpx.Response(
+            200,
+            json={
+                "url": "https://review.example.test/webhooks/github",
+                "content_type": "json",
+                "insecure_ssl": "0",
+                "secret": "not-returned-by-client",
+            },
+        )
+
+    github = GitHubAppClient(
+        repository="octo-org/example",
+        app_id=12345,
+        private_key_path=private_key_path,
+        http_client=httpx.Client(
+            base_url="https://api.github.test",
+            transport=httpx.MockTransport(github_api),
+        ),
+    )
+
+    assert github.webhook_url() == "https://review.example.test/webhooks/github"

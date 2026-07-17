@@ -24,6 +24,7 @@ def _valid_environment(tmp_path: Path) -> dict[str, str]:
         "GITHUB_PRIVATE_KEY_PATH": str(private_key),
         "GITHUB_WEBHOOK_SECRET": "a" * 32,
         "CODEX_MODEL": "gpt-5.4",
+        "OPENAI_REASONING_EFFORT": "high",
         "REVIEW_KIT_PATH": str(kit),
         "WORKSPACE_ROOT": str(workspace_parent / "workspaces"),
         "REVIEW_TIMEOUT_SECONDS": "900",
@@ -49,6 +50,7 @@ def test_production_settings_accept_the_complete_bounded_configuration(
     assert settings.private_key_path == tmp_path / "github-app.pem"
     assert settings.webhook_secret == "a" * 32
     assert settings.codex_model == "gpt-5.4"
+    assert settings.openai_reasoning_effort == "high"
     assert settings.review_timeout_seconds == 900
     assert settings.sandbox_resources.cpus == 2
     assert settings.sandbox_resources.memory_mib == 4096
@@ -66,6 +68,7 @@ def test_production_settings_accept_the_complete_bounded_configuration(
         ("GITHUB_APP_ID", "0"),
         ("GITHUB_WEBHOOK_SECRET", "short"),
         ("CODEX_MODEL", ""),
+        ("OPENAI_REASONING_EFFORT", "extreme"),
         ("REVIEW_TIMEOUT_SECONDS", "0"),
         ("SANDBOX_CPUS", "0"),
         ("SANDBOX_MEMORY_MIB", "0"),
@@ -327,6 +330,7 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
 
     for setting in (
         "CODEX_MODEL",
+        "OPENAI_REASONING_EFFORT",
         "REVIEW_KIT_PATH",
         "SANDBOX_CPUS",
         "SANDBOX_MEMORY_MIB",

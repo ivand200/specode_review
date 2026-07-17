@@ -29,6 +29,7 @@ from review_agent.process import ProcessOptions, _run_bounded_process
 from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
+    CodexExecutionConfig,
     CodexSandboxRunner,
     DockerSandboxClient,
     DockerSandboxConfig,
@@ -189,6 +190,10 @@ class RecordingProcessRunner:
             return "--ignore-user-config" in command and "--ignore-rules" in command
         return False
 
+    def codex_used_reasoning_effort(self, reasoning_effort: str) -> bool:
+        expected = f'model_reasoning_effort="{reasoning_effort}"'
+        return any(expected in arguments for arguments in self.calls)
+
 
 class VerifyingCodexSandboxClient:
     def __init__(self, client: DockerSandboxClient) -> None:
@@ -343,6 +348,7 @@ def _assert_checkpoint_isolation(
     assert sandbox_client.forbidden_network_denied
     assert process_runner.created_with_kit(settings.review_kit_path)
     assert process_runner.codex_ignored_repository_configuration()
+    assert process_runner.codex_used_reasoning_effort(settings.openai_reasoning_effort)
     assert list(settings.workspace_root.iterdir()) == []
     assert not any(
         name.startswith(settings.sandbox_name_prefix) for name in sandbox_client.list_names()
@@ -413,8 +419,11 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
             client=sandbox_client,
             sandbox_prefix=settings.sandbox_name_prefix,
             kit=settings.review_kit_path,
-            model=settings.codex_model,
-            candidate_output_max_bytes=settings.candidate_output_max_bytes,
+            config=CodexExecutionConfig(
+                model=settings.codex_model,
+                reasoning_effort=settings.openai_reasoning_effort,
+                candidate_output_max_bytes=settings.candidate_output_max_bytes,
+            ),
         ),
         repository_control_markers={
             Path("AGENTS.md"): forbidden_instruction,

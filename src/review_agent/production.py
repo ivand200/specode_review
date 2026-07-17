@@ -10,7 +10,12 @@ from review_agent.configuration import ProductionSettings
 from review_agent.core import GitHubRepository, Reviewer, ReviewLimits
 from review_agent.github import GitHubAppClient
 from review_agent.readiness import ProductionReadiness
-from review_agent.sandbox import CodexSandboxRunner, DockerSandboxClient, DockerSandboxConfig
+from review_agent.sandbox import (
+    CodexExecutionConfig,
+    CodexSandboxRunner,
+    DockerSandboxClient,
+    DockerSandboxConfig,
+)
 from review_agent.web import create_app
 
 
@@ -39,8 +44,11 @@ def create_production_app(
         client=sandbox_client,
         sandbox_prefix=resolved_settings.sandbox_name_prefix,
         kit=resolved_settings.review_kit_path,
-        model=resolved_settings.codex_model,
-        candidate_output_max_bytes=resolved_settings.candidate_output_max_bytes,
+        config=CodexExecutionConfig(
+            model=resolved_settings.codex_model,
+            reasoning_effort=resolved_settings.openai_reasoning_effort,
+            candidate_output_max_bytes=resolved_settings.candidate_output_max_bytes,
+        ),
     )
     github = GitHubAppClient(
         repository=resolved_settings.repository,

@@ -21,6 +21,9 @@ _SANDBOX_PREFIX = re.compile(r"^[a-z0-9][a-z0-9.-]{1,29}-$")
 _WEBHOOK_SECRET_MIN_CHARS = 32
 _WEBHOOK_SECRET_MAX_CHARS = 1_024
 _CODEX_MODEL_MAX_CHARS = 128
+_OPENAI_REASONING_EFFORTS = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+)
 
 
 class ConfigurationError(ValueError):
@@ -104,6 +107,7 @@ class ProductionSettings:
     private_key_path: Path
     webhook_secret: str = field(repr=False)
     codex_model: str
+    openai_reasoning_effort: str
     review_kit_path: Path
     workspace_root: Path
     review_timeout_seconds: float
@@ -127,6 +131,10 @@ class ProductionSettings:
         if len(codex_model) > _CODEX_MODEL_MAX_CHARS or codex_model.strip() != codex_model:
             _invalid("CODEX_MODEL")
 
+        openai_reasoning_effort = _required(environment, "OPENAI_REASONING_EFFORT")
+        if openai_reasoning_effort not in _OPENAI_REASONING_EFFORTS:
+            _invalid("OPENAI_REASONING_EFFORT")
+
         workspace_root = _absolute_path(environment, "WORKSPACE_ROOT")
         if workspace_root == Path(workspace_root.anchor) or workspace_root.is_symlink():
             _invalid("WORKSPACE_ROOT")
@@ -144,6 +152,7 @@ class ProductionSettings:
             private_key_path=_existing_file(environment, "GITHUB_PRIVATE_KEY_PATH"),
             webhook_secret=webhook_secret,
             codex_model=codex_model,
+            openai_reasoning_effort=openai_reasoning_effort,
             review_kit_path=_existing_directory(environment, "REVIEW_KIT_PATH"),
             workspace_root=workspace_root,
             review_timeout_seconds=_positive_float(

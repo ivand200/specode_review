@@ -15,6 +15,7 @@ from review_agent import (
     SandboxResourceLimits,
 )
 from review_agent.sandbox import (
+    CodexExecutionConfig,
     CodexSandboxRunner,
     DockerSandboxClient,
     DockerSandboxConfig,
@@ -141,7 +142,7 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        model="gpt-5.4",
+        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
     )
 
     candidate = runner.run(context)
@@ -162,6 +163,16 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert "--ephemeral" in command
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
+    provider_index = command.index("--config")
+    assert command[provider_index + 1] == 'model_provider="review_agent_openai_https"'
+    assert command[provider_index + 3].startswith(
+        "model_providers.review_agent_openai_https="
+    )
+    assert "supports_websockets=false" in command[provider_index + 3]
+    assert command[provider_index + 4 : provider_index + 6] == (
+        "--config",
+        'model_reasoning_effort="high"',
+    )
     assert "--output-schema" in command
     assert "--output-last-message" in command
     assert "--json" in command
@@ -179,9 +190,9 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert output_schema["additionalProperties"] is False
     assert set(output_schema["properties"]) == {"findings"}
     location_schema = output_schema["$defs"]["Location"]
-    assert set(location_schema["required"]) == {"path"}
-    assert location_schema["properties"]["line"]["default"] is None
-    assert location_schema["properties"]["description"]["default"] is None
+    assert set(location_schema["required"]) == {"path", "line", "description"}
+    assert "default" not in location_schema["properties"]["line"]
+    assert "default" not in location_schema["properties"]["description"]
 
 
 def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(
@@ -196,7 +207,7 @@ def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        model="gpt-5.4",
+        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -219,7 +230,7 @@ def test_codex_sandbox_runner_rejects_injected_control_configuration(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        model="gpt-5.4",
+        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -239,7 +250,7 @@ def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> No
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        model="gpt-5.4",
+        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -260,7 +271,7 @@ def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        model="gpt-5.4",
+        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
     )
 
     with pytest.raises(ReviewError) as failure:

@@ -21,6 +21,7 @@ class GitHubOperation(StrEnum):
     INSTALLATION_TOKEN = "installation_token"  # noqa: S105 - normalized operation name.
     PULL_REQUEST_READ = "pull_request_read"
     PUBLICATION = "publication"
+    WEBHOOK_CONFIGURATION_READ = "webhook_configuration_read"
 
 
 class GitHubError(Exception):
@@ -56,6 +57,12 @@ class _InstallationResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     id: int = Field(gt=0)
+
+
+class _WebhookConfigurationResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    url: str = Field(min_length=1)
 
 
 class _CommitIdentity(BaseModel):
@@ -204,6 +211,27 @@ class GitHubAppClient:
         if not isinstance(payload, _InstallationResponse):
             raise GitHubError(operation)
         return payload.id
+
+    def webhook_url(self) -> str:
+        operation = GitHubOperation.WEBHOOK_CONFIGURATION_READ
+        app_jwt = self._app_jwt(operation)
+        response = self._request(
+            _Request(
+                operation=operation,
+                method="GET",
+                path="/app/hook/config",
+                bearer=app_jwt,
+                expected_status=httpx.codes.OK,
+            )
+        )
+        payload = self._validate_response(
+            _WebhookConfigurationResponse,
+            response,
+            operation,
+        )
+        if not isinstance(payload, _WebhookConfigurationResponse):
+            raise GitHubError(operation)
+        return payload.url
 
     def publish(
         self,
