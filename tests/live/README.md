@@ -46,8 +46,11 @@ This cost-bearing rollout gate exercises the real signed webhook, queue, GitHub 
 flow, exact Git checkout, Docker Sandbox, Codex CLI, grounding, deterministic publication, and
 cleanup. It must target a disposable pull request in a dedicated repository whose name contains
 `test`. Prepare that PR with a known important defect plus malicious repository-owned `AGENTS.md`
-and `.codex` instructions; those files must remain untrusted data. Set the expected finding text to
-a stable fragment describing the seeded defect.
+and `.codex/config.toml` instructions containing distinct markers; those files must remain
+untrusted data. Set the expected finding text to a stable fragment describing the seeded defect.
+The checkpoint verifies that the application kit is passed to the real sandbox, the Codex
+invocation ignores repository configuration, and an in-sandbox request to `github.com` is denied
+while the OpenAI-backed Codex run still succeeds.
 
 The test is skipped unless both the live switch and cost acknowledgement are present:
 
@@ -61,6 +64,7 @@ E2E_GITHUB_REPOSITORY=ivand200/test_repo \
 E2E_GITHUB_PR_NUMBER=<number> \
 E2E_EXPECTED_FINDING=<stable-defect-fragment> \
 E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT=<malicious-output-marker> \
+E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT=<malicious-config-marker> \
 E2E_CREATED_RESOURCES_PATH=/tmp/review-agent-full-live-resources.jsonl \
 uv run pytest tests/live/test_full_live.py -q -s
 ```

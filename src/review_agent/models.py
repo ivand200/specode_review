@@ -62,8 +62,8 @@ class Location(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     path: str = Field(min_length=1, max_length=512)
-    line: int | None = Field(gt=0)
-    description: str | None = Field(min_length=1, max_length=240)
+    line: int | None = Field(default=None, gt=0)
+    description: str | None = Field(default=None, min_length=1, max_length=240)
 
 
 class Finding(BaseModel):

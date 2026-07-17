@@ -1,20 +1,17 @@
 import json
 import os
 import re
-import selectors
 import shutil
-import subprocess
-import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, ReviewContext, SandboxResourceLimits
-from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview
+from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
 
 _SANDBOX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")
 _VM_CHECKOUT = "/home/agent/review/repo"
@@ -27,27 +24,6 @@ _CODEX_PROMPT = (
 )
 
 
-class _ProcessOutputLimitError(Exception):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessOptions:
-    output_max_bytes: int
-    stage: str
-    timeout_seconds: float | None = None
-    use_review_deadline: bool = True
-    env: Mapping[str, str] | None = None
-
-
-class ProcessRunner(Protocol):
-    def __call__(
-        self,
-        arguments: tuple[str, ...],
-        options: ProcessOptions,
-    ) -> subprocess.CompletedProcess[bytes]: ...
-
-
 @dataclass(frozen=True, slots=True)
 class DockerSandboxConfig:
     process_output_max_bytes: int = 1_048_576
@@ -58,99 +34,6 @@ class DockerSandboxConfig:
         if self.process_output_max_bytes <= 0 or self.cleanup_timeout_seconds <= 0:
             message = "sandbox process limits must be positive"
             raise ValueError(message)
-
-
-def _run_bounded_process(  # noqa: C901, PLR0912, PLR0915
-    arguments: tuple[str, ...],
-    options: ProcessOptions,
-) -> subprocess.CompletedProcess[bytes]:
-    timeout_at = (
-        None
-        if options.timeout_seconds is None
-        else time.monotonic() + options.timeout_seconds
-    )
-    process = subprocess.Popen(  # noqa: S603 - arguments are structured and never use a shell.
-        arguments,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=options.env,
-    )
-    if process.stdout is None or process.stderr is None:
-        message = "bounded process capture requires stdout and stderr pipes"
-        raise RuntimeError(message)
-
-    captured = {"stdout": bytearray(), "stderr": bytearray()}
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-    total_bytes = 0
-    exceeded = False
-    try:
-        while selector.get_map():
-            timeouts: list[float] = []
-            if options.use_review_deadline:
-                review_timeout = remaining_review_time(stage=options.stage)
-                if review_timeout is not None:
-                    timeouts.append(review_timeout)
-            if timeout_at is not None:
-                fixed_timeout = timeout_at - time.monotonic()
-                if fixed_timeout <= 0:
-                    raise TimeoutError
-                timeouts.append(fixed_timeout)
-            select_timeout = min(timeouts) if timeouts else None
-            for key, _events in selector.select(select_timeout):
-                remaining = options.output_max_bytes - total_bytes
-                chunk = os.read(key.fd, min(65_536, remaining + 1))
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                total_bytes += len(chunk)
-                if total_bytes > options.output_max_bytes:
-                    exceeded = True
-                    process.kill()
-                    break
-                captured[str(key.data)].extend(chunk)
-            if exceeded:
-                break
-        wait_timeout: float | None
-        if timeout_at is not None:
-            wait_timeout = timeout_at - time.monotonic()
-            if wait_timeout <= 0:
-                raise TimeoutError
-        else:
-            wait_timeout = (
-                remaining_review_time(stage=options.stage)
-                if options.use_review_deadline
-                else None
-            )
-        try:
-            return_code = process.wait(timeout=wait_timeout)
-        except subprocess.TimeoutExpired as error:
-            raise TimeoutError from error
-    finally:
-        selector.close()
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        process.stdout.close()
-        process.stderr.close()
-
-    if exceeded:
-        raise _ProcessOutputLimitError
-    completed = subprocess.CompletedProcess(
-        arguments,
-        return_code,
-        stdout=bytes(captured["stdout"]),
-        stderr=bytes(captured["stderr"]),
-    )
-    if return_code != 0:
-        raise subprocess.CalledProcessError(
-            return_code,
-            arguments,
-            output=completed.stdout,
-            stderr=completed.stderr,
-        )
-    return completed
 
 
 def _default_sbx_environment() -> dict[str, str]:
@@ -368,37 +251,34 @@ class CodexSandboxClient(Protocol):
     def list_names(self) -> tuple[str, ...]: ...
 
 
-class CodexSandboxRunner:
+_ResultT = TypeVar("_ResultT")
+
+
+class _SandboxLifecycle:
     def __init__(
         self,
         *,
-        client: CodexSandboxClient,
+        client: SandboxClient | CodexSandboxClient,
         sandbox_prefix: str,
-        kit: Path,
-        model: str,
-        candidate_output_max_bytes: int = CANDIDATE_OUTPUT_MAX_BYTES,
+        timeout_stage: str,
+        failure_stage: str,
     ) -> None:
         sample_name = f"{sandbox_prefix}{'0' * 32}"
         if _SANDBOX_NAME_PATTERN.fullmatch(sample_name) is None:
             message = "sandbox prefix must be lowercase, bounded, and end with a hyphen"
             raise ValueError(message)
-        if not model or len(model) > _CODEX_MODEL_MAX_CHARS:
-            message = "Codex model must be a non-empty bounded value"
-            raise ValueError(message)
-        if candidate_output_max_bytes <= 0:
-            message = "candidate output limit must be positive"
-            raise ValueError(message)
         self._client = client
         self._sandbox_prefix = sandbox_prefix
-        self._kit = kit
-        self._model = model
-        self._candidate_output_max_bytes = candidate_output_max_bytes
+        self._timeout_stage = timeout_stage
+        self._failure_stage = failure_stage
+        self._owned_name = re.compile(
+            rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$"
+        )
 
     def sweep_orphans(self) -> None:
-        owned_name = re.compile(rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$")
         try:
             for sandbox_name in self._client.list_names():
-                if owned_name.fullmatch(sandbox_name) is not None:
+                if self._owned_name.fullmatch(sandbox_name) is not None:
                     self._client.remove(sandbox_name)
         except Exception as error:
             raise ReviewError(
@@ -406,53 +286,38 @@ class CodexSandboxRunner:
                 stage="sandbox_orphan_sweep",
             ) from error
 
-    def run(self, context: ReviewContext) -> bytes:
+    def run(
+        self,
+        context: ReviewContext,
+        *,
+        control: Path,
+        prepare_control: Callable[[], None] | None,
+        create: Callable[[str], None],
+        action: Callable[[str], _ResultT],
+    ) -> _ResultT:
         sandbox_name = f"{self._sandbox_prefix}{uuid.uuid4().hex}"
-        control = context.workspace / "control"
-        schema_path = control / "review.schema.json"
-        request_path = control / "request.json"
-        result_path = control / "result.json"
         primary_failed = False
-        candidate: bytes
         try:
             control.mkdir(mode=0o700)
-            self._write_control_artifacts(context, schema_path, request_path)
-            self._client.create_codex(
-                name=sandbox_name,
-                control=control,
-                checkout=context.checkout,
-                kit=self._kit,
-                resources=context.sandbox_resources,
-            )
-            trusted_artifacts = self._snapshot_trusted_tree(
-                control,
-                result_path=result_path,
-            )
+            if prepare_control is not None:
+                prepare_control()
+            create(sandbox_name)
             self._prepare_vm_checkout(sandbox_name, context)
-            self._invoke_codex(
-                sandbox_name,
-                context,
-                control=control,
-                schema_path=schema_path,
-                result_path=result_path,
-            )
-            self._verify_trusted_artifacts(
-                control,
-                result_path=result_path,
-                snapshot=trusted_artifacts,
-            )
-            candidate = self._read_candidate(result_path)
+            return action(sandbox_name)
         except ReviewError:
             primary_failed = True
             raise
         except TimeoutError as error:
             primary_failed = True
-            raise ReviewError(FailureCategory.TIMEOUT, stage="codex_execution") from error
+            raise ReviewError(
+                FailureCategory.TIMEOUT,
+                stage=self._timeout_stage,
+            ) from error
         except Exception as error:
             primary_failed = True
             raise ReviewError(
                 FailureCategory.SANDBOX_LIFECYCLE,
-                stage="codex_sandbox_lifecycle",
+                stage=self._failure_stage,
             ) from error
         except BaseException:
             primary_failed = True
@@ -466,7 +331,6 @@ class CodexSandboxRunner:
                         FailureCategory.SANDBOX_LIFECYCLE,
                         stage="sandbox_cleanup",
                     ) from error
-        return candidate
 
     def _prepare_vm_checkout(
         self,
@@ -496,7 +360,117 @@ class CodexSandboxRunner:
             ("git", "rev-parse", "HEAD"),
             workdir=_VM_CHECKOUT,
         ).decode("ascii").strip()
-        self._ensure_exact_head(copied_head, context.request.head_sha)
+        if copied_head != context.request.head_sha:
+            raise ReviewError(
+                FailureCategory.SANDBOX_LIFECYCLE,
+                stage="sandbox_head_verification",
+            )
+
+    def execute(
+        self,
+        sandbox_name: str,
+        context: ReviewContext,
+        command: tuple[str, ...],
+        *,
+        workdir: str | None = None,
+    ) -> bytes:
+        return self._execute(
+            sandbox_name,
+            context,
+            command,
+            workdir=workdir,
+        )
+
+    def _execute(
+        self,
+        sandbox_name: str,
+        context: ReviewContext,
+        command: tuple[str, ...],
+        *,
+        workdir: str | None = None,
+    ) -> bytes:
+        return self._client.execute(
+            name=sandbox_name,
+            command=command,
+            workdir=workdir,
+            process_limit=context.sandbox_resources.pids,
+        )
+
+
+class CodexSandboxRunner:
+    def __init__(
+        self,
+        *,
+        client: CodexSandboxClient,
+        sandbox_prefix: str,
+        kit: Path,
+        model: str,
+        candidate_output_max_bytes: int = CANDIDATE_OUTPUT_MAX_BYTES,
+    ) -> None:
+        if not model or len(model) > _CODEX_MODEL_MAX_CHARS:
+            message = "Codex model must be a non-empty bounded value"
+            raise ValueError(message)
+        if candidate_output_max_bytes <= 0:
+            message = "candidate output limit must be positive"
+            raise ValueError(message)
+        self._client = client
+        self._lifecycle = _SandboxLifecycle(
+            client=client,
+            sandbox_prefix=sandbox_prefix,
+            timeout_stage="codex_execution",
+            failure_stage="codex_sandbox_lifecycle",
+        )
+        self._kit = kit
+        self._model = model
+        self._candidate_output_max_bytes = candidate_output_max_bytes
+
+    def sweep_orphans(self) -> None:
+        self._lifecycle.sweep_orphans()
+
+    def run(self, context: ReviewContext) -> bytes:
+        control = context.workspace / "control"
+        schema_path = control / "review.schema.json"
+        request_path = control / "request.json"
+        result_path = control / "result.json"
+
+        def prepare_control() -> None:
+            self._write_control_artifacts(context, schema_path, request_path)
+
+        def create(sandbox_name: str) -> None:
+            self._client.create_codex(
+                name=sandbox_name,
+                control=control,
+                checkout=context.checkout,
+                kit=self._kit,
+                resources=context.sandbox_resources,
+            )
+
+        def review(sandbox_name: str) -> bytes:
+            trusted_artifacts = self._snapshot_trusted_tree(
+                control,
+                result_path=result_path,
+            )
+            self._invoke_codex(
+                sandbox_name,
+                context,
+                control=control,
+                schema_path=schema_path,
+                result_path=result_path,
+            )
+            self._verify_trusted_artifacts(
+                control,
+                result_path=result_path,
+                snapshot=trusted_artifacts,
+            )
+            return self._read_candidate(result_path)
+
+        return self._lifecycle.run(
+            context,
+            control=control,
+            prepare_control=prepare_control,
+            create=create,
+            action=review,
+        )
 
     def _invoke_codex(
         self,
@@ -508,7 +482,7 @@ class CodexSandboxRunner:
         result_path: Path,
     ) -> None:
         try:
-            self._execute(
+            self._lifecycle.execute(
                 sandbox_name,
                 context,
                 (
@@ -631,29 +605,6 @@ class CodexSandboxRunner:
                 stage="trusted_control_integrity",
             )
 
-    def _execute(
-        self,
-        sandbox_name: str,
-        context: ReviewContext,
-        command: tuple[str, ...],
-        *,
-        workdir: str | None = None,
-    ) -> bytes:
-        return self._client.execute(
-            name=sandbox_name,
-            command=command,
-            workdir=workdir,
-            process_limit=context.sandbox_resources.pids,
-        )
-
-    @staticmethod
-    def _ensure_exact_head(actual_head: str, expected_head: str) -> None:
-        if actual_head != expected_head:
-            raise ReviewError(
-                FailureCategory.SANDBOX_LIFECYCLE,
-                stage="sandbox_head_verification",
-            )
-
 
 class SandboxLifecycleRunner:
     def __init__(
@@ -663,121 +614,43 @@ class SandboxLifecycleRunner:
         sandbox_prefix: str,
         review_command: tuple[str, ...] | None = None,
     ) -> None:
-        sample_name = f"{sandbox_prefix}{'0' * 32}"
-        if _SANDBOX_NAME_PATTERN.fullmatch(sample_name) is None:
-            message = "sandbox prefix must be lowercase, bounded, and end with a hyphen"
-            raise ValueError(message)
         self._client = client
-        self._sandbox_prefix = sandbox_prefix
+        self._lifecycle = _SandboxLifecycle(
+            client=client,
+            sandbox_prefix=sandbox_prefix,
+            timeout_stage="sandbox_lifecycle",
+            failure_stage="sandbox_lifecycle",
+        )
         self._review_command = review_command
 
     def sweep_orphans(self) -> None:
-        owned_name = re.compile(rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$")
-        try:
-            for sandbox_name in self._client.list_names():
-                if owned_name.fullmatch(sandbox_name) is not None:
-                    self._client.remove(sandbox_name)
-        except Exception as error:
-            raise ReviewError(
-                FailureCategory.SANDBOX_LIFECYCLE,
-                stage="sandbox_orphan_sweep",
-            ) from error
+        self._lifecycle.sweep_orphans()
 
     def run(self, context: ReviewContext) -> object:
-        sandbox_name = f"{self._sandbox_prefix}{uuid.uuid4().hex}"
         control = context.workspace / "control"
-        control.mkdir(mode=0o700)
-        primary_failed = False
-        try:
+
+        def create(sandbox_name: str) -> None:
             self._client.create(
                 name=sandbox_name,
                 control=control,
                 checkout=context.checkout,
                 resources=context.sandbox_resources,
             )
-            self._execute(
-                sandbox_name,
-                context,
-                (
-                    "sh",
-                    "-c",
-                    'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
-                    "review-agent-read-only-check",
-                    str(context.checkout),
-                ),
-            )
-            self._execute(
-                sandbox_name,
-                context,
-                ("mkdir", "-p", _VM_CHECKOUT),
-            )
-            self._execute(
-                sandbox_name,
-                context,
-                ("cp", "-R", f"{context.checkout}/.", _VM_CHECKOUT),
-            )
-            copied_head = self._execute(
-                sandbox_name,
-                context,
-                ("git", "rev-parse", "HEAD"),
-                workdir=_VM_CHECKOUT,
-            ).decode("ascii").strip()
-            self._ensure_exact_head(copied_head, context.request.head_sha)
+
+        def review(sandbox_name: str) -> object:
             if self._review_command is not None:
-                return self._execute(
+                return self._lifecycle.execute(
                     sandbox_name,
                     context,
                     self._review_command,
                     workdir=_VM_CHECKOUT,
                 )
             return AgentReview(findings=())
-        except ReviewError:
-            primary_failed = True
-            raise
-        except TimeoutError as error:
-            primary_failed = True
-            raise ReviewError(
-                FailureCategory.TIMEOUT,
-                stage="sandbox_lifecycle",
-            ) from error
-        except Exception as error:
-            primary_failed = True
-            raise ReviewError(
-                FailureCategory.SANDBOX_LIFECYCLE,
-                stage="sandbox_lifecycle",
-            ) from error
-        except BaseException:
-            primary_failed = True
-            raise
-        finally:
-            try:
-                self._client.remove(sandbox_name)
-            except Exception as error:
-                if not primary_failed:
-                    raise ReviewError(
-                        FailureCategory.SANDBOX_LIFECYCLE,
-                        stage="sandbox_cleanup",
-                    ) from error
 
-    def _execute(
-        self,
-        sandbox_name: str,
-        context: ReviewContext,
-        command: tuple[str, ...],
-        *,
-        workdir: str | None = None,
-    ) -> bytes:
-        return self._client.execute(
-            name=sandbox_name,
-            command=command,
-            workdir=workdir,
-            process_limit=context.sandbox_resources.pids,
+        return self._lifecycle.run(
+            context,
+            control=control,
+            prepare_control=None,
+            create=create,
+            action=review,
         )
-
-    @staticmethod
-    def _ensure_exact_head(actual_head: str, expected_head: str) -> None:
-        if actual_head != expected_head:
-            raise ReviewError(
-                FailureCategory.SANDBOX_LIFECYCLE,
-                stage="sandbox_head_verification",
-            )

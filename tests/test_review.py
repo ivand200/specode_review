@@ -920,6 +920,41 @@ def test_review_carries_validated_sandbox_resource_limits_to_the_runner(tmp_path
         SandboxResourceLimits(cpus=0, memory_mib=4_096, pids=256)
 
 
+def test_review_fails_when_successful_workspace_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _, base_sha, head_sha = _diverged_repository(tmp_path)
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        runner=ReturningRunner(AgentReview(findings=())),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Require workspace cleanup",
+    )
+
+    cleanup_error = "untrusted cleanup detail"
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise OSError(cleanup_error)
+
+    monkeypatch.setattr("review_agent.core.shutil.rmtree", fail_cleanup)
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.REVIEW_FAILURE
+    assert failure.value.stage == "workspace_cleanup"
+    assert "untrusted cleanup detail" not in str(failure.value)
+
+
 def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
     runner = ReturningRunner(
@@ -1280,6 +1315,16 @@ def test_typed_models_enforce_identity_and_result_bounds() -> None:
         )
     with pytest.raises(ValidationError):
         finding.title = "Mutated"  # type: ignore[misc]
+
+
+def test_location_line_and_description_can_be_omitted() -> None:
+    location = Location.model_validate({"path": "feature.txt"})
+
+    assert location.line is None
+    assert location.description is None
+    required_fields = set(Location.model_json_schema()["required"])
+    assert "line" not in required_fields
+    assert "description" not in required_fields
 
 
 def test_finding_models_enforce_all_declared_string_and_collection_bounds() -> None:

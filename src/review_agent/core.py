@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import selectors
 import shutil
 import subprocess
 import uuid
@@ -15,6 +14,7 @@ from pydantic import ValidationError
 from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
+from review_agent.process import ProcessOptions, _run_bounded_process
 
 MAX_CHANGED_FILES = 100
 MAX_CHANGED_TEXT_LINES = 5_000
@@ -22,10 +22,6 @@ CANDIDATE_OUTPUT_MAX_BYTES = 65_536
 PROCESS_OUTPUT_MAX_BYTES = 1_048_576
 WORKSPACE_PREFIX = "review-agent-workspace-"
 _OWNED_WORKSPACE = re.compile(rf"^{re.escape(WORKSPACE_PREFIX)}[0-9a-f]{{32}}$")
-
-
-class _ProcessOutputLimitError(Exception):
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +119,7 @@ class Reviewer:
 
         workspace = self._create_workspace()
         checkout = workspace / "checkout"
+        primary_failed = False
         try:
             context = self._prepare_context(workspace, checkout, request)
             candidate = self._candidate_from_runner(context)
@@ -145,8 +142,18 @@ class Reviewer:
                 status=status,
                 findings=candidate.findings,
             )
+        except BaseException:
+            primary_failed = True
+            raise
         finally:
-            shutil.rmtree(workspace, ignore_errors=True)
+            try:
+                shutil.rmtree(workspace)
+            except Exception as error:
+                if not primary_failed:
+                    raise ReviewError(
+                        FailureCategory.REVIEW_FAILURE,
+                        stage="workspace_cleanup",
+                    ) from error
 
     def _create_workspace(self) -> Path:
         for _attempt in range(10):
@@ -363,71 +370,16 @@ class Reviewer:
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         remaining_review_time(stage="repository_materialization")
-        process = subprocess.Popen(  # noqa: S603 - arguments are structured and never use a shell.
-            arguments,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-        if process.stdout is None or process.stderr is None:
-            message = "bounded process capture requires stdout and stderr pipes"
-            raise RuntimeError(message)
-
-        captured = {"stdout": bytearray(), "stderr": bytearray()}
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-        total_bytes = 0
-        exceeded = False
         try:
-            while selector.get_map():
-                timeout = remaining_review_time(stage="repository_materialization")
-                for key, _events in selector.select(timeout):
-                    remaining = self._limits.process_output_max_bytes - total_bytes
-                    chunk = os.read(key.fd, min(65_536, remaining + 1))
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    total_bytes += len(chunk)
-                    if total_bytes > self._limits.process_output_max_bytes:
-                        exceeded = True
-                        process.kill()
-                        break
-                    captured[str(key.data)].extend(chunk)
-                if exceeded:
-                    break
-            return_code = self._wait_for_process(process)
-        finally:
-            selector.close()
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            process.stdout.close()
-            process.stderr.close()
-
-        if exceeded:
-            raise _ProcessOutputLimitError
-        completed = subprocess.CompletedProcess(
-            arguments,
-            return_code,
-            stdout=bytes(captured["stdout"]),
-            stderr=bytes(captured["stderr"]),
-        )
-        if return_code != 0:
-            raise subprocess.CalledProcessError(
-                return_code,
+            return _run_bounded_process(
                 arguments,
-                output=completed.stdout,
-                stderr=completed.stderr,
+                ProcessOptions(
+                    output_max_bytes=self._limits.process_output_max_bytes,
+                    stage="repository_materialization",
+                    env=env,
+                ),
             )
-        return completed
-
-    @staticmethod
-    def _wait_for_process(process: subprocess.Popen[bytes]) -> int:
-        wait_timeout = remaining_review_time(stage="repository_materialization")
-        try:
-            return process.wait(timeout=wait_timeout)
-        except subprocess.TimeoutExpired as error:
+        except TimeoutError as error:
             raise ReviewError(
                 FailureCategory.TIMEOUT,
                 stage="repository_materialization",

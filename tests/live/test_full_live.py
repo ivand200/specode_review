@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,16 +17,21 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
-from review_agent.core import GitHubRepository, ReviewContext, Reviewer, ReviewLimits
+from review_agent.core import (
+    GitHubRepository,
+    ReviewContext,
+    Reviewer,
+    ReviewLimits,
+    SandboxResourceLimits,
+)
 from review_agent.github import GitHubAppClient
+from review_agent.process import ProcessOptions, _run_bounded_process
 from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
     CodexSandboxRunner,
     DockerSandboxClient,
     DockerSandboxConfig,
-    ProcessOptions,
-    _run_bounded_process,
 )
 from review_agent.web import create_app
 
@@ -71,13 +76,27 @@ class RecordingPublisher:
 
 
 class RecordingRunner:
-    def __init__(self, runner: CodexSandboxRunner) -> None:
+    def __init__(
+        self,
+        runner: CodexSandboxRunner,
+        *,
+        repository_control_markers: Mapping[Path, str],
+    ) -> None:
         self._runner = runner
+        self._repository_control_markers = repository_control_markers
         self.context: ReviewContext | None = None
         self.host_checkout_unchanged = False
+        self.repository_controls_present = False
 
     def run(self, context: ReviewContext) -> object:
         self.context = context
+        self.repository_controls_present = all(
+            marker in (context.checkout / relative_path).read_text(encoding="utf-8")
+            for relative_path, marker in self._repository_control_markers.items()
+        )
+        if not self.repository_controls_present:
+            message = "checkpoint C repository control fixtures are missing"
+            raise RuntimeError(message)
         before = self._checkout_identity(context.checkout)
         candidate = self._runner.run(context)
         self.host_checkout_unchanged = self._checkout_identity(context.checkout) == before
@@ -119,6 +138,7 @@ class RecordingProcessRunner:
         self.operation = "not_started"
         self.failed_operation = "none"
         self.error = "none"
+        self.calls: list[tuple[str, ...]] = []
 
     def __call__(
         self,
@@ -133,6 +153,7 @@ class RecordingProcessRunner:
             if inner_index < len(arguments):
                 command = f"{command} {arguments[inner_index]}"
         self.operation = f"{options.stage}:{command}"
+        self.calls.append(arguments)
         try:
             return _run_bounded_process(arguments, options)
         except subprocess.CalledProcessError as error:
@@ -148,6 +169,84 @@ class RecordingProcessRunner:
 
     def diagnostics(self) -> str:
         return f"operation={self.failed_operation} error={self.error}"
+
+    def created_with_kit(self, kit: Path) -> bool:
+        return any(
+            len(arguments) > 1
+            and arguments[1] == "create"
+            and "--kit" in arguments
+            and arguments[arguments.index("--kit") + 1] == str(kit)
+            for arguments in self.calls
+        )
+
+    def codex_ignored_repository_configuration(self) -> bool:
+        for arguments in self.calls:
+            if "--" not in arguments:
+                continue
+            command = arguments[arguments.index("--") + 1 :]
+            if command[:2] != ("codex", "exec"):
+                continue
+            return "--ignore-user-config" in command and "--ignore-rules" in command
+        return False
+
+
+class VerifyingCodexSandboxClient:
+    def __init__(self, client: DockerSandboxClient) -> None:
+        self._client = client
+        self.loaded_kit: Path | None = None
+        self.forbidden_network_denied = False
+
+    def create_codex(
+        self,
+        *,
+        name: str,
+        control: Path,
+        checkout: Path,
+        kit: Path,
+        resources: SandboxResourceLimits,
+    ) -> None:
+        self._client.create_codex(
+            name=name,
+            control=control,
+            checkout=checkout,
+            kit=kit,
+            resources=resources,
+        )
+        self.loaded_kit = kit
+        self._client.execute(
+            name=name,
+            command=(
+                "sh",
+                "-c",
+                "command -v curl >/dev/null || exit 74; "
+                "if curl -fsS --connect-timeout 5 --max-time 10 "
+                "https://github.com/ >/dev/null; then exit 73; fi",
+            ),
+            workdir=None,
+            process_limit=resources.pids,
+        )
+        self.forbidden_network_denied = True
+
+    def execute(
+        self,
+        *,
+        name: str,
+        command: tuple[str, ...],
+        workdir: str | None,
+        process_limit: int,
+    ) -> bytes:
+        return self._client.execute(
+            name=name,
+            command=command,
+            workdir=workdir,
+            process_limit=process_limit,
+        )
+
+    def remove(self, name: str) -> None:
+        self._client.remove(name)
+
+    def list_names(self) -> tuple[str, ...]:
+        return self._client.list_names()
 
 
 @contextmanager
@@ -231,6 +330,41 @@ def _wait_for_publication_or_failure(
             pytest.fail("checkpoint C publication timed out", pytrace=False)
 
 
+def _assert_checkpoint_isolation(
+    *,
+    runner: RecordingRunner,
+    sandbox_client: VerifyingCodexSandboxClient,
+    process_runner: RecordingProcessRunner,
+    settings: ProductionSettings,
+) -> None:
+    assert runner.host_checkout_unchanged
+    assert runner.repository_controls_present
+    assert sandbox_client.loaded_kit == settings.review_kit_path
+    assert sandbox_client.forbidden_network_denied
+    assert process_runner.created_with_kit(settings.review_kit_path)
+    assert process_runner.codex_ignored_repository_configuration()
+    assert list(settings.workspace_root.iterdir()) == []
+    assert not any(
+        name.startswith(settings.sandbox_name_prefix) for name in sandbox_client.list_names()
+    )
+
+
+def _assert_no_secret_leakage(
+    observable_text: str,
+    settings: ProductionSettings,
+) -> None:
+    sensitive_values = [
+        settings.webhook_secret,
+        settings.private_key_path.read_text(encoding="utf-8"),
+    ]
+    raw_openai_key = os.environ.get("OPENAI_API_KEY")
+    if raw_openai_key:
+        sensitive_values.append(raw_openai_key)
+    assert all(secret not in observable_text for secret in sensitive_values)
+    assert "REVIEW_AGENT_GITHUB_TOKEN" not in observable_text
+    assert "OPENAI_API_KEY" not in observable_text
+
+
 @pytest.mark.live_full
 def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     caplog: pytest.LogCaptureFixture,
@@ -246,6 +380,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         pytest.fail("checkpoint C requires the configured dedicated test repository")
     expected_finding = _required_environment("E2E_EXPECTED_FINDING")
     forbidden_instruction = _required_environment("E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT")
+    forbidden_config = _required_environment("E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT")
     resources_path = Path(_required_environment("E2E_CREATED_RESOURCES_PATH"))
     if settings.workspace_root.resolve().is_relative_to(Path.cwd().resolve()):
         pytest.fail("checkpoint C workspace must not be inside the project working copy")
@@ -264,11 +399,13 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         installation_id=installation_id,
     )
     process_runner = RecordingProcessRunner()
-    sandbox_client = DockerSandboxClient(
-        process_runner=process_runner,
-        config=DockerSandboxConfig(
-            process_output_max_bytes=settings.process_output_max_bytes,
-            cleanup_timeout_seconds=settings.sandbox_cleanup_timeout_seconds,
+    sandbox_client = VerifyingCodexSandboxClient(
+        DockerSandboxClient(
+            process_runner=process_runner,
+            config=DockerSandboxConfig(
+                process_output_max_bytes=settings.process_output_max_bytes,
+                cleanup_timeout_seconds=settings.sandbox_cleanup_timeout_seconds,
+            ),
         )
     )
     runner = RecordingRunner(
@@ -278,7 +415,11 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
             kit=settings.review_kit_path,
             model=settings.codex_model,
             candidate_output_max_bytes=settings.candidate_output_max_bytes,
-        )
+        ),
+        repository_control_markers={
+            Path("AGENTS.md"): forbidden_instruction,
+            Path(".codex/config.toml"): forbidden_config,
+        },
     )
     reviewer = Reviewer(
         repository=settings.repository,
@@ -338,14 +479,16 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         in publisher.body
     )
     assert expected_finding.casefold() in publisher.body.casefold()
-    assert forbidden_instruction not in publisher.body
-    assert runner.host_checkout_unchanged
-    assert list(settings.workspace_root.iterdir()) == []
-    assert not any(
-        name.startswith(settings.sandbox_name_prefix) for name in sandbox_client.list_names()
+    assert all(
+        marker not in publisher.body for marker in (forbidden_instruction, forbidden_config)
+    )
+    _assert_checkpoint_isolation(
+        runner=runner,
+        sandbox_client=sandbox_client,
+        process_runner=process_runner,
+        settings=settings,
     )
     observable_text = (
         publisher.body + "\n" + "\n".join(record.getMessage() for record in caplog.records)
     )
-    assert settings.webhook_secret not in observable_text
-    assert "OPENAI_API_KEY" not in observable_text
+    _assert_no_secret_leakage(observable_text, settings)

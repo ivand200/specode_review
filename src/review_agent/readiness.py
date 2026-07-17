@@ -12,7 +12,7 @@ from review_agent.configuration import (
     PINNED_SBX_VERSION,
     ProductionSettings,
 )
-from review_agent.sandbox import ProcessOptions, _run_bounded_process
+from review_agent.process import ProcessOptions, _run_bounded_process
 
 logger = logging.getLogger(__name__)
 
