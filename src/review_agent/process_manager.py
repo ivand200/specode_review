@@ -157,11 +157,19 @@ class ReviewProcessManager:
                 if process.stdin is None:
                     message = "review child stdin was not created"
                     raise BrokenPipeError(message)
-                process.stdin.write(command.to_json_bytes())
-                await process.stdin.drain()
-                process.stdin.close()
-                await process.stdin.wait_closed()
-            except OSError:
+                async with asyncio.timeout_at(hard_deadline):
+                    process.stdin.write(command.to_json_bytes())
+                    await process.stdin.drain()
+                    process.stdin.close()
+                    await process.stdin.wait_closed()
+            except asyncio.CancelledError:
+                await self._rollback_failed_launch(
+                    process,
+                    attempt_id=attempt_id,
+                    active_key=active_key,
+                )
+                raise
+            except (OSError, TimeoutError):
                 await self._rollback_failed_launch(
                     process,
                     attempt_id=attempt_id,
@@ -195,9 +203,15 @@ class ReviewProcessManager:
             if process.stdin is not None:
                 process.stdin.close()
             if process.returncode is None:
-                with suppress(ProcessLookupError):
-                    process.kill()
-            await process.wait()
+                await _terminate_process_group(
+                    process,
+                    attempt_id=attempt_id,
+                    grace_seconds=(
+                        self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+                    ),
+                )
+            else:
+                await process.wait()
         await self._cleanup(attempt_id)
         self._reserved -= 1
         self._active_keys.remove(active_key)
@@ -220,29 +234,14 @@ class ReviewProcessManager:
                 "attempt_id=%s stage=timeout category=review_failure",
                 command.attempt_id,
             )
-            with suppress(ProcessLookupError, PermissionError):
-                os.killpg(process.pid, signal.SIGTERM)
-                logger.info(
-                    "review process signal sent attempt_id=%s signal=SIGTERM",
-                    command.attempt_id,
-                )
             cleanup_grace = (
                 self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
             )
-            grace_return_code = await _wait_for_process_group_exit(
+            return_code = await _terminate_process_group(
                 process,
+                attempt_id=command.attempt_id,
                 grace_seconds=cleanup_grace,
             )
-            if grace_return_code is None:
-                with suppress(ProcessLookupError, PermissionError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                    logger.info(
-                        "review process signal sent attempt_id=%s signal=SIGKILL",
-                        command.attempt_id,
-                    )
-                return_code = await process.wait()
-            else:
-                return_code = grace_return_code
         request = command.request
         if return_code == 0:
             child_status = "success"
@@ -294,7 +293,12 @@ class ReviewProcessManager:
 
     async def _cleanup(self, attempt_id: str) -> bool:
         try:
-            await asyncio.to_thread(self._resource_manager.cleanup, attempt_id)
+            await asyncio.wait_for(
+                asyncio.to_thread(self._resource_manager.cleanup, attempt_id),
+                timeout=(
+                    self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+                ),
+            )
         except Exception:  # noqa: BLE001 - exact parent cleanup failure boundary.
             logger.warning(
                 "review process cleanup failed "
@@ -317,6 +321,33 @@ async def _wait_for_process_group_exit(
         if remaining <= 0:
             return None
         await asyncio.sleep(min(0.01, remaining))
+    return await process.wait()
+
+
+async def _terminate_process_group(
+    process: asyncio.subprocess.Process,
+    *,
+    attempt_id: str,
+    grace_seconds: float,
+) -> int:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGTERM)
+        logger.info(
+            "review process signal sent attempt_id=%s signal=SIGTERM",
+            attempt_id,
+        )
+    return_code = await _wait_for_process_group_exit(
+        process,
+        grace_seconds=grace_seconds,
+    )
+    if return_code is not None:
+        return return_code
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+        logger.info(
+            "review process signal sent attempt_id=%s signal=SIGKILL",
+            attempt_id,
+        )
     return await process.wait()
 
 

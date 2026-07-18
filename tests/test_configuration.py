@@ -127,6 +127,7 @@ def test_attempt_settings_render_a_revalidatable_allowlisted_executor_environmen
         "HOME": "/trusted/home",
         "TMPDIR": "/trusted/tmp",
         "DOCKER_HOST": "unix:///trusted/docker.sock",
+        "DOCKER_SANDBOXES_CONTEXT": "trusted-sandbox-context",
         "SSL_CERT_FILE": "/trusted/cert.pem",
         "GITHUB_WEBHOOK_SECRET": "webhook-secret-must-not-cross-" + "x" * 8,
         "OPENAI_API_KEY": "raw-model-secret-must-not-cross",
@@ -143,6 +144,10 @@ def test_attempt_settings_render_a_revalidatable_allowlisted_executor_environmen
     assert executor_environment["HOME"] == "/trusted/home"
     assert executor_environment["TMPDIR"] == "/trusted/tmp"
     assert executor_environment["DOCKER_HOST"] == "unix:///trusted/docker.sock"
+    assert (
+        executor_environment["DOCKER_SANDBOXES_CONTEXT"]
+        == "trusted-sandbox-context"
+    )
     assert executor_environment["SSL_CERT_FILE"] == "/trusted/cert.pem"
     for excluded in (
         "GITHUB_REPOSITORY",

@@ -301,9 +301,10 @@ class AttemptSettings:
         runtime = self.runtime
         resources = runtime.review_limits.sandbox_resources
         rendered = {
-            name: parent_environment[name]
-            for name in _EXECUTOR_OS_ENVIRONMENT
-            if name in parent_environment
+            name: value
+            for name, value in parent_environment.items()
+            if name in _EXECUTOR_OS_ENVIRONMENT
+            or name.startswith("DOCKER_SANDBOXES_")
         }
         rendered.update(
             {

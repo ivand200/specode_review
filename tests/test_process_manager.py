@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,72 @@ class RecordingSandboxResources:
 
     def remove(self, name: str) -> None:
         raise AssertionError(name)
+
+
+class BlockingSandboxResources(RecordingSandboxResources):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_started = threading.Event()
+        self.release_cleanup = threading.Event()
+
+    def list_names(self) -> tuple[str, ...]:
+        self.list_calls += 1
+        self.cleanup_started.set()
+        self.release_cleanup.wait()
+        return ()
+
+
+class _NeverDrainsStdin:
+    def __init__(self) -> None:
+        self.closed = False
+        self.drain_started = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        del data
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await asyncio.Event().wait()
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return
+
+
+class _NeverConsumesProcess:
+    def __init__(self) -> None:
+        self.stdin = _NeverDrainsStdin()
+        self.pid = 999_999
+        self.returncode: int | None = None
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        if self.returncode is None:
+            await asyncio.Event().wait()
+        return self.returncode
+
+
+def _install_nonconsuming_process(
+    monkeypatch: pytest.MonkeyPatch,
+    process: _NeverConsumesProcess,
+) -> None:
+    async def spawn(*args: object, **kwargs: object) -> _NeverConsumesProcess:
+        del args, kwargs
+        return process
+
+    def signal_process_group(process_group_id: int, sent_signal: int) -> None:
+        assert process_group_id == process.pid
+        if sent_signal == 0 and process.returncode is not None:
+            raise ProcessLookupError
+        if sent_signal != 0:
+            process.kill()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(os, "killpg", signal_process_group)
 
 
 def _attempt_settings(
@@ -127,6 +194,54 @@ def test_manager_accepts_only_after_delivering_one_complete_attempt(
     assert len(command.attempt_id) == 32
     workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
     assert not workspace.exists()
+
+
+def test_command_delivery_is_bounded_by_the_attempt_hard_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    process = _NeverConsumesProcess()
+    manager = _manager(
+        tmp_path,
+        receipt,
+        review_timeout_seconds=0.01,
+        cleanup_timeout_seconds=0.01,
+    )
+    _install_nonconsuming_process(monkeypatch, process)
+
+    async def exercise() -> SubmissionOutcome:
+        async with manager:
+            return await asyncio.wait_for(manager.start(_request()), timeout=0.2)
+
+    outcome = asyncio.run(exercise())
+
+    assert outcome is SubmissionOutcome.UNAVAILABLE
+    assert process.stdin.closed
+    assert process.returncode is not None
+
+
+def test_cancelled_command_delivery_terminates_the_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    process = _NeverConsumesProcess()
+    manager = _manager(tmp_path, receipt)
+    _install_nonconsuming_process(monkeypatch, process)
+
+    async def exercise() -> None:
+        async with manager:
+            delivery = asyncio.create_task(manager.start(_request()))
+            await process.stdin.drain_started.wait()
+            delivery.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await delivery
+
+    asyncio.run(exercise())
+
+    assert process.stdin.closed
+    assert process.returncode is not None
 
 
 def test_configured_capacity_permits_three_complete_attempts(
@@ -282,6 +397,44 @@ def test_full_capacity_retains_no_distinct_request_and_reuses_slot_after_cleanup
     assert accepted is SubmissionOutcome.ACCEPTED
     assert at_capacity is SubmissionOutcome.AT_CAPACITY
     assert len(tuple(started.iterdir())) == 2
+
+
+def test_parent_cleanup_releases_admission_when_its_budget_expires(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    sandbox_resources = BlockingSandboxResources()
+    manager = _manager(
+        tmp_path,
+        receipt,
+        sandbox_resources=sandbox_resources,
+        cleanup_timeout_seconds=0.02,
+    )
+    distinct_request = _request().model_copy(update={"pr_number": 18})
+
+    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
+        async with manager:
+            try:
+                accepted = await manager.start(_request())
+                cleanup_started = await asyncio.to_thread(
+                    sandbox_resources.cleanup_started.wait,
+                    1,
+                )
+                assert cleanup_started
+                for _ in range(100):
+                    retried = await manager.start(distinct_request)
+                    if retried is SubmissionOutcome.ACCEPTED:
+                        return accepted, retried
+                    assert retried is SubmissionOutcome.AT_CAPACITY
+                    await asyncio.sleep(0.01)
+                pytest.fail("cleanup timeout did not release admission")
+            finally:
+                sandbox_resources.release_cleanup.set()
+
+    accepted, retried = asyncio.run(exercise())
+
+    assert accepted is SubmissionOutcome.ACCEPTED
+    assert retried is SubmissionOutcome.ACCEPTED
 
 
 def test_exact_request_can_restart_with_a_new_attempt_after_cleanup(

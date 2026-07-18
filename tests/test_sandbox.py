@@ -518,7 +518,13 @@ def test_docker_sandbox_client_lists_names_and_forces_bounded_removal() -> None:
     assert process_runner.calls == [
         (
             ("/opt/review-agent/bin/sbx", "ls", "--quiet"),
-            ProcessOptions(output_max_bytes=16_384, stage="sandbox_list", env={}),
+            ProcessOptions(
+                output_max_bytes=16_384,
+                stage="sandbox_list",
+                timeout_seconds=7,
+                use_review_deadline=False,
+                env={},
+            ),
         ),
         (
             (

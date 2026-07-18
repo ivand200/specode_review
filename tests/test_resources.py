@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import review_agent.resources
 from review_agent.resources import AttemptResources, ReviewResourceManager
 
 
@@ -56,6 +57,35 @@ def test_exact_cleanup_is_idempotent_and_preserves_other_attempts(tmp_path: Path
     assert other.workspace.is_dir()
     assert client.removed == [exact_sandbox]
     assert client.existing == [other_sandbox]
+
+
+def test_exact_cleanup_removes_the_sandbox_when_workspace_deletion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_id = "a" * 32
+    sandbox_name = "review-agent-" + attempt_id
+    client = RecordingSandboxResources(existing=[sandbox_name])
+    manager = ReviewResourceManager(
+        workspace_root=tmp_path / "workspaces",
+        sandbox_prefix="review-agent-",
+        sandbox_client=client,
+    )
+    workspace = manager.for_attempt(attempt_id).workspace
+    workspace.mkdir(parents=True)
+
+    def fail_workspace_deletion(path: Path) -> None:
+        assert path == workspace
+        message = "simulated workspace deletion failure"
+        raise OSError(message)
+
+    monkeypatch.setattr(review_agent.resources.shutil, "rmtree", fail_workspace_deletion)
+
+    with pytest.raises(OSError, match="simulated workspace deletion failure"):
+        manager.cleanup(attempt_id)
+
+    assert workspace.is_dir()
+    assert client.removed == [sandbox_name]
 
 
 def test_exact_cleanup_rejects_an_owned_name_that_is_a_symlink(tmp_path: Path) -> None:

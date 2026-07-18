@@ -114,10 +114,20 @@ class ReviewResourceManager:
         if lexists(resources.workspace) and not resources.workspace.is_dir():
             message = "owned workspace must be a directory"
             raise ValueError(message)
-        if resources.workspace.exists():
-            shutil.rmtree(resources.workspace)
-        if resources.sandbox_name in self._sandbox_client.list_names():
-            self._sandbox_client.remove(resources.sandbox_name)
+        cleanup_error: Exception | None = None
+        try:
+            if resources.workspace.exists():
+                shutil.rmtree(resources.workspace)
+        except Exception as error:  # noqa: BLE001 - cleanup attempts are independent.
+            cleanup_error = error
+        try:
+            if resources.sandbox_name in self._sandbox_client.list_names():
+                self._sandbox_client.remove(resources.sandbox_name)
+        except Exception as error:  # noqa: BLE001 - preserve the first cleanup failure.
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def sweep_stale(self) -> None:
         if self._workspace_root.is_symlink() or not self._workspace_root.is_dir():

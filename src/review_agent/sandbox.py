@@ -189,6 +189,8 @@ class DockerSandboxClient:
             ProcessOptions(
                 output_max_bytes=self._process_output_max_bytes,
                 stage="sandbox_list",
+                timeout_seconds=self._cleanup_timeout_seconds,
+                use_review_deadline=False,
                 env=self._environment,
             ),
         )
