@@ -33,14 +33,16 @@ def create_production_app(
     )
     (readiness or ProductionReadiness()).check(resolved_settings)
 
-    runtime = resolved_settings.runtime
+    webhook = resolved_settings.webhook
+    attempt = resolved_settings.attempt
+    runtime = attempt.runtime
     sandbox_client = DockerSandboxClient(
         config=runtime.sandbox_operation,
     )
     adapter = CodexSandboxAdapter(
         client=sandbox_client,
         sandbox_prefix=runtime.sandbox_name_prefix,
-        kit=resolved_settings.review_kit_path,
+        kit=attempt.review_kit_path,
         config=runtime.codex_execution,
     )
     candidate_acceptance = CandidateAcceptance(
@@ -48,14 +50,14 @@ def create_production_app(
         max_bytes=runtime.candidate_output_max_bytes,
     )
     github = GitHubAppClient(
-        repository=resolved_settings.repository,
-        app_id=resolved_settings.app_id,
-        private_key_path=resolved_settings.private_key_path,
+        repository=webhook.repository,
+        app_id=attempt.app_id,
+        private_key_path=attempt.private_key_path,
     )
     try:
         reviewer = Reviewer(
-            repository=resolved_settings.repository,
-            workspace_root=resolved_settings.workspace_root,
+            repository=webhook.repository,
+            workspace_root=attempt.workspace_root,
             candidate_acceptance=candidate_acceptance,
             source_repository=GitHubRepository(credentials=github),
             limits=runtime.review_limits,
@@ -64,8 +66,8 @@ def create_production_app(
         github.close()
         raise
     return create_app(
-        repository=resolved_settings.repository,
-        webhook_secret=resolved_settings.webhook_secret,
+        repository=webhook.repository,
+        webhook_secret=webhook.secret,
         worker=SingleReviewWorker(
             reviewer=reviewer,
             publisher=github,

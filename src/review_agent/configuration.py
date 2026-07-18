@@ -18,6 +18,26 @@ _SANDBOX_PREFIX = re.compile(r"^[a-z0-9][a-z0-9.-]{1,29}-$")
 _WEBHOOK_SECRET_MIN_CHARS = 32
 _WEBHOOK_SECRET_MAX_CHARS = 1_024
 _CODEX_MODEL_MAX_CHARS = 128
+_MAX_CONCURRENT_REVIEWS = 10
+_EXECUTOR_OS_ENVIRONMENT = frozenset(
+    {
+        "CURL_CA_BUNDLE",
+        "DOCKER_CONFIG",
+        "DOCKER_HOST",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,31 +206,30 @@ def _existing_directory(environment: Mapping[str, str], name: str) -> Path:
 
 
 @dataclass(frozen=True, slots=True)
-class ProductionSettings:
+class WebhookSettings:
     repository: str
+    secret: str = field(repr=False)
+    max_concurrent_reviews: int
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptSettings:
     app_id: int
     private_key_path: Path
-    webhook_secret: str = field(repr=False)
     review_kit_path: Path
     workspace_root: Path
     runtime: RuntimePolicy
 
     @classmethod
-    def from_environment(cls, environment: Mapping[str, str]) -> "ProductionSettings":
-        repository = _required(environment, "GITHUB_REPOSITORY")
-        if _REPOSITORY.fullmatch(repository) is None or repository.endswith(".git"):
-            _invalid("GITHUB_REPOSITORY")
-
-        webhook_secret = _required(environment, "GITHUB_WEBHOOK_SECRET")
-        if not _WEBHOOK_SECRET_MIN_CHARS <= len(webhook_secret) <= _WEBHOOK_SECRET_MAX_CHARS:
-            _invalid("GITHUB_WEBHOOK_SECRET")
-
+    def from_environment(cls, environment: Mapping[str, str]) -> "AttemptSettings":
         codex_model = _required(environment, "CODEX_MODEL")
         if len(codex_model) > _CODEX_MODEL_MAX_CHARS or codex_model.strip() != codex_model:
             _invalid("CODEX_MODEL")
 
         try:
-            reasoning_effort = ReasoningEffort(_required(environment, "OPENAI_REASONING_EFFORT"))
+            reasoning_effort = ReasoningEffort(
+                _required(environment, "OPENAI_REASONING_EFFORT")
+            )
         except ValueError:
             _invalid("OPENAI_REASONING_EFFORT")
 
@@ -225,54 +244,118 @@ class ProductionSettings:
         if _SANDBOX_PREFIX.fullmatch(sandbox_name_prefix) is None:
             _invalid("SANDBOX_NAME_PREFIX")
 
-        review_timeout_seconds = _positive_float(
-            environment,
-            "REVIEW_TIMEOUT_SECONDS",
-            default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
-        )
-        sandbox_resources = SandboxResourceLimits(
-            cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
-            memory_mib=_positive_int(environment, "SANDBOX_MEMORY_MIB", default=4_096),
-            pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
-        )
         process_output_max_bytes = _positive_int(
             environment,
             "PROCESS_OUTPUT_MAX_BYTES",
             default=PROCESS_OUTPUT_MAX_BYTES,
         )
-        candidate_output_max_bytes = _positive_int(
-            environment,
-            "CANDIDATE_OUTPUT_MAX_BYTES",
-            default=CANDIDATE_OUTPUT_MAX_BYTES,
+        runtime = RuntimePolicy(
+            codex_execution=CodexExecutionPolicy(
+                model=codex_model,
+                reasoning_effort=reasoning_effort,
+            ),
+            sandbox_operation=SandboxOperationPolicy(
+                process_output_max_bytes=process_output_max_bytes,
+                cleanup_timeout_seconds=_positive_float(
+                    environment,
+                    "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
+                    default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
+                ),
+            ),
+            review_limits=ReviewLimits(
+                process_output_max_bytes=process_output_max_bytes,
+                sandbox_resources=SandboxResourceLimits(
+                    cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
+                    memory_mib=_positive_int(
+                        environment,
+                        "SANDBOX_MEMORY_MIB",
+                        default=4_096,
+                    ),
+                    pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
+                ),
+            ),
+            candidate_output_max_bytes=_positive_int(
+                environment,
+                "CANDIDATE_OUTPUT_MAX_BYTES",
+                default=CANDIDATE_OUTPUT_MAX_BYTES,
+            ),
+            review_timeout_seconds=_positive_float(
+                environment,
+                "REVIEW_TIMEOUT_SECONDS",
+                default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
+            ),
+            sandbox_name_prefix=sandbox_name_prefix,
         )
-        sandbox_cleanup_timeout_seconds = _positive_float(
-            environment,
-            "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
-            default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
-        )
-
         return cls(
-            repository=repository,
             app_id=_positive_int(environment, "GITHUB_APP_ID"),
             private_key_path=_existing_file(environment, "GITHUB_PRIVATE_KEY_PATH"),
-            webhook_secret=webhook_secret,
             review_kit_path=_existing_directory(environment, "REVIEW_KIT_PATH"),
             workspace_root=workspace_root,
-            runtime=RuntimePolicy(
-                codex_execution=CodexExecutionPolicy(
-                    model=codex_model,
-                    reasoning_effort=reasoning_effort,
+            runtime=runtime,
+        )
+
+    def render_executor_environment(
+        self,
+        parent_environment: Mapping[str, str],
+    ) -> dict[str, str]:
+        runtime = self.runtime
+        resources = runtime.review_limits.sandbox_resources
+        rendered = {
+            name: parent_environment[name]
+            for name in _EXECUTOR_OS_ENVIRONMENT
+            if name in parent_environment
+        }
+        rendered.update(
+            {
+                "GITHUB_APP_ID": str(self.app_id),
+                "GITHUB_PRIVATE_KEY_PATH": str(self.private_key_path),
+                "CODEX_MODEL": runtime.codex_execution.model,
+                "OPENAI_REASONING_EFFORT": runtime.codex_execution.reasoning_effort.value,
+                "REVIEW_KIT_PATH": str(self.review_kit_path),
+                "WORKSPACE_ROOT": str(self.workspace_root),
+                "REVIEW_TIMEOUT_SECONDS": str(runtime.review_timeout_seconds),
+                "SANDBOX_CPUS": str(resources.cpus),
+                "SANDBOX_MEMORY_MIB": str(resources.memory_mib),
+                "SANDBOX_PIDS": str(resources.pids),
+                "PROCESS_OUTPUT_MAX_BYTES": str(runtime.review_limits.process_output_max_bytes),
+                "CANDIDATE_OUTPUT_MAX_BYTES": str(runtime.candidate_output_max_bytes),
+                "SANDBOX_CLEANUP_TIMEOUT_SECONDS": str(
+                    runtime.sandbox_operation.cleanup_timeout_seconds
                 ),
-                sandbox_operation=SandboxOperationPolicy(
-                    process_output_max_bytes=process_output_max_bytes,
-                    cleanup_timeout_seconds=sandbox_cleanup_timeout_seconds,
-                ),
-                review_limits=ReviewLimits(
-                    process_output_max_bytes=process_output_max_bytes,
-                    sandbox_resources=sandbox_resources,
-                ),
-                candidate_output_max_bytes=candidate_output_max_bytes,
-                review_timeout_seconds=review_timeout_seconds,
-                sandbox_name_prefix=sandbox_name_prefix,
+                "SANDBOX_NAME_PREFIX": runtime.sandbox_name_prefix,
+            }
+        )
+        return rendered
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSettings:
+    webhook: WebhookSettings
+    attempt: AttemptSettings
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> "ProductionSettings":
+        repository = _required(environment, "GITHUB_REPOSITORY")
+        if _REPOSITORY.fullmatch(repository) is None or repository.endswith(".git"):
+            _invalid("GITHUB_REPOSITORY")
+
+        webhook_secret = _required(environment, "GITHUB_WEBHOOK_SECRET")
+        if not _WEBHOOK_SECRET_MIN_CHARS <= len(webhook_secret) <= _WEBHOOK_SECRET_MAX_CHARS:
+            _invalid("GITHUB_WEBHOOK_SECRET")
+
+        max_concurrent_reviews = _positive_int(
+            environment,
+            "MAX_CONCURRENT_REVIEWS",
+            default=1,
+        )
+        if max_concurrent_reviews > _MAX_CONCURRENT_REVIEWS:
+            _invalid("MAX_CONCURRENT_REVIEWS")
+
+        return cls(
+            webhook=WebhookSettings(
+                repository=repository,
+                secret=webhook_secret,
+                max_concurrent_reviews=max_concurrent_reviews,
             ),
+            attempt=AttemptSettings.from_environment(environment),
         )

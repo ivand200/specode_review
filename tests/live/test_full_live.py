@@ -347,18 +347,19 @@ def _assert_checkpoint_isolation(
     process_runner: RecordingProcessRunner,
     settings: ProductionSettings,
 ) -> None:
+    attempt = settings.attempt
     assert runner.host_checkout_unchanged
     assert runner.repository_controls_present
-    assert sandbox_client.loaded_kit == settings.review_kit_path
+    assert sandbox_client.loaded_kit == attempt.review_kit_path
     assert sandbox_client.forbidden_network_denied
-    assert process_runner.created_with_kit(settings.review_kit_path)
+    assert process_runner.created_with_kit(attempt.review_kit_path)
     assert process_runner.codex_ignored_repository_configuration()
     assert process_runner.codex_used_reasoning_effort(
-        settings.runtime.codex_execution.reasoning_effort.value
+        attempt.runtime.codex_execution.reasoning_effort.value
     )
-    assert list(settings.workspace_root.iterdir()) == []
+    assert list(attempt.workspace_root.iterdir()) == []
     assert not any(
-        name.startswith(settings.runtime.sandbox_name_prefix)
+        name.startswith(attempt.runtime.sandbox_name_prefix)
         for name in sandbox_client.list_names()
     )
 
@@ -368,8 +369,8 @@ def _assert_no_secret_leakage(
     settings: ProductionSettings,
 ) -> None:
     sensitive_values = [
-        settings.webhook_secret,
-        settings.private_key_path.read_text(encoding="utf-8"),
+        settings.webhook.secret,
+        settings.attempt.private_key_path.read_text(encoding="utf-8"),
     ]
     raw_openai_key = os.environ.get("OPENAI_API_KEY")
     if raw_openai_key:
@@ -389,23 +390,25 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         pytest.fail("set ACKNOWLEDGE_MODEL_COST=1 to approve the checkpoint C model call")
 
     settings = ProductionSettings.from_environment(os.environ)
+    webhook = settings.webhook
+    attempt = settings.attempt
     repository = _required_environment("E2E_GITHUB_REPOSITORY")
-    if repository != settings.repository or "test" not in repository.casefold():
+    if repository != webhook.repository or "test" not in repository.casefold():
         pytest.fail("checkpoint C requires the configured dedicated test repository")
     expected_finding = _required_environment("E2E_EXPECTED_FINDING")
     forbidden_instruction = _required_environment("E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT")
     forbidden_config = _required_environment("E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT")
     resources_path = Path(_required_environment("E2E_CREATED_RESOURCES_PATH"))
-    if settings.workspace_root.resolve().is_relative_to(Path.cwd().resolve()):
+    if attempt.workspace_root.resolve().is_relative_to(Path.cwd().resolve()):
         pytest.fail("checkpoint C workspace must not be inside the project working copy")
-    if settings.workspace_root.exists() and any(settings.workspace_root.iterdir()):
+    if attempt.workspace_root.exists() and any(attempt.workspace_root.iterdir()):
         pytest.fail("checkpoint C requires an empty dedicated workspace root")
 
     ProductionReadiness().check(settings)
     github = GitHubAppClient(
-        repository=settings.repository,
-        app_id=settings.app_id,
-        private_key_path=settings.private_key_path,
+        repository=webhook.repository,
+        app_id=attempt.app_id,
+        private_key_path=attempt.private_key_path,
     )
     installation_id = github.repository_installation_id()
     accepted_request = github.review_request(
@@ -416,15 +419,15 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     sandbox_client = VerifyingCodexSandboxClient(
         DockerSandboxClient(
             process_runner=process_runner,
-            config=settings.runtime.sandbox_operation,
+            config=attempt.runtime.sandbox_operation,
         )
     )
     runner = RecordingAdapter(
         CodexSandboxAdapter(
             client=sandbox_client,
-            sandbox_prefix=settings.runtime.sandbox_name_prefix,
-            kit=settings.review_kit_path,
-            config=settings.runtime.codex_execution,
+            sandbox_prefix=attempt.runtime.sandbox_name_prefix,
+            kit=attempt.review_kit_path,
+            config=attempt.runtime.codex_execution,
         ),
         repository_control_markers={
             Path("AGENTS.md"): forbidden_instruction,
@@ -432,23 +435,23 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         },
     )
     reviewer = Reviewer(
-        repository=settings.repository,
-        workspace_root=settings.workspace_root,
+        repository=webhook.repository,
+        workspace_root=attempt.workspace_root,
         candidate_acceptance=CandidateAcceptance(
             adapter=runner,
-            max_bytes=settings.runtime.candidate_output_max_bytes,
+            max_bytes=attempt.runtime.candidate_output_max_bytes,
         ),
         source_repository=GitHubRepository(credentials=github),
-        limits=settings.runtime.review_limits,
+        limits=attempt.runtime.review_limits,
     )
     publisher = RecordingPublisher(github, resources_path)
     app = create_app(
-        repository=settings.repository,
-        webhook_secret=settings.webhook_secret,
+        repository=webhook.repository,
+        webhook_secret=webhook.secret,
         worker=SingleReviewWorker(
             reviewer=reviewer,
             publisher=publisher,
-            review_timeout_seconds=settings.runtime.review_timeout_seconds,
+            review_timeout_seconds=attempt.runtime.review_timeout_seconds,
         ),
         shutdown_callback=github.close,
     )
@@ -471,12 +474,12 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         status_code, response_body = _send_signed_webhook(
             url,
             payload,
-            settings.webhook_secret,
+            webhook.secret,
         )
         _wait_for_publication_or_failure(
             publisher,
             failure_handler,
-            timeout_seconds=settings.runtime.review_timeout_seconds,
+            timeout_seconds=attempt.runtime.review_timeout_seconds,
             diagnostics=process_runner.diagnostics,
         )
 

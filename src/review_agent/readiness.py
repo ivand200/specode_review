@@ -66,7 +66,8 @@ class ProductionReadiness:
 
     def check(self, settings: ProductionSettings) -> None:
         self._verify_paths(settings)
-        process_output_max_bytes = settings.runtime.sandbox_operation.process_output_max_bytes
+        attempt = settings.attempt
+        process_output_max_bytes = attempt.runtime.sandbox_operation.process_output_max_bytes
         sbx = self._executable("sbx")
         codex = self._executable("codex")
         git = self._executable("git")
@@ -95,25 +96,26 @@ class ProductionReadiness:
             output_max_bytes=process_output_max_bytes,
         )
         self._command(
-            (sbx, "kit", "validate", str(settings.review_kit_path)),
+            (sbx, "kit", "validate", str(attempt.review_kit_path)),
             stage="review_kit_validation",
             output_max_bytes=process_output_max_bytes,
         )
 
     @staticmethod
     def _verify_paths(settings: ProductionSettings) -> None:
+        attempt = settings.attempt
         try:
             configured_inputs_are_valid = not (
-                settings.private_key_path.is_symlink()
-                or not settings.private_key_path.is_file()
-                or settings.review_kit_path.is_symlink()
-                or not settings.review_kit_path.is_dir()
+                attempt.private_key_path.is_symlink()
+                or not attempt.private_key_path.is_file()
+                or attempt.review_kit_path.is_symlink()
+                or not attempt.review_kit_path.is_dir()
             )
-            settings.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            attempt.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
             workspace_is_valid = not (
-                settings.workspace_root.is_symlink()
-                or not settings.workspace_root.is_dir()
-                or not os.access(settings.workspace_root, os.R_OK | os.W_OK | os.X_OK)
+                attempt.workspace_root.is_symlink()
+                or not attempt.workspace_root.is_dir()
+                or not os.access(attempt.workspace_root, os.R_OK | os.W_OK | os.X_OK)
             )
         except OSError:
             ProductionReadiness._fail("configured_paths")
