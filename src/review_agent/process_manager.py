@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
 import uuid
 from collections.abc import Mapping
@@ -138,6 +139,11 @@ class ReviewProcessManager:
                     env=self._executor_environment,
                     start_new_session=True,
                 )
+                hard_deadline = (
+                    asyncio.get_running_loop().time()
+                    + self._attempt_settings.runtime.review_timeout_seconds
+                    + self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+                )
                 logger.info(
                     "review process started attempt_id=%s repository=%s pr_number=%d "
                     "base_sha=%s head_sha=%s pid=%d",
@@ -168,7 +174,13 @@ class ReviewProcessManager:
                 )
                 return SubmissionOutcome.UNAVAILABLE
 
-            monitor_task = asyncio.create_task(self._monitor(process, command=command))
+            monitor_task = asyncio.create_task(
+                self._monitor(
+                    process,
+                    command=command,
+                    hard_deadline=hard_deadline,
+                )
+            )
             self._monitor_tasks.add(monitor_task)
             return SubmissionOutcome.ACCEPTED
 
@@ -195,27 +207,79 @@ class ReviewProcessManager:
         process: asyncio.subprocess.Process,
         *,
         command: AttemptCommand,
+        hard_deadline: float,
     ) -> None:
-        return_code = await process.wait()
+        remaining = max(0.0, hard_deadline - asyncio.get_running_loop().time())
+        hard_timed_out = False
+        try:
+            return_code = await asyncio.wait_for(process.wait(), timeout=remaining)
+        except TimeoutError:
+            hard_timed_out = True
+            logger.warning(
+                "review process hard timeout "
+                "attempt_id=%s stage=timeout category=review_failure",
+                command.attempt_id,
+            )
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(process.pid, signal.SIGTERM)
+                logger.info(
+                    "review process signal sent attempt_id=%s signal=SIGTERM",
+                    command.attempt_id,
+                )
+            cleanup_grace = (
+                self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+            )
+            grace_return_code = await _wait_for_process_group_exit(
+                process,
+                grace_seconds=cleanup_grace,
+            )
+            if grace_return_code is None:
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                    logger.info(
+                        "review process signal sent attempt_id=%s signal=SIGKILL",
+                        command.attempt_id,
+                    )
+                return_code = await process.wait()
+            else:
+                return_code = grace_return_code
         request = command.request
         if return_code == 0:
-            outcome = "success"
+            child_status = "success"
         elif return_code < 0:
-            outcome = f"signal_{-return_code}"
+            child_status = f"signal_{-return_code}"
         else:
-            outcome = "nonzero_exit"
-        logger.info(
-            "review process exited attempt_id=%s repository=%s pr_number=%d "
-            "base_sha=%s head_sha=%s outcome=%s",
-            command.attempt_id,
-            request.repository,
-            request.pr_number,
-            request.base_sha,
-            request.head_sha,
-            outcome,
-        )
+            child_status = "nonzero_exit"
+        if hard_timed_out:
+            logger.info(
+                "review process exited attempt_id=%s repository=%s pr_number=%d "
+                "base_sha=%s head_sha=%s outcome=hard_timeout child_status=%s",
+                command.attempt_id,
+                request.repository,
+                request.pr_number,
+                request.base_sha,
+                request.head_sha,
+                child_status,
+            )
+        else:
+            logger.info(
+                "review process exited attempt_id=%s repository=%s pr_number=%d "
+                "base_sha=%s head_sha=%s outcome=%s",
+                command.attempt_id,
+                request.repository,
+                request.pr_number,
+                request.base_sha,
+                request.head_sha,
+                child_status,
+            )
         try:
-            await self._cleanup(command.attempt_id)
+            cleanup_succeeded = await self._cleanup(command.attempt_id)
+            if hard_timed_out and cleanup_succeeded:
+                logger.info(
+                    "review process cleanup completed "
+                    "attempt_id=%s stage=cleanup outcome=success",
+                    command.attempt_id,
+                )
         finally:
             async with self._admission_lock:
                 self._reserved -= 1
@@ -228,7 +292,7 @@ class ReviewProcessManager:
                 self._active_keys.remove(active_key)
                 self._monitor_tasks.discard(asyncio.current_task())
 
-    async def _cleanup(self, attempt_id: str) -> None:
+    async def _cleanup(self, attempt_id: str) -> bool:
         try:
             await asyncio.to_thread(self._resource_manager.cleanup, attempt_id)
         except Exception:  # noqa: BLE001 - exact parent cleanup failure boundary.
@@ -237,3 +301,30 @@ class ReviewProcessManager:
                 "attempt_id=%s stage=cleanup category=review_failure",
                 attempt_id,
             )
+            return False
+        return True
+
+
+async def _wait_for_process_group_exit(
+    process: asyncio.subprocess.Process,
+    *,
+    grace_seconds: float,
+) -> int | None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + grace_seconds
+    while _process_group_exists(process.pid):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(0.01, remaining))
+    return await process.wait()
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

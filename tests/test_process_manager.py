@@ -26,7 +26,12 @@ class RecordingSandboxResources:
         raise AssertionError(name)
 
 
-def _attempt_settings(tmp_path: Path) -> AttemptSettings:
+def _attempt_settings(
+    tmp_path: Path,
+    *,
+    review_timeout_seconds: float = 900,
+    cleanup_timeout_seconds: float = 30,
+) -> AttemptSettings:
     private_key = tmp_path / "github-app.pem"
     private_key.write_text("test private key", encoding="utf-8")
     review_kit = tmp_path / "review-kit"
@@ -39,6 +44,8 @@ def _attempt_settings(tmp_path: Path) -> AttemptSettings:
             "OPENAI_REASONING_EFFORT": "high",
             "REVIEW_KIT_PATH": str(review_kit),
             "WORKSPACE_ROOT": str(tmp_path / "workspaces"),
+            "REVIEW_TIMEOUT_SECONDS": str(review_timeout_seconds),
+            "SANDBOX_CLEANUP_TIMEOUT_SECONDS": str(cleanup_timeout_seconds),
         }
     )
 
@@ -55,15 +62,21 @@ def _request() -> ReviewRequest:
     )
 
 
-def _manager(
+def _manager(  # noqa: PLR0913 - compact fixture construction seam.
     tmp_path: Path,
     receipt: Path,
     *child_arguments: str,
     sandbox_resources: RecordingSandboxResources | None = None,
     child_executable: str = sys.executable,
     max_concurrent_reviews: int = 1,
+    review_timeout_seconds: float = 900,
+    cleanup_timeout_seconds: float = 30,
 ) -> ReviewProcessManager:
-    settings = _attempt_settings(tmp_path)
+    settings = _attempt_settings(
+        tmp_path,
+        review_timeout_seconds=review_timeout_seconds,
+        cleanup_timeout_seconds=cleanup_timeout_seconds,
+    )
     resolved_sandbox_resources = sandbox_resources or RecordingSandboxResources()
     return ReviewProcessManager(
         attempt_settings=settings,
@@ -403,3 +416,104 @@ def test_child_streams_and_safe_correlated_lifecycle_records_are_inherited(
         assert f"head_sha={'b' * 40}" in message
         assert "untrusted title" not in message
         assert "untrusted description" not in message
+
+
+def test_overlong_attempt_gets_sigterm_after_review_and_cleanup_budget(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    terminated = tmp_path / "terminated"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "exit-on-term",
+        str(started),
+        str(terminated),
+        review_timeout_seconds=0.15,
+        cleanup_timeout_seconds=0.1,
+    )
+    caplog.set_level(logging.INFO, logger="review_agent.process_manager")
+
+    async def exercise() -> float:
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        async with manager:
+            assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
+            for _ in range(100):
+                if started.exists():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("child did not start")
+        return loop.time() - began
+
+    elapsed = asyncio.run(exercise())
+
+    assert terminated.exists()
+    assert elapsed >= 0.24
+    assert not any(
+        "signal=SIGKILL" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_sigterm_ignoring_attempt_and_descendant_are_hard_stopped(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "ignore-term-group",
+        str(started),
+        review_timeout_seconds=0.3,
+        cleanup_timeout_seconds=0.1,
+    )
+    caplog.set_level(logging.INFO, logger="review_agent.process_manager")
+
+    async def exercise() -> float:
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        async with manager:
+            assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
+            for _ in range(100):
+                if started.exists():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("process group did not start")
+        return loop.time() - began
+
+    elapsed = asyncio.run(exercise())
+    direct_pid, descendant_pid = (int(value) for value in started.read_text().split())
+    command = AttemptCommand.from_json_bytes(receipt.read_bytes())
+
+    assert elapsed < 0.9
+    workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
+    assert not workspace.exists()
+    for pid in (direct_pid, descendant_pid):
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("signal=SIGTERM" in message for message in messages)
+    assert any("signal=SIGKILL" in message for message in messages)
+    assert any("stage=timeout" in message for message in messages)
+    assert any(
+        "outcome=hard_timeout child_status=signal_9" in message for message in messages
+    )
+    assert any("stage=cleanup outcome=success" in message for message in messages)
+    correlated = [
+        message
+        for message in messages
+        if "hard timeout" in message
+        or "signal sent" in message
+        or "process exited" in message
+        or "cleanup completed" in message
+    ]
+    assert len(correlated) == 5
+    assert all(f"attempt_id={command.attempt_id}" in message for message in correlated)
+    assert all("untrusted title" not in message for message in correlated)
+    assert all("untrusted description" not in message for message in correlated)
