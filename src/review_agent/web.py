@@ -107,6 +107,8 @@ async def _accept_github_webhook(
         ) from error
 
     outcome = await manager.start(review_request)
+    if outcome is SubmissionOutcome.ALREADY_RUNNING:
+        return JSONResponse({"status": "already_running"})
     if outcome is SubmissionOutcome.AT_CAPACITY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

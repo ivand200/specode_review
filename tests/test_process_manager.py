@@ -61,6 +61,7 @@ def _manager(
     *child_arguments: str,
     sandbox_resources: RecordingSandboxResources | None = None,
     child_executable: str = sys.executable,
+    max_concurrent_reviews: int = 1,
 ) -> ReviewProcessManager:
     settings = _attempt_settings(tmp_path)
     resolved_sandbox_resources = sandbox_resources or RecordingSandboxResources()
@@ -72,6 +73,7 @@ def _manager(
             sandbox_client=resolved_sandbox_resources,
         ),
         parent_environment=os.environ,
+        max_concurrent_reviews=max_concurrent_reviews,
         child_arguments=(
             child_executable,
             str(Path(__file__).parent / "fixtures" / "process_manager_child.py"),
@@ -79,6 +81,20 @@ def _manager(
             *child_arguments,
         ),
     )
+
+
+def _started_attempt_count(started: Path) -> int:
+    if not started.exists():
+        return 0
+    return len(tuple(started.iterdir()))
+
+
+async def _wait_for_started_attempts(started: Path, expected: int) -> None:
+    for _ in range(500):
+        if await asyncio.to_thread(_started_attempt_count, started) == expected:
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"expected {expected} child attempts to start")
 
 
 def test_manager_accepts_only_after_delivering_one_complete_attempt(
@@ -98,6 +114,198 @@ def test_manager_accepts_only_after_delivering_one_complete_attempt(
     assert len(command.attempt_id) == 32
     workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
     assert not workspace.exists()
+
+
+def test_configured_capacity_permits_three_complete_attempts(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "record-start",
+        str(started),
+        str(release),
+        max_concurrent_reviews=3,
+    )
+
+    async def exercise() -> tuple[SubmissionOutcome, ...]:
+        async with manager:
+            try:
+                outcomes = await asyncio.gather(
+                    manager.start(_request().model_copy(update={"pr_number": 17})),
+                    manager.start(_request().model_copy(update={"pr_number": 18})),
+                    manager.start(_request().model_copy(update={"pr_number": 19})),
+                )
+                await _wait_for_started_attempts(started, 3)
+                return tuple(outcomes)
+            finally:
+                release.touch()
+
+    outcomes = asyncio.run(exercise())
+    assert outcomes == (SubmissionOutcome.ACCEPTED,) * 3
+    assert len(tuple(started.iterdir())) == 3
+
+
+def test_exact_active_duplicate_precedes_capacity_and_starts_no_child(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "record-start",
+        str(started),
+        str(release),
+    )
+
+    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
+        async with manager:
+            accepted = await manager.start(_request())
+            await _wait_for_started_attempts(started, 1)
+            duplicate = await manager.start(_request())
+            release.touch()
+            return accepted, duplicate
+
+    accepted, duplicate = asyncio.run(exercise())
+    assert accepted is SubmissionOutcome.ACCEPTED
+    assert duplicate is SubmissionOutcome.ALREADY_RUNNING
+    assert len(tuple(started.iterdir())) == 1
+
+
+@pytest.mark.parametrize(
+    "changed_request",
+    [
+        pytest.param(
+            _request().model_copy(update={"repository": "octo-org/other"}),
+            id="repository",
+        ),
+        pytest.param(
+            _request().model_copy(update={"pr_number": 18}),
+            id="pull-request",
+        ),
+        pytest.param(
+            _request().model_copy(update={"base_sha": "c" * 40}),
+            id="base-sha",
+        ),
+        pytest.param(
+            _request().model_copy(update={"head_sha": "d" * 40}),
+            id="head-sha",
+        ),
+    ],
+)
+def test_each_active_identity_field_distinguishes_an_attempt(
+    tmp_path: Path,
+    changed_request: ReviewRequest,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "record-start",
+        str(started),
+        str(release),
+        max_concurrent_reviews=2,
+    )
+
+    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
+        async with manager:
+            try:
+                outcomes = await asyncio.gather(
+                    manager.start(_request()),
+                    manager.start(changed_request),
+                )
+                await _wait_for_started_attempts(started, 2)
+                return outcomes[0], outcomes[1]
+            finally:
+                release.touch()
+
+    outcomes = asyncio.run(exercise())
+    assert outcomes == (SubmissionOutcome.ACCEPTED,) * 2
+    assert len(tuple(started.iterdir())) == 2
+
+
+def test_full_capacity_retains_no_distinct_request_and_reuses_slot_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "record-start",
+        str(started),
+        str(release),
+    )
+    distinct_request = _request().model_copy(update={"pr_number": 18})
+
+    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
+        async with manager:
+            try:
+                accepted = await manager.start(_request())
+                await _wait_for_started_attempts(started, 1)
+                at_capacity = await manager.start(distinct_request)
+                assert await asyncio.to_thread(_started_attempt_count, started) == 1
+                release.touch()
+                for _ in range(500):
+                    retried = await manager.start(distinct_request)
+                    if retried is SubmissionOutcome.ACCEPTED:
+                        await _wait_for_started_attempts(started, 2)
+                        return accepted, at_capacity
+                    assert retried is SubmissionOutcome.AT_CAPACITY
+                    await asyncio.sleep(0.01)
+                pytest.fail("capacity slot was not released after cleanup")
+            finally:
+                release.touch()
+
+    accepted, at_capacity = asyncio.run(exercise())
+    assert accepted is SubmissionOutcome.ACCEPTED
+    assert at_capacity is SubmissionOutcome.AT_CAPACITY
+    assert len(tuple(started.iterdir())) == 2
+
+
+def test_exact_request_can_restart_with_a_new_attempt_after_cleanup(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "record-start",
+        str(started),
+        str(release),
+    )
+
+    async def exercise() -> None:
+        async with manager:
+            try:
+                assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
+                await _wait_for_started_attempts(started, 1)
+                release.touch()
+                for _ in range(500):
+                    retried = await manager.start(_request())
+                    if retried is SubmissionOutcome.ACCEPTED:
+                        await _wait_for_started_attempts(started, 2)
+                        return
+                    assert retried is SubmissionOutcome.ALREADY_RUNNING
+                    await asyncio.sleep(0.01)
+                pytest.fail("active key was not released after cleanup")
+            finally:
+                release.touch()
+
+    asyncio.run(exercise())
+    attempt_ids = tuple(path.name for path in started.iterdir())
+    assert len(attempt_ids) == 2
+    assert attempt_ids[0] != attempt_ids[1]
 
 
 def test_manager_stops_admission_during_shutdown_and_cannot_restart(

@@ -258,6 +258,12 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(
             id="accepted",
         ),
         pytest.param(
+            SubmissionOutcome.ALREADY_RUNNING,
+            200,
+            '{"status":"already_running"}',
+            id="already-running",
+        ),
+        pytest.param(
             SubmissionOutcome.AT_CAPACITY,
             503,
             '{"detail":"review execution capacity is full"}',

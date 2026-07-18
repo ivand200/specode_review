@@ -16,6 +16,13 @@ if len(sys.argv) == 3 and sys.argv[2] == "emit-output":
     sys.stdout.flush()
     sys.stderr.write("child stderr is inherited\n")
     sys.stderr.flush()
+if len(sys.argv) == 5 and sys.argv[2] == "record-start":
+    started = Path(sys.argv[3])
+    release = Path(sys.argv[4])
+    started.mkdir(parents=True, exist_ok=True)
+    (started / command.attempt_id).touch()
+    while not release.exists():
+        time.sleep(0.01)
 if len(sys.argv) == 4:
     started = Path(sys.argv[2])
     release = Path(sys.argv[3])
