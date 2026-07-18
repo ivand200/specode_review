@@ -168,8 +168,19 @@ values are not logged.
 The service does not use `pydantic-ai` and does not claim model-request, tool-call, or token limits
 that Codex CLI cannot enforce.
 
-The queue is in memory and has capacity ten. V0.1 has no delivery deduplication, retries, or crash
-recovery. An abrupt restart can lose queued or active work; redeliver the webhook manually.
+The worker keeps at most one active review plus ten waiting requests in memory. During graceful
+shutdown it stops accepting work immediately, gives only the active review up to the configured
+review timeout to finish review and publication, and discards every waiting request. Each discarded
+request produces a secret-safe `stage=worker_shutdown category=review_failure` warning identifying
+the repository, pull request number, and accepted head SHA. Use the GitHub App's
+**Advanced → Recent deliveries** page to redeliver each affected `pull_request / opened` webhook
+manually.
+
+Shutdown cancellation is cooperative, not a hard-kill guarantee. After the grace period the async
+worker wrapper may be cancelled, but Python cannot forcibly terminate arbitrary synchronous work
+already running in its thread. An abrupt process loss provides no grace or discard warnings and can
+lose both active and waiting work. V0.1 has no delivery deduplication, retries, or crash recovery;
+manual webhook redelivery is the recovery path in either case.
 
 ## Why there is no production Dockerfile
 

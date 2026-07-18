@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import subprocess
+import threading
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -8,11 +9,11 @@ from typing import Self
 import pytest
 
 from review_agent.configuration import ConfigurationError, ProductionSettings
-from review_agent.models import ReviewRequest
+from review_agent.models import DiffRange, ReviewRequest, ReviewResult
 from review_agent.production import create_production_app
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
 from review_agent.web import create_app
-from review_agent.worker import SubmissionOutcome
+from review_agent.worker import SingleReviewWorker, SubmissionOutcome
 
 
 def _valid_environment(tmp_path: Path) -> dict[str, str]:
@@ -263,6 +264,46 @@ class RecordingWorker:
         raise AssertionError(request)
 
 
+class LifecycleReviewer:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def review(self, request: ReviewRequest) -> ReviewResult:
+        self._events.append("review")
+        return ReviewResult(
+            repository=request.repository,
+            pr_number=request.pr_number,
+            diff_range=DiffRange(
+                start_sha=request.base_sha,
+                end_sha=request.head_sha,
+            ),
+            status="no_important_issues",
+            findings=(),
+        )
+
+
+class BlockingLifecyclePublisher:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def publish(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> None:
+        del repository, pr_number, installation_id, body
+        self._events.append("publication_start")
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError
+        self._events.append("publication_finish")
+
+
 def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() -> None:
     startup_failure = StartupReadinessError("review_kit_validation")
     events: list[str] = []
@@ -309,6 +350,55 @@ def test_application_lifespan_releases_production_resources_on_shutdown() -> Non
     asyncio.run(run_lifespan())
 
     assert events == ["readiness", "worker_enter", "worker_exit", "closed"]
+
+
+def test_application_lifespan_finishes_active_publication_before_resource_cleanup() -> None:
+    events: list[str] = []
+    publisher = BlockingLifecyclePublisher(events)
+    worker = SingleReviewWorker(
+        reviewer=LifecycleReviewer(events),
+        publisher=publisher,
+        review_timeout_seconds=1,
+    )
+    app = create_app(
+        repository="octo-org/example",
+        webhook_secret="a" * 32,
+        worker=worker,
+        startup_check=lambda: events.append("readiness"),
+        shutdown_callback=lambda: events.append("closed"),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="Review lifecycle ordering",
+    )
+
+    async def run_lifespan() -> None:
+        release_timer: threading.Timer | None = None
+        try:
+            async with app.router.lifespan_context(app):
+                assert worker.submit(request) is SubmissionOutcome.ACCEPTED
+                assert await asyncio.to_thread(publisher.started.wait, 5)
+                release_timer = threading.Timer(0.05, publisher.release.set)
+                release_timer.start()
+        finally:
+            if release_timer is not None:
+                release_timer.cancel()
+            publisher.release.set()
+
+    asyncio.run(run_lifespan())
+
+    assert worker.submit(request) is SubmissionOutcome.STOPPING
+    assert events == [
+        "readiness",
+        "review",
+        "publication_start",
+        "publication_finish",
+        "closed",
+    ]
 
 
 class RejectingReadiness:

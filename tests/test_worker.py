@@ -21,6 +21,16 @@ class UnusedPublisher:
         raise AssertionError(values)
 
 
+class ShutdownLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.emitted = threading.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "stage=worker_shutdown" in record.getMessage():
+            self.emitted.set()
+
+
 class RecordingReviewer:
     def __init__(
         self,
@@ -95,6 +105,22 @@ class BlockingFirstReviewer(RecordingReviewer):
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class CooperativeBlockingReviewer:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.reviewed_prs: list[int] = []
+
+    def review(self, request: ReviewRequest) -> ReviewResult:
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError
+        self.reviewed_prs.append(request.pr_number)
+        self.finished.set()
+        return _result(request)
 
 
 class SerialActivity:
@@ -476,6 +502,116 @@ def test_worker_exit_allows_the_active_attempt_to_finish_within_grace() -> None:
 
     assert reviewer.reviewed_prs == [17]
     assert publisher.published_prs == [17]
+
+
+def test_shutdown_grace_is_bounded_and_thread_cancellation_is_cooperative(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reviewer = CooperativeBlockingReviewer()
+    publisher = RecordingPublisher()
+    worker = _worker(
+        reviewer=reviewer,
+        publisher=publisher,
+        review_timeout_seconds=0.05,
+    )
+    caplog.set_level(logging.WARNING, logger="review_agent.worker")
+
+    async def exercise() -> None:
+        async def run_lifecycle() -> None:
+            async with worker:
+                assert worker.submit(_request()) is SubmissionOutcome.ACCEPTED
+                await _wait_for(reviewer.started)
+
+        try:
+            await asyncio.wait_for(run_lifecycle(), timeout=0.5)
+            assert worker.submit(_request(18)) is SubmissionOutcome.STOPPING
+            assert not reviewer.finished.is_set()
+        finally:
+            reviewer.release.set()
+        await _wait_for(reviewer.finished)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        reviewer.release.set()
+
+    assert reviewer.reviewed_prs == [17]
+    assert publisher.published_prs == []
+    assert [record.getMessage() for record in caplog.records] == [
+        "review failed repository=octo-org/example pr_number=17 "
+        f"head_sha={'a' * 40} stage=review category=timeout"
+    ]
+
+
+def test_shutdown_rejects_new_work_and_safely_discards_ten_waiting_requests(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reviewer = BlockingFirstReviewer()
+    publisher = RecordingPublisher()
+    worker = _worker(reviewer=reviewer, publisher=publisher)
+    shutdown_log = ShutdownLogHandler()
+    worker_logger = logging.getLogger("review_agent.worker")
+    worker_logger.addHandler(shutdown_log)
+    caplog.set_level(logging.WARNING, logger="review_agent.worker")
+
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        begin_shutdown = asyncio.Event()
+
+        async def run_worker() -> None:
+            async with worker:
+                entered.set()
+                await begin_shutdown.wait()
+
+        worker_lifecycle = asyncio.create_task(run_worker())
+        await entered.wait()
+        assert worker.submit(_request(17)) is SubmissionOutcome.ACCEPTED
+        await _wait_for(reviewer.started)
+        for pr_number in range(18, 28):
+            request = _request(pr_number).model_copy(
+                update={
+                    "title": "payload text with model output",
+                    "description": (
+                        "pull request description with subprocess output, "
+                        "credentials, and exception messages"
+                    ),
+                }
+            )
+            assert worker.submit(request) is SubmissionOutcome.ACCEPTED
+
+        begin_shutdown.set()
+        await _wait_for(shutdown_log.emitted)
+        assert worker.submit(_request(28)) is SubmissionOutcome.STOPPING
+        reviewer.release.set()
+        await worker_lifecycle
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        reviewer.release.set()
+        worker_logger.removeHandler(shutdown_log)
+
+    assert reviewer.reviewed_prs == [17]
+    assert publisher.published_prs == [17]
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "review failed repository=octo-org/example "
+        f"pr_number={pr_number} "
+        f"head_sha={'abcdef0123456789'[(pr_number - 17) % 16] * 40} "
+        "stage=worker_shutdown category=review_failure"
+        for pr_number in range(18, 28)
+    ]
+    observable = "\n".join(messages)
+    for unsafe_text in (
+        "payload text",
+        "pull request description",
+        "model output",
+        "publication body",
+        "subprocess output",
+        "credentials",
+        "exception messages",
+    ):
+        assert unsafe_text not in observable
 
 
 def test_duplicate_submissions_remain_distinct_attempts() -> None:
