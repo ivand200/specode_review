@@ -16,6 +16,7 @@ review-agent = "review_agent.production:main"
 
 [dependency-groups]
 dev = [
+    "httpx2>=2,<3",
     "mypy>=1.18,<2",
     "pytest>=9,<10",
     "ruff>=0.14,<1",

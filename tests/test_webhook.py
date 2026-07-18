@@ -17,6 +17,8 @@ from urllib.error import HTTPError
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from httpx import Response
 
 from review_agent import (
     CandidateAcceptance,
@@ -102,6 +104,69 @@ class CapturingPublisher:
         del installation_id
         self.comments.append((repository, pr_number, body))
         self.published.set()
+
+
+class CapturingReviewer:
+    def __init__(self) -> None:
+        self.requests: list[ReviewRequest] = []
+        self.reviewed = threading.Event()
+
+    def review(self, request: ReviewRequest) -> ReviewResult:
+        self.requests.append(request)
+        self.reviewed.set()
+        return ReviewResult(
+            repository=request.repository,
+            pr_number=request.pr_number,
+            diff_range=DiffRange(start_sha=request.base_sha, end_sha=request.head_sha),
+            status="no_important_issues",
+            findings=(),
+        )
+
+
+@pytest.fixture
+def webhook_payload() -> dict[str, object]:
+    return {
+        "action": "opened",
+        "installation": {"id": 23},
+        "repository": {"full_name": "octo-org/example"},
+        "pull_request": {
+            "number": 17,
+            "draft": False,
+            "title": "Add feature",
+            "body": "A useful description",
+            "base": {"sha": "a" * 40},
+            "head": {"sha": "b" * 40},
+        },
+    }
+
+
+@pytest.fixture
+def capturing_reviewer() -> CapturingReviewer:
+    return CapturingReviewer()
+
+
+@pytest.fixture
+def capturing_publisher() -> CapturingPublisher:
+    return CapturingPublisher()
+
+
+@pytest.fixture
+def webhook_app(
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
+) -> FastAPI:
+    return create_app(
+        repository="octo-org/example",
+        webhook_secret="correct horse battery staple",
+        reviewer=capturing_reviewer,
+        publisher=capturing_publisher,
+    )
+
+
+@pytest.fixture
+def webhook_client(webhook_app: FastAPI) -> Iterator[TestClient]:
+    with TestClient(webhook_app) as client:
+        yield client
 
 
 class LimitFailingReviewer:
@@ -261,7 +326,7 @@ class ActivityTrackingPublisher:
 
 
 @contextmanager
-def _serve(app: FastAPI) -> Iterator[str]:
+def _serve_worker_policy_app(app: FastAPI) -> Iterator[str]:
     server_socket = socket.socket()
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind(("127.0.0.1", 0))
@@ -290,7 +355,7 @@ def _serve(app: FastAPI) -> Iterator[str]:
         server_socket.close()
 
 
-def _signed_request(
+def _send_signed_worker_policy_request(
     url: str,
     payload: dict[str, object],
     secret: str,
@@ -316,242 +381,149 @@ def _signed_request(
         return error.code, error.read().decode()
 
 
-def _raw_request(
-    url: str,
+def _signature(secret: str, body: bytes) -> str:
+    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def _post_raw_webhook(
+    client: TestClient,
     body: bytes,
     *,
     signature: str,
     event: str = "pull_request",
-) -> tuple[int, str]:
-    request = urllib.request.Request(
-        f"{url}/webhooks/github",
-        data=body,
+) -> Response:
+    return client.post(
+        "/webhooks/github",
+        content=body,
         headers={
             "Content-Type": "application/json",
             "X-GitHub-Event": event,
             "X-Hub-Signature-256": signature,
         },
-        method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return response.status, response.read().decode()
-    except HTTPError as error:
-        return error.code, error.read().decode()
 
 
-def _signature(secret: str, body: bytes) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+def _post_signed_webhook(
+    client: TestClient,
+    payload: dict[str, object],
+    secret: str,
+    *,
+    event: str = "pull_request",
+) -> Response:
+    body = json.dumps(payload).encode()
+    return _post_raw_webhook(
+        client,
+        body,
+        signature=_signature(secret, body),
+        event=event,
+    )
 
 
-def test_signed_opened_pull_request_is_accepted_before_review_and_published(
-    tmp_path: Path,
+def test_signed_opened_pull_request_is_accepted_and_derives_trusted_review_request(
+    webhook_client: TestClient,
+    webhook_payload: dict[str, object],
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
 ) -> None:
-    source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
+    response = _post_signed_webhook(
+        webhook_client,
+        webhook_payload,
+        "correct horse battery staple",
     )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
-    )
-    payload: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": 23},
-        "repository": {"full_name": "octo-org/example"},
-        "pull_request": {
-            "number": 17,
-            "draft": False,
-            "title": "Add feature",
-            "body": "A useful description",
-            "base": {"sha": base_sha},
-            "head": {"sha": head_sha},
-        },
-    }
 
-    try:
-        with _serve(app) as url:
-            status, response_body = _signed_request(
-                url,
-                payload,
-                "correct horse battery staple",
-            )
-
-            assert status == 202
-            assert json.loads(response_body) == {"status": "accepted"}
-            assert runner.started.wait(timeout=5)
-            assert runner.context is not None
-            assert runner.context.request.repository == "octo-org/example"
-            assert runner.context.request.pr_number == 17
-            assert runner.context.request.installation_id == 23
-            assert runner.context.request.base_sha == base_sha
-            assert runner.context.request.head_sha == head_sha
-            assert runner.context.request.title == "Add feature"
-            assert runner.context.request.description == "A useful description"
-            assert publisher.comments == []
-            runner.release.set()
-            assert publisher.published.wait(timeout=5)
-    finally:
-        runner.release.set()
-
-    assert len(publisher.comments) == 1
-    repository, pr_number, comment = publisher.comments[0]
+    assert response.status_code == 202
+    assert response.text == '{"status":"accepted"}'
+    assert capturing_reviewer.reviewed.wait(timeout=5)
+    assert capturing_reviewer.requests == [
+        ReviewRequest(
+            repository="octo-org/example",
+            pr_number=17,
+            installation_id=23,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            title="Add feature",
+            description="A useful description",
+        )
+    ]
+    assert capturing_publisher.published.wait(timeout=5)
+    assert len(capturing_publisher.comments) == 1
+    repository, pr_number, comment = capturing_publisher.comments[0]
     assert repository == "octo-org/example"
     assert pr_number == 17
-    assert f"{base_sha}..{head_sha}" in comment
+    assert f"{'a' * 40}..{'b' * 40}" in comment
     assert "No important issues found" in comment
 
 
-def test_invalid_signature_is_rejected_before_payload_parsing(tmp_path: Path) -> None:
-    source, _, _ = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
-    )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
+def test_invalid_signature_is_rejected_before_payload_parsing(
+    webhook_client: TestClient,
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
+) -> None:
+    response = _post_raw_webhook(
+        webhook_client,
+        b"this is not JSON and must not be parsed",
+        signature="sha256=" + "0" * 64,
     )
 
-    with _serve(app) as url:
-        status, response_body = _raw_request(
-            url,
-            b"this is not JSON and must not be parsed",
-            signature="sha256=" + "0" * 64,
-        )
-
-    assert status == 401
-    assert json.loads(response_body) == {"detail": "invalid webhook signature"}
-    assert not runner.started.is_set()
-    assert publisher.comments == []
+    assert response.status_code == 401
+    assert response.text == '{"detail":"invalid webhook signature"}'
+    assert capturing_reviewer.requests == []
+    assert capturing_publisher.comments == []
 
 
-def test_signed_non_pull_request_event_is_a_successful_no_op(tmp_path: Path) -> None:
-    source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
+def test_signed_non_pull_request_event_is_a_successful_no_op(
+    webhook_client: TestClient,
+    webhook_payload: dict[str, object],
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
+) -> None:
+    response = _post_signed_webhook(
+        webhook_client,
+        webhook_payload,
+        "correct horse battery staple",
+        event="push",
     )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
-    )
-    payload: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": 23},
-        "repository": {"full_name": "octo-org/example"},
-        "pull_request": {
-            "number": 17,
-            "draft": False,
-            "title": "Add feature",
-            "body": "A useful description",
-            "base": {"sha": base_sha},
-            "head": {"sha": head_sha},
-        },
-    }
 
-    try:
-        with _serve(app) as url:
-            status, response_body = _signed_request(
-                url,
-                payload,
-                "correct horse battery staple",
-                event="push",
-            )
-    finally:
-        runner.release.set()
-
-    assert status == 200
-    assert json.loads(response_body) == {"status": "ignored"}
-    assert not runner.started.is_set()
-    assert publisher.comments == []
+    assert response.status_code == 200
+    assert response.text == '{"status":"ignored"}'
+    assert capturing_reviewer.requests == []
+    assert capturing_publisher.comments == []
 
 
-def test_signed_ineligible_pull_requests_are_successful_no_ops(tmp_path: Path) -> None:
-    source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
-    )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
-    )
-    eligible: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": 23},
-        "repository": {"full_name": "octo-org/example"},
-        "pull_request": {
-            "number": 17,
-            "draft": False,
-            "title": "Add feature",
-            "body": "A useful description",
-            "base": {"sha": base_sha},
-            "head": {"sha": head_sha},
-        },
-    }
-    closed = deepcopy(eligible)
+def test_signed_ineligible_pull_requests_are_successful_no_ops(
+    webhook_client: TestClient,
+    webhook_payload: dict[str, object],
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
+) -> None:
+    closed = deepcopy(webhook_payload)
     closed["action"] = "closed"
-    draft = deepcopy(eligible)
+    draft = deepcopy(webhook_payload)
     draft["pull_request"]["draft"] = True  # type: ignore[index]
-    other_repository = deepcopy(eligible)
+    other_repository = deepcopy(webhook_payload)
     other_repository["repository"]["full_name"] = "elsewhere/example"  # type: ignore[index]
 
-    try:
-        with _serve(app) as url:
-            responses = [
-                _signed_request(url, payload, "correct horse battery staple")
-                for payload in (closed, draft, other_repository)
-            ]
-    finally:
-        runner.release.set()
+    responses = [
+        _post_signed_webhook(
+            webhook_client,
+            payload,
+            "correct horse battery staple",
+        )
+        for payload in (closed, draft, other_repository)
+    ]
 
-    assert responses == [(200, '{"status":"ignored"}')] * 3
-    assert not runner.started.is_set()
-    assert publisher.comments == []
+    assert [(response.status_code, response.text) for response in responses] == [
+        (200, '{"status":"ignored"}')
+    ] * 3
+    assert capturing_reviewer.requests == []
+    assert capturing_publisher.comments == []
 
 
-def test_malformed_eligible_payload_returns_a_generic_client_error(tmp_path: Path) -> None:
-    source, _, _ = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
-    )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
-    )
+def test_malformed_eligible_payload_returns_a_generic_client_error(
+    webhook_client: TestClient,
+    capturing_reviewer: CapturingReviewer,
+    capturing_publisher: CapturingPublisher,
+) -> None:
     incomplete_payload = json.dumps(
         {
             "action": "opened",
@@ -561,21 +533,45 @@ def test_malformed_eligible_payload_returns_a_generic_client_error(tmp_path: Pat
     ).encode()
     malformed_bodies = (b"not JSON", incomplete_payload)
 
-    with _serve(app) as url:
-        responses = [
-            _raw_request(
-                url,
-                body,
-                signature=_signature("correct horse battery staple", body),
-            )
-            for body in malformed_bodies
-        ]
+    responses = [
+        _post_raw_webhook(
+            webhook_client,
+            body,
+            signature=_signature("correct horse battery staple", body),
+        )
+        for body in malformed_bodies
+    ]
 
-    assert responses == [(400, '{"detail":"malformed pull request webhook"}')] * 2
-    assert not runner.started.is_set()
-    assert publisher.comments == []
+    assert [(response.status_code, response.text) for response in responses] == [
+        (400, '{"detail":"malformed pull request webhook"}')
+    ] * 2
+    assert capturing_reviewer.requests == []
+    assert capturing_publisher.comments == []
 
 
+def test_eligible_webhook_visibly_bounds_the_pull_request_description(
+    webhook_client: TestClient,
+    webhook_payload: dict[str, object],
+    capturing_reviewer: CapturingReviewer,
+) -> None:
+    webhook_payload["pull_request"]["body"] = "x" * 10_001  # type: ignore[index]
+
+    response = _post_signed_webhook(
+        webhook_client,
+        webhook_payload,
+        "correct horse battery staple",
+    )
+
+    assert response.status_code == 202
+    assert response.text == '{"status":"accepted"}'
+    assert capturing_reviewer.reviewed.wait(timeout=5)
+    description = capturing_reviewer.requests[0].description
+    assert len(description) == 10_000
+    assert description.endswith("\n\n[truncated]")
+
+
+# These socket-based tests exercise policy owned by the current web worker. Ticket 3 replaces
+# them with direct worker-interface coverage after the production cutover in Ticket 2.
 def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
     runner = BlockingAdapter()
@@ -607,13 +603,26 @@ def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
     }
 
     try:
-        with _serve(app) as url:
-            first = _signed_request(url, payload, "correct horse battery staple")
+        with _serve_worker_policy_app(app) as url:
+            first = _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             assert runner.started.wait(timeout=5)
             pending = [
-                _signed_request(url, payload, "correct horse battery staple") for _ in range(10)
+                _send_signed_worker_policy_request(
+                    url,
+                    payload,
+                    "correct horse battery staple",
+                )
+                for _ in range(10)
             ]
-            rejected = _signed_request(url, payload, "correct horse battery staple")
+            rejected = _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             runner.release.set()
             assert publisher.published.wait(timeout=5)
     finally:
@@ -622,52 +631,6 @@ def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
     assert first == (202, '{"status":"accepted"}')
     assert pending == [(202, '{"status":"accepted"}')] * 10
     assert rejected == (503, '{"detail":"review queue is full"}')
-
-
-def test_eligible_webhook_visibly_bounds_the_pull_request_description(tmp_path: Path) -> None:
-    source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingAdapter()
-    publisher = CapturingPublisher()
-    reviewer = Reviewer(
-        repository="octo-org/example",
-        source_repository=source,
-        workspace_root=tmp_path / "workspaces",
-        candidate_acceptance=_acceptance(runner),
-    )
-    app = create_app(
-        repository="octo-org/example",
-        webhook_secret="correct horse battery staple",
-        reviewer=reviewer,
-        publisher=publisher,
-    )
-    payload: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": 23},
-        "repository": {"full_name": "octo-org/example"},
-        "pull_request": {
-            "number": 17,
-            "draft": False,
-            "title": "Add feature",
-            "body": "x" * 10_001,
-            "base": {"sha": base_sha},
-            "head": {"sha": head_sha},
-        },
-    }
-
-    try:
-        with _serve(app) as url:
-            response = _signed_request(url, payload, "correct horse battery staple")
-            assert runner.started.wait(timeout=5)
-            assert runner.context is not None
-            description = runner.context.request.description
-            runner.release.set()
-            assert publisher.published.wait(timeout=5)
-    finally:
-        runner.release.set()
-
-    assert response == (202, '{"status":"accepted"}')
-    assert len(description) == 10_000
-    assert description.endswith("\n\n[truncated]")
 
 
 def test_review_size_failure_is_logged_and_publishes_no_comment(
@@ -696,8 +659,12 @@ def test_review_size_failure_is_logged_and_publishes_no_comment(
         },
     }
 
-    with _serve(app) as url:
-        response = _signed_request(url, payload, "correct horse battery staple")
+    with _serve_worker_policy_app(app) as url:
+        response = _send_signed_worker_policy_request(
+            url,
+            payload,
+            "correct horse battery staple",
+        )
         assert reviewer.called.wait(timeout=5)
         deadline = time.monotonic() + 1
         while not caplog.records and time.monotonic() < deadline:
@@ -744,9 +711,14 @@ def test_duplicate_deliveries_can_create_duplicate_comments(tmp_path: Path) -> N
     }
 
     try:
-        with _serve(app) as url:
+        with _serve_worker_policy_app(app) as url:
             responses = [
-                _signed_request(url, payload, "correct horse battery staple") for _ in range(2)
+                _send_signed_worker_policy_request(
+                    url,
+                    payload,
+                    "correct horse battery staple",
+                )
+                for _ in range(2)
             ]
             assert runner.started.wait(timeout=5)
             runner.release.set()
@@ -789,9 +761,13 @@ def test_publication_failure_does_not_stop_later_queued_review(
     second_payload["pull_request"]["number"] = 18  # type: ignore[index]
     second_payload["pull_request"]["head"]["sha"] = "c" * 40  # type: ignore[index]
 
-    with _serve(app) as url:
+    with _serve_worker_policy_app(app) as url:
         responses = [
-            _signed_request(url, payload, "correct horse battery staple")
+            _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             for payload in (first_payload, second_payload)
         ]
         assert publisher.second_published.wait(timeout=5)
@@ -846,9 +822,13 @@ def test_expired_review_deadline_skips_publication_and_allows_later_work(
     second_payload = deepcopy(first_payload)
     second_payload["pull_request"]["number"] = 18  # type: ignore[index]
 
-    with _serve(app) as url:
+    with _serve_worker_policy_app(app) as url:
         responses = [
-            _signed_request(url, payload, "correct horse battery staple")
+            _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             for payload in (first_payload, second_payload)
         ]
         assert publisher.published.wait(timeout=5)
@@ -889,8 +869,12 @@ def test_graceful_shutdown_allows_active_review_to_finish() -> None:
         },
     }
 
-    with _serve(app) as url:
-        response = _signed_request(url, payload, "correct horse battery staple")
+    with _serve_worker_policy_app(app) as url:
+        response = _send_signed_worker_policy_request(
+            url,
+            payload,
+            "correct horse battery staple",
+        )
         assert reviewer.started.wait(timeout=5)
         threading.Timer(0.8, reviewer.release.set).start()
 
@@ -928,9 +912,13 @@ def test_cancelled_review_attempt_does_not_stop_later_queued_work(
     second_payload["pull_request"]["number"] = 18  # type: ignore[index]
     second_payload["pull_request"]["head"]["sha"] = "c" * 40  # type: ignore[index]
 
-    with _serve(app) as url:
+    with _serve_worker_policy_app(app) as url:
         responses = [
-            _signed_request(url, payload, "correct horse battery staple")
+            _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             for payload in (first_payload, second_payload)
         ]
         assert publisher.published.wait(timeout=5)
@@ -972,9 +960,13 @@ def test_reviews_and_publications_run_one_at_a_time_in_fifo_order() -> None:
     second_payload["pull_request"]["number"] = 18  # type: ignore[index]
     second_payload["pull_request"]["head"]["sha"] = "c" * 40  # type: ignore[index]
 
-    with _serve(app) as url:
+    with _serve_worker_policy_app(app) as url:
         responses = [
-            _signed_request(url, payload, "correct horse battery staple")
+            _send_signed_worker_policy_request(
+                url,
+                payload,
+                "correct horse battery staple",
+            )
             for payload in (first_payload, second_payload)
         ]
         assert publisher.finished.wait(timeout=5)
