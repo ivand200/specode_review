@@ -37,6 +37,7 @@ from review_agent.sandbox import (
     DockerSandboxConfig,
 )
 from review_agent.web import create_app
+from review_agent.worker import SingleReviewWorker
 
 
 class RecordingPublisher:
@@ -453,9 +454,11 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     app = create_app(
         repository=settings.repository,
         webhook_secret=settings.webhook_secret,
-        reviewer=reviewer,
-        publisher=publisher,
-        review_timeout_seconds=settings.review_timeout_seconds,
+        worker=SingleReviewWorker(
+            reviewer=reviewer,
+            publisher=publisher,
+            review_timeout_seconds=settings.review_timeout_seconds,
+        ),
         shutdown_callback=github.close,
     )
     payload: dict[str, object] = {

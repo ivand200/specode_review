@@ -20,10 +20,12 @@ from review_agent import (
     ReviewContext,
     Reviewer,
 )
+from review_agent.configuration import DEFAULT_REVIEW_TIMEOUT_SECONDS
 from review_agent.core import CandidateContract
 from review_agent.github import GitHubAppClient
 from review_agent.publishing import ReviewPublisher
 from review_agent.web import create_app
+from review_agent.worker import SingleReviewWorker
 
 
 class CleanAdapter:
@@ -170,8 +172,11 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
     app = create_app(
         repository=repository,
         webhook_secret=webhook_secret,
-        reviewer=reviewer,
-        publisher=publisher,
+        worker=SingleReviewWorker(
+            reviewer=reviewer,
+            publisher=publisher,
+            review_timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS,
+        ),
     )
     payload: dict[str, object] = {
         "action": "opened",

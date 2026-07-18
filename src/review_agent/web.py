@@ -1,114 +1,14 @@
-import asyncio
 import hashlib
 import hmac
 import json
-import logging
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, suppress
-from typing import Protocol
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from review_agent.deadline import ReviewDeadline, review_deadline_scope
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import ReviewRequest, ReviewResult, bound_description
-from review_agent.publishing import ReviewPublisher, publish_review_result
-
-logger = logging.getLogger(__name__)
-DEFAULT_REVIEW_TIMEOUT_SECONDS = 15 * 60
-
-
-class ReviewService(Protocol):
-    def review(self, request: ReviewRequest) -> ReviewResult: ...
-
-
-def _run_review_attempt(
-    request: ReviewRequest,
-    reviewer: ReviewService,
-    publisher: ReviewPublisher,
-    deadline: ReviewDeadline,
-) -> None:
-    stage = "review"
-    with review_deadline_scope(deadline):
-        try:
-            deadline.remaining(stage=stage)
-            result = reviewer.review(request)
-            deadline.remaining(stage=stage)
-            stage = "publication"
-            deadline.remaining(stage=stage)
-            publish_review_result(
-                result,
-                publisher,
-                installation_id=request.installation_id,
-            )
-        except asyncio.CancelledError:
-            logger.warning(
-                "review failed repository=%s pr_number=%d head_sha=%s stage=%s category=%s",
-                request.repository,
-                request.pr_number,
-                request.head_sha,
-                stage,
-                FailureCategory.REVIEW_FAILURE.value,
-            )
-        except ReviewError as error:
-            logger.warning(
-                "review failed repository=%s pr_number=%d head_sha=%s stage=%s category=%s",
-                request.repository,
-                request.pr_number,
-                request.head_sha,
-                error.stage,
-                error.category.value,
-            )
-        except TimeoutError:
-            logger.warning(
-                "review failed repository=%s pr_number=%d head_sha=%s stage=%s category=%s",
-                request.repository,
-                request.pr_number,
-                request.head_sha,
-                stage,
-                FailureCategory.TIMEOUT.value,
-            )
-        except Exception:  # noqa: BLE001 - this is the worker's failure-isolation boundary.
-            logger.warning(
-                "review failed repository=%s pr_number=%d head_sha=%s stage=%s category=%s",
-                request.repository,
-                request.pr_number,
-                request.head_sha,
-                stage,
-                FailureCategory.REVIEW_FAILURE.value,
-            )
-
-
-async def _review_worker(
-    queue: asyncio.Queue[ReviewRequest | None],
-    reviewer: ReviewService,
-    publisher: ReviewPublisher,
-    *,
-    review_timeout_seconds: float,
-    stopping: asyncio.Event,
-) -> None:
-    while True:
-        request = await queue.get()
-        if request is None:
-            queue.task_done()
-            return
-        if stopping.is_set():
-            queue.task_done()
-            return
-        deadline = ReviewDeadline.after(review_timeout_seconds)
-        try:
-            await asyncio.to_thread(
-                _run_review_attempt,
-                request,
-                reviewer,
-                publisher,
-                deadline,
-            )
-        finally:
-            queue.task_done()
-        if stopping.is_set():
-            return
+from review_agent.models import ReviewRequest, bound_description
+from review_agent.worker import ReviewWorker, SubmissionOutcome
 
 
 def _review_request_from_payload(payload: object) -> ReviewRequest:
@@ -168,6 +68,7 @@ async def _accept_github_webhook(
     *,
     repository: str,
     webhook_secret: str,
+    worker: ReviewWorker,
 ) -> JSONResponse:
     body = await request.body()
     expected = (
@@ -205,72 +106,39 @@ async def _accept_github_webhook(
             detail="malformed pull request webhook",
         ) from error
 
-    try:
-        if not request.app.state.accepting_reviews:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="review service is shutting down",
-            )
-        request.app.state.review_queue.put_nowait(review_request)
-    except asyncio.QueueFull as error:
+    outcome = worker.submit(review_request)
+    if outcome is SubmissionOutcome.AT_CAPACITY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="review queue is full",
-        ) from error
+        )
+    if outcome is SubmissionOutcome.STOPPING:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="review service is shutting down",
+        )
     return JSONResponse({"status": "accepted"}, status_code=status.HTTP_202_ACCEPTED)
 
 
-def create_app(  # noqa: PLR0913 - explicit application boundary dependencies.
+def create_app(
     *,
     repository: str,
     webhook_secret: str,
-    reviewer: ReviewService,
-    publisher: ReviewPublisher,
-    review_timeout_seconds: float = DEFAULT_REVIEW_TIMEOUT_SECONDS,
+    worker: ReviewWorker,
     startup_check: Callable[[], None] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
-    if review_timeout_seconds <= 0:
-        message = "review timeout must be positive"
-        raise ValueError(message)
-
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        del app
         if startup_check is not None:
             startup_check()
-        queue: asyncio.Queue[ReviewRequest | None] = asyncio.Queue(maxsize=10)
-        stopping = asyncio.Event()
-        app.state.review_queue = queue
-        app.state.accepting_reviews = True
-        worker = asyncio.create_task(
-            _review_worker(
-                queue,
-                reviewer,
-                publisher,
-                review_timeout_seconds=review_timeout_seconds,
-                stopping=stopping,
-            )
-        )
         try:
-            yield
+            async with worker:
+                yield
         finally:
-            try:
-                app.state.accepting_reviews = False
-                stopping.set()
-                if queue.empty():
-                    queue.put_nowait(None)
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(worker),
-                        timeout=review_timeout_seconds,
-                    )
-                except TimeoutError:
-                    worker.cancel()
-                with suppress(asyncio.CancelledError):
-                    await worker
-            finally:
-                if shutdown_callback is not None:
-                    shutdown_callback()
+            if shutdown_callback is not None:
+                shutdown_callback()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -280,6 +148,7 @@ def create_app(  # noqa: PLR0913 - explicit application boundary dependencies.
             request,
             repository=repository,
             webhook_secret=webhook_secret,
+            worker=worker,
         )
 
     return app

@@ -17,6 +17,7 @@ from review_agent.sandbox import (
     DockerSandboxConfig,
 )
 from review_agent.web import create_app
+from review_agent.worker import SingleReviewWorker
 
 
 class ReadinessCheck(Protocol):
@@ -75,9 +76,11 @@ def create_production_app(
     return create_app(
         repository=resolved_settings.repository,
         webhook_secret=resolved_settings.webhook_secret,
-        reviewer=reviewer,
-        publisher=github,
-        review_timeout_seconds=resolved_settings.review_timeout_seconds,
+        worker=SingleReviewWorker(
+            reviewer=reviewer,
+            publisher=github,
+            review_timeout_seconds=resolved_settings.review_timeout_seconds,
+        ),
         shutdown_callback=github.close,
     )
 

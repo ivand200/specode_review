@@ -2,13 +2,17 @@ import asyncio
 import logging
 import subprocess
 from pathlib import Path
+from types import TracebackType
+from typing import Self
 
 import pytest
 
 from review_agent.configuration import ConfigurationError, ProductionSettings
+from review_agent.models import ReviewRequest
 from review_agent.production import create_production_app
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
 from review_agent.web import create_app
+from review_agent.worker import SubmissionOutcome
 
 
 def _valid_environment(tmp_path: Path) -> dict[str, str]:
@@ -238,27 +242,39 @@ def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     assert observable.count("stage=review_kit_validation") == 1
 
 
-class UnusedReviewer:
-    def review(self, request: object) -> object:
+class RecordingWorker:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def __aenter__(self) -> Self:
+        self._events.append("worker_enter")
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self._events.append("worker_exit")
+
+    def submit(self, request: ReviewRequest) -> SubmissionOutcome:
         raise AssertionError(request)
-
-
-class UnusedPublisher:
-    def publish(self, **values: object) -> None:
-        raise AssertionError(values)
 
 
 def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() -> None:
     startup_failure = StartupReadinessError("review_kit_validation")
+    events: list[str] = []
 
     def reject_startup() -> None:
+        events.append("readiness")
         raise startup_failure
 
     app = create_app(
         repository="octo-org/example",
         webhook_secret="a" * 32,
-        reviewer=UnusedReviewer(),
-        publisher=UnusedPublisher(),
+        worker=RecordingWorker(events),
         startup_check=reject_startup,
     )
 
@@ -271,27 +287,28 @@ def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() ->
         asyncio.run(start())
 
     assert failure.value is startup_failure
+    assert events == ["readiness"]
     assert not hasattr(app.state, "accepting_reviews")
+    assert not hasattr(app.state, "review_queue")
 
 
 def test_application_lifespan_releases_production_resources_on_shutdown() -> None:
-    shutdown_calls: list[str] = []
+    events: list[str] = []
     app = create_app(
         repository="octo-org/example",
         webhook_secret="a" * 32,
-        reviewer=UnusedReviewer(),
-        publisher=UnusedPublisher(),
-        shutdown_callback=lambda: shutdown_calls.append("closed"),
+        worker=RecordingWorker(events),
+        startup_check=lambda: events.append("readiness"),
+        shutdown_callback=lambda: events.append("closed"),
     )
 
     async def run_lifespan() -> None:
         async with app.router.lifespan_context(app):
-            assert app.state.accepting_reviews is True
+            assert events == ["readiness", "worker_enter"]
 
     asyncio.run(run_lifespan())
 
-    assert app.state.accepting_reviews is False
-    assert shutdown_calls == ["closed"]
+    assert events == ["readiness", "worker_enter", "worker_exit", "closed"]
 
 
 class RejectingReadiness:

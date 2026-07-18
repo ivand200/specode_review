@@ -30,8 +30,10 @@ from review_agent import (
     ReviewRequest,
     ReviewResult,
 )
+from review_agent.configuration import DEFAULT_REVIEW_TIMEOUT_SECONDS
 from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, CandidateContract
 from review_agent.web import create_app
+from review_agent.worker import SingleReviewWorker
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -66,6 +68,25 @@ def _acceptance(adapter: object) -> CandidateAcceptance:
     return CandidateAcceptance(
         adapter=adapter,  # type: ignore[arg-type]
         max_bytes=CANDIDATE_OUTPUT_MAX_BYTES,
+    )
+
+
+def _worker_app(
+    *,
+    repository: str,
+    webhook_secret: str,
+    reviewer: object,
+    publisher: object,
+    review_timeout_seconds: float = DEFAULT_REVIEW_TIMEOUT_SECONDS,
+) -> FastAPI:
+    return create_app(
+        repository=repository,
+        webhook_secret=webhook_secret,
+        worker=SingleReviewWorker(
+            reviewer=reviewer,  # type: ignore[arg-type]
+            publisher=publisher,  # type: ignore[arg-type]
+            review_timeout_seconds=review_timeout_seconds,
+        ),
     )
 
 
@@ -155,7 +176,7 @@ def webhook_app(
     capturing_reviewer: CapturingReviewer,
     capturing_publisher: CapturingPublisher,
 ) -> FastAPI:
-    return create_app(
+    return _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=capturing_reviewer,
@@ -582,7 +603,7 @@ def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
         workspace_root=tmp_path / "workspaces",
         candidate_acceptance=_acceptance(runner),
     )
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -639,7 +660,7 @@ def test_review_size_failure_is_logged_and_publishes_no_comment(
     reviewer = LimitFailingReviewer()
     publisher = CapturingPublisher()
     caplog.set_level(logging.WARNING, logger="review_agent.web")
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -690,7 +711,7 @@ def test_duplicate_deliveries_can_create_duplicate_comments(tmp_path: Path) -> N
         workspace_root=tmp_path / "workspaces",
         candidate_acceptance=_acceptance(runner),
     )
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -738,7 +759,7 @@ def test_publication_failure_does_not_stop_later_queued_review(
     reviewer = CleanReviewer()
     publisher = FirstPublicationFails()
     caplog.set_level(logging.WARNING, logger="review_agent.web")
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -799,7 +820,7 @@ def test_expired_review_deadline_skips_publication_and_allows_later_work(
     )
     publisher = CapturingPublisher()
     caplog.set_level(logging.WARNING, logger="review_agent.web")
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -848,7 +869,7 @@ def test_expired_review_deadline_skips_publication_and_allows_later_work(
 def test_graceful_shutdown_allows_active_review_to_finish() -> None:
     reviewer = ShutdownCompletingReviewer()
     publisher = CapturingPublisher()
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -889,7 +910,7 @@ def test_cancelled_review_attempt_does_not_stop_later_queued_work(
     reviewer = FirstReviewIsCancelled()
     publisher = CapturingPublisher()
     caplog.set_level(logging.WARNING, logger="review_agent.web")
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
@@ -937,7 +958,7 @@ def test_reviews_and_publications_run_one_at_a_time_in_fifo_order() -> None:
     activity = SerialActivity()
     reviewer = ActivityTrackingReviewer(activity)
     publisher = ActivityTrackingPublisher(activity)
-    app = create_app(
+    app = _worker_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
         reviewer=reviewer,
