@@ -1,13 +1,11 @@
 import json
 import os
-import re
 import shutil
 import subprocess
-import uuid
 from dataclasses import dataclass
 from os.path import lexists
 from pathlib import Path, PurePosixPath
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
@@ -16,11 +14,10 @@ from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
 from review_agent.process import ProcessOptions, _run_bounded_process
+from review_agent.resources import AttemptResources
 
 MAX_CHANGED_FILES = 100
 MAX_CHANGED_TEXT_LINES = 5_000
-WORKSPACE_PREFIX = "review-agent-workspace-"
-_OWNED_WORKSPACE = re.compile(rf"^{re.escape(WORKSPACE_PREFIX)}[0-9a-f]{{32}}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,11 +57,6 @@ class _CandidateAdapter(Protocol):
     ) -> bytes: ...
 
 
-@runtime_checkable
-class _OrphanSweeper(Protocol):
-    def sweep_orphans(self) -> None: ...
-
-
 class CandidateAcceptance:
     def __init__(self, *, adapter: _CandidateAdapter, max_bytes: int) -> None:
         if max_bytes <= 0:
@@ -80,8 +72,6 @@ class CandidateAcceptance:
         ).encode("utf-8")
         self._adapter = adapter
         self._contract = CandidateContract(schema_json=schema_json, max_bytes=max_bytes)
-        if isinstance(self._adapter, _OrphanSweeper):
-            self._adapter.sweep_orphans()
 
     def accept(self, context: ReviewContext) -> AgentReview:
         remaining_review_time(stage="review_runner")
@@ -217,18 +207,17 @@ class Reviewer:
         self,
         *,
         repository: str,
-        workspace_root: Path,
+        resources: AttemptResources,
         candidate_acceptance: CandidateAcceptance,
         source_repository: Path | GitHubRepository,
         limits: ReviewLimits | None = None,
     ) -> None:
         self._repository = repository
         self._source_repository = source_repository
-        self._workspace_root = workspace_root
+        self._workspace = resources.workspace
         self._candidate_acceptance = candidate_acceptance
         self._limits = limits or ReviewLimits()
-        self._workspace_root.mkdir(parents=True, exist_ok=True)
-        self._sweep_orphan_workspaces()
+        self._workspace.parent.mkdir(parents=True, exist_ok=True)
         git_executable = shutil.which("git")
         if git_executable is None:
             raise ReviewError(
@@ -273,27 +262,14 @@ class Reviewer:
                     ) from error
 
     def _create_workspace(self) -> Path:
-        for _attempt in range(10):
-            workspace = self._workspace_root / f"{WORKSPACE_PREFIX}{uuid.uuid4().hex}"
-            try:
-                workspace.mkdir(mode=0o700)
-            except FileExistsError:
-                continue
-            return workspace
-        message = "could not allocate a unique review workspace"
-        raise ReviewError(
-            FailureCategory.REVIEW_FAILURE,
-            stage="workspace_allocation",
-        ) from RuntimeError(message)
-
-    def _sweep_orphan_workspaces(self) -> None:
-        for entry in self._workspace_root.iterdir():
-            if (
-                _OWNED_WORKSPACE.fullmatch(entry.name) is not None
-                and entry.is_dir()
-                and not entry.is_symlink()
-            ):
-                shutil.rmtree(entry)
+        try:
+            self._workspace.mkdir(mode=0o700)
+        except FileExistsError as error:
+            raise ReviewError(
+                FailureCategory.REVIEW_FAILURE,
+                stage="workspace_allocation",
+            ) from error
+        return self._workspace
 
     def _prepare_context(
         self,

@@ -2,7 +2,6 @@ import json
 import os
 import re
 import shutil
-import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol, TypeVar
@@ -15,6 +14,7 @@ from review_agent.configuration import (
 from review_agent.core import CandidateContract, ReviewContext
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
+from review_agent.resources import AttemptResources
 
 _SANDBOX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")
 _VM_CHECKOUT = "/home/agent/review/repo"
@@ -252,30 +252,17 @@ class _SandboxLifecycle:
         self,
         *,
         client: SandboxClient | CodexSandboxClient,
-        sandbox_prefix: str,
+        resources: AttemptResources,
         timeout_stage: str,
         failure_stage: str,
     ) -> None:
-        sample_name = f"{sandbox_prefix}{'0' * 32}"
-        if _SANDBOX_NAME_PATTERN.fullmatch(sample_name) is None:
-            message = "sandbox prefix must be lowercase, bounded, and end with a hyphen"
-            raise ValueError(message)
         self._client = client
-        self._sandbox_prefix = sandbox_prefix
+        self._sandbox_name = resources.sandbox_name
+        if _SANDBOX_NAME_PATTERN.fullmatch(self._sandbox_name) is None:
+            message = "sandbox name must be application-owned and attempt-specific"
+            raise ValueError(message)
         self._timeout_stage = timeout_stage
         self._failure_stage = failure_stage
-        self._owned_name = re.compile(rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$")
-
-    def sweep_orphans(self) -> None:
-        try:
-            for sandbox_name in self._client.list_names():
-                if self._owned_name.fullmatch(sandbox_name) is not None:
-                    self._client.remove(sandbox_name)
-        except Exception as error:
-            raise ReviewError(
-                FailureCategory.SANDBOX_LIFECYCLE,
-                stage="sandbox_orphan_sweep",
-            ) from error
 
     def run(
         self,
@@ -286,7 +273,7 @@ class _SandboxLifecycle:
         create: Callable[[str], None],
         action: Callable[[str], _ResultT],
     ) -> _ResultT:
-        sandbox_name = f"{self._sandbox_prefix}{uuid.uuid4().hex}"
+        sandbox_name = self._sandbox_name
         primary_failed = False
         try:
             control.mkdir(mode=0o700)
@@ -397,23 +384,20 @@ class CodexSandboxAdapter:
         self,
         *,
         client: CodexSandboxClient,
-        sandbox_prefix: str,
+        resources: AttemptResources,
         kit: Path,
         config: CodexExecutionPolicy,
     ) -> None:
         self._client = client
         self._lifecycle = _SandboxLifecycle(
             client=client,
-            sandbox_prefix=sandbox_prefix,
+            resources=resources,
             timeout_stage="codex_execution",
             failure_stage="codex_sandbox_lifecycle",
         )
         self._kit = kit
         self._model = config.model
         self._reasoning_effort = config.reasoning_effort.value
-
-    def sweep_orphans(self) -> None:
-        self._lifecycle.sweep_orphans()
 
     def produce(
         self,
@@ -610,20 +594,17 @@ class SandboxLifecycleAdapter:
         self,
         *,
         client: SandboxClient,
-        sandbox_prefix: str,
+        resources: AttemptResources,
         review_command: tuple[str, ...] | None = None,
     ) -> None:
         self._client = client
         self._lifecycle = _SandboxLifecycle(
             client=client,
-            sandbox_prefix=sandbox_prefix,
+            resources=resources,
             timeout_stage="sandbox_lifecycle",
             failure_stage="sandbox_lifecycle",
         )
         self._review_command = review_command
-
-    def sweep_orphans(self) -> None:
-        self._lifecycle.sweep_orphans()
 
     def produce(
         self,

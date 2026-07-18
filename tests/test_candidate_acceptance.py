@@ -242,12 +242,12 @@ def test_accept_preserves_order_after_grounding_every_location(tmp_path: Path) -
     assert tuple(item.title for item in accepted.findings) == ("First", "Second")
 
 
-def test_acceptance_construction_sweeps_optional_adapter_orphans() -> None:
+def test_acceptance_construction_does_not_sweep_adapter_resources() -> None:
     adapter = SweepingCandidateAdapter()
 
     CandidateAcceptance(adapter=adapter, max_bytes=1_024)
 
-    assert adapter.sweeps == 1
+    assert adapter.sweeps == 0
 
 
 def test_acceptance_construction_rejects_a_non_positive_budget() -> None:

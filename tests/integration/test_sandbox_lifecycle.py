@@ -1,6 +1,5 @@
 import os
 import subprocess
-import uuid
 from pathlib import Path
 
 import pytest
@@ -15,6 +14,7 @@ from review_agent import (
 )
 from review_agent.configuration import SandboxOperationPolicy
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
+from review_agent.resources import ReviewResourceManager
 from review_agent.sandbox import (
     DockerSandboxClient,
     SandboxLifecycleAdapter,
@@ -103,6 +103,12 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
     workspace_root = tmp_path / "workspaces"
     client = RecordingDockerSandboxClient()
     prefix = "review-agent-it-"
+    resource_manager = ReviewResourceManager(
+        workspace_root=workspace_root,
+        sandbox_prefix=prefix,
+        sandbox_client=client,
+    )
+    resources = resource_manager.for_attempt("a" * 32)
     probe_command = (
         "sh",
         "-c",
@@ -116,37 +122,37 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
     )
     runner = SandboxLifecycleAdapter(
         client=client,
-        sandbox_prefix=prefix,
+        resources=resources,
         review_command=probe_command,
     )
     reviewer = Reviewer(
         repository="octo-org/sandbox-fixture",
         source_repository=source,
-        workspace_root=workspace_root,
+        resources=resources,
         candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
     )
     request = _request(base_sha=base_sha, head_sha=head_sha, title="No-model lifecycle")
 
     try:
         first = reviewer.review(request)
-        second = reviewer.review(request)
 
-        assert first.status == second.status == "no_important_issues"
-        assert len(set(client.created_names)) == 2
+        assert first.status == "no_important_issues"
+        assert client.created_names == [resources.sandbox_name]
         assert client.removed_names == client.created_names
         assert _git(source, "status", "--short") == ""
         assert _git(source, "rev-parse", "HEAD") == head_sha
         assert list(workspace_root.iterdir()) == []
 
+        timeout_resources = resource_manager.for_attempt("b" * 32)
         timeout_runner = SandboxLifecycleAdapter(
             client=client,
-            sandbox_prefix=prefix,
+            resources=timeout_resources,
             review_command=("sleep", "30"),
         )
         timeout_reviewer = Reviewer(
             repository="octo-org/sandbox-fixture",
             source_repository=source,
-            workspace_root=workspace_root,
+            resources=timeout_resources,
             candidate_acceptance=CandidateAcceptance(
                 adapter=timeout_runner,
                 max_bytes=65_536,
@@ -160,11 +166,12 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
         assert timeout_failure.value.category is FailureCategory.TIMEOUT
         assert list(workspace_root.iterdir()) == []
 
-        orphan_workspace = workspace_root / ("review-agent-workspace-" + uuid.uuid4().hex)
+        orphan_resources = resource_manager.for_attempt("c" * 32)
+        orphan_workspace = orphan_resources.workspace
         orphan_workspace.mkdir()
         orphan_control = tmp_path / "orphan-control"
         orphan_control.mkdir()
-        orphan_name = f"{prefix}{uuid.uuid4().hex}"
+        orphan_name = orphan_resources.sandbox_name
         client.create(
             name=orphan_name,
             control=orphan_control,
@@ -172,15 +179,7 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
             resources=SandboxResourceLimits(),
         )
 
-        Reviewer(
-            repository="octo-org/sandbox-fixture",
-            source_repository=source,
-            workspace_root=workspace_root,
-            candidate_acceptance=CandidateAcceptance(
-                adapter=SandboxLifecycleAdapter(client=client, sandbox_prefix=prefix),
-                max_bytes=65_536,
-            ),
-        )
+        resource_manager.sweep_stale()
 
         assert not orphan_workspace.exists()
         assert orphan_name in client.removed_names

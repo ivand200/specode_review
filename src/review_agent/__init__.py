@@ -21,9 +21,11 @@ from review_agent.publishing import (
     publish_review_result,
     render_review_comment,
 )
+from review_agent.resources import AttemptResources, ReviewResourceManager
 
 __all__ = [
     "AgentReview",
+    "AttemptResources",
     "CandidateAcceptance",
     "ChangedPathManifest",
     "DiffRange",
@@ -38,6 +40,7 @@ __all__ = [
     "ReviewLimits",
     "ReviewPublisher",
     "ReviewRequest",
+    "ReviewResourceManager",
     "ReviewResult",
     "Reviewer",
     "SandboxResourceLimits",

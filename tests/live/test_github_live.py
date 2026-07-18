@@ -24,6 +24,7 @@ from review_agent.configuration import DEFAULT_REVIEW_TIMEOUT_SECONDS
 from review_agent.core import CandidateContract
 from review_agent.github import GitHubAppClient
 from review_agent.publishing import ReviewPublisher
+from review_agent.resources import AttemptResources
 from review_agent.web import create_app
 from review_agent.worker import SingleReviewWorker
 
@@ -164,7 +165,11 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
     runner = CleanAdapter()
     reviewer = Reviewer(
         repository=repository,
-        workspace_root=tmp_path / "workspaces",
+        resources=AttemptResources.for_attempt(
+            "a" * 32,
+            workspace_root=tmp_path / "workspaces",
+            sandbox_prefix="review-agent-",
+        ),
         candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
         source_repository=GitHubRepository(credentials=github),
     )

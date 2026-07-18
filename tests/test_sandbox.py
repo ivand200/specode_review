@@ -20,6 +20,7 @@ from review_agent.configuration import (
     SandboxOperationPolicy,
 )
 from review_agent.core import CandidateContract
+from review_agent.resources import AttemptResources
 from review_agent.sandbox import (
     CodexSandboxAdapter,
     DockerSandboxClient,
@@ -39,6 +40,14 @@ class RecordingProcessRunner:
     ) -> subprocess.CompletedProcess[bytes]:
         self.calls.append((arguments, options))
         return subprocess.CompletedProcess(arguments, 0, stdout=self.stdout, stderr=b"")
+
+
+def _resources(workspace_root: Path) -> AttemptResources:
+    return AttemptResources.for_attempt(
+        "a" * 32,
+        workspace_root=workspace_root,
+        sandbox_prefix="review-agent-",
+    )
 
 
 @dataclass
@@ -152,7 +161,7 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     client = RecordingCodexSandboxClient(context.request.head_sha)
     adapter = CodexSandboxAdapter(
         client=client,
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -209,7 +218,7 @@ def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(
     )
     adapter = CodexSandboxAdapter(
         client=client,
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -232,7 +241,7 @@ def test_codex_sandbox_runner_rejects_injected_control_configuration(
     )
     adapter = CodexSandboxAdapter(
         client=client,
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -252,7 +261,7 @@ def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> No
     )
     adapter = CodexSandboxAdapter(
         client=client,
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -273,7 +282,7 @@ def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None
     )
     adapter = CodexSandboxAdapter(
         client=client,
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -296,7 +305,7 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
             exact_context.request.head_sha,
             result_bytes=exact_candidate,
         ),
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
@@ -315,7 +324,7 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
             oversized_context.request.head_sha,
             result_bytes=exact_candidate + b"x",
         ),
-        sandbox_prefix="review-agent-",
+        resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )

@@ -29,6 +29,7 @@ from review_agent.github import GitHubAppClient
 from review_agent.process import ProcessOptions, _run_bounded_process
 from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
+from review_agent.resources import ReviewResourceManager
 from review_agent.sandbox import (
     CodexSandboxAdapter,
     DockerSandboxClient,
@@ -359,8 +360,7 @@ def _assert_checkpoint_isolation(
     )
     assert list(attempt.workspace_root.iterdir()) == []
     assert not any(
-        name.startswith(attempt.runtime.sandbox_name_prefix)
-        for name in sandbox_client.list_names()
+        name.startswith(attempt.runtime.sandbox_name_prefix) for name in sandbox_client.list_names()
     )
 
 
@@ -422,10 +422,15 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
             config=attempt.runtime.sandbox_operation,
         )
     )
+    resources = ReviewResourceManager(
+        workspace_root=attempt.workspace_root,
+        sandbox_prefix=attempt.runtime.sandbox_name_prefix,
+        sandbox_client=sandbox_client,
+    ).for_attempt("a" * 32)
     runner = RecordingAdapter(
         CodexSandboxAdapter(
             client=sandbox_client,
-            sandbox_prefix=attempt.runtime.sandbox_name_prefix,
+            resources=resources,
             kit=attempt.review_kit_path,
             config=attempt.runtime.codex_execution,
         ),
@@ -436,7 +441,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     )
     reviewer = Reviewer(
         repository=webhook.repository,
-        workspace_root=attempt.workspace_root,
+        resources=resources,
         candidate_acceptance=CandidateAcceptance(
             adapter=runner,
             max_bytes=attempt.runtime.candidate_output_max_bytes,

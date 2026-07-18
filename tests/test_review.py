@@ -25,6 +25,7 @@ from review_agent import (
 )
 from review_agent.configuration import CANDIDATE_OUTPUT_MAX_BYTES
 from review_agent.core import CandidateContract
+from review_agent.resources import AttemptResources, ReviewResourceManager
 from review_agent.sandbox import SandboxLifecycleAdapter
 
 
@@ -136,6 +137,18 @@ def _acceptance(
     max_bytes: int = CANDIDATE_OUTPUT_MAX_BYTES,
 ) -> CandidateAcceptance:
     return CandidateAcceptance(adapter=adapter, max_bytes=max_bytes)  # type: ignore[arg-type]
+
+
+def _resources(
+    workspace_root: Path,
+    *,
+    sandbox_prefix: str = "review-agent-",
+) -> AttemptResources:
+    return AttemptResources.for_attempt(
+        "a" * 32,
+        workspace_root=workspace_root,
+        sandbox_prefix=sandbox_prefix,
+    )
 
 
 class CapturingAdapter:
@@ -362,7 +375,7 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -394,14 +407,19 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
 def test_review_creates_exact_writable_sandbox_copy_and_removes_it(tmp_path: Path) -> None:
     source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
     client = RecordingSandboxClient(head_sha=head_sha)
-    runner = SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
-    resources = SandboxResourceLimits(cpus=3, memory_mib=2_048, pids=64)
+    owned_resources = ReviewResourceManager(
+        workspace_root=tmp_path / "workspaces",
+        sandbox_prefix="review-agent-",
+        sandbox_client=client,
+    ).for_attempt("a" * 32)
+    runner = SandboxLifecycleAdapter(client=client, resources=owned_resources)
+    sandbox_resources = SandboxResourceLimits(cpus=3, memory_mib=2_048, pids=64)
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=owned_resources,
         candidate_acceptance=_acceptance(runner),
-        limits=ReviewLimits(sandbox_resources=resources),
+        limits=ReviewLimits(sandbox_resources=sandbox_resources),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -417,10 +435,11 @@ def test_review_creates_exact_writable_sandbox_copy_and_removes_it(tmp_path: Pat
     assert result.status == "no_important_issues"
     assert len(client.created) == 1
     sandbox_name, control, checkout, applied_resources = client.created[0]
-    assert sandbox_name.startswith("review-agent-")
+    assert sandbox_name == "review-agent-" + "a" * 32
+    assert control.parent == owned_resources.workspace
     assert control.name == "control"
     assert checkout.name == "checkout"
-    assert applied_resources is resources
+    assert applied_resources is sandbox_resources
     assert client.executed == [
         (
             sandbox_name,
@@ -462,9 +481,9 @@ def test_review_rejects_an_inexact_sandbox_copy_after_forced_removal(tmp_path: P
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
-            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+            SandboxLifecycleAdapter(client=client, resources=_resources(tmp_path / "workspaces"))
         ),
     )
     request = ReviewRequest(
@@ -485,7 +504,7 @@ def test_review_rejects_an_inexact_sandbox_copy_after_forced_removal(tmp_path: P
     assert client.removed[0] == client.created[0][0]
 
 
-def test_sandbox_startup_sweep_removes_only_strictly_owned_names(tmp_path: Path) -> None:
+def test_sandbox_adapter_construction_does_not_sweep_owned_names(tmp_path: Path) -> None:
     owned = "review-agent-" + "a" * 32
     client = RecordingSandboxClient(
         head_sha="f" * 40,
@@ -495,19 +514,19 @@ def test_sandbox_startup_sweep_removes_only_strictly_owned_names(tmp_path: Path)
             "other-" + "b" * 32,
         ),
     )
-    runner = SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+    runner = SandboxLifecycleAdapter(client=client, resources=_resources(tmp_path / "workspaces"))
 
     Reviewer(
         repository="octo-org/example",
         source_repository=tmp_path / "unused-origin",
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
 
-    assert client.removed == [owned]
+    assert client.removed == []
 
 
-def test_reviewer_startup_sweep_removes_only_strictly_owned_workspaces(tmp_path: Path) -> None:
+def test_reviewer_construction_does_not_sweep_owned_workspaces(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspaces"
     workspace_root.mkdir()
     owned = workspace_root / ("review-agent-workspace-" + "a" * 32)
@@ -520,11 +539,11 @@ def test_reviewer_startup_sweep_removes_only_strictly_owned_workspaces(tmp_path:
     Reviewer(
         repository="octo-org/example",
         source_repository=tmp_path / "unused-origin",
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(CapturingAdapter()),
     )
 
-    assert not owned.exists()
+    assert owned.exists()
     assert similarly_named.exists()
     assert unrelated.exists()
 
@@ -539,11 +558,11 @@ def test_review_returns_only_the_candidate_from_the_vm_local_copy(tmp_path: Path
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             SandboxLifecycleAdapter(
                 client=client,
-                sandbox_prefix="review-agent-",
+                resources=_resources(tmp_path / "workspaces"),
                 review_command=review_command,
             ),
             max_bytes=len(b'{"findings":[]}'),
@@ -577,9 +596,9 @@ def test_review_fails_when_forced_sandbox_removal_fails(tmp_path: Path) -> None:
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
-            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+            SandboxLifecycleAdapter(client=client, resources=_resources(tmp_path / "workspaces"))
         ),
     )
     request = ReviewRequest(
@@ -621,11 +640,11 @@ def test_sandbox_command_terminal_failures_force_removal(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             SandboxLifecycleAdapter(
                 client=client,
-                sandbox_prefix="review-agent-",
+                resources=_resources(tmp_path / "workspaces"),
                 review_command=review_command,
             )
         ),
@@ -658,11 +677,11 @@ def test_invalid_sandbox_candidate_is_rejected_after_forced_removal(tmp_path: Pa
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             SandboxLifecycleAdapter(
                 client=client,
-                sandbox_prefix="review-agent-",
+                resources=_resources(tmp_path / "workspaces"),
                 review_command=review_command,
             )
         ),
@@ -695,11 +714,11 @@ def test_sandbox_lifecycle_adapter_detects_candidate_overflow_and_cleans_up(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             SandboxLifecycleAdapter(
                 client=client,
-                sandbox_prefix="review-agent-",
+                resources=_resources(tmp_path / "workspaces"),
                 review_command=review_command,
             ),
             max_bytes=len(b'{"findings":[]}') - 1,
@@ -731,9 +750,9 @@ def test_sandbox_setup_failure_still_attempts_forced_removal(tmp_path: Path) -> 
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
-            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+            SandboxLifecycleAdapter(client=client, resources=_resources(tmp_path / "workspaces"))
         ),
     )
     request = ReviewRequest(
@@ -764,7 +783,7 @@ def test_review_rejects_more_than_one_hundred_changed_files_before_the_runner(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -799,7 +818,7 @@ def test_review_accepts_exact_file_and_text_line_limits_without_counting_binary_
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -831,7 +850,7 @@ def test_review_rejects_more_than_five_thousand_changed_text_lines_before_the_ru
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -859,7 +878,7 @@ def test_github_materialization_uses_pull_ref_but_reviews_the_accepted_head(
     runner = GitHubCapturingAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
         source_repository=GitHubRepository(
             credentials=credentials,
@@ -900,7 +919,7 @@ def test_github_materialization_failure_redacts_credentials_and_cleans_workspace
     workspace_root = tmp_path / "workspaces"
     reviewer = Reviewer(
         repository="octo-org/example",
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(CapturingAdapter()),
         source_repository=GitHubRepository(
             credentials=credentials,
@@ -931,7 +950,7 @@ def test_repository_failure_is_normalized_and_cleans_the_workspace(tmp_path: Pat
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(CapturingAdapter()),
     )
     request = ReviewRequest(
@@ -958,7 +977,7 @@ def test_review_bounds_captured_git_process_output(tmp_path: Path) -> None:
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=workspace_root,
+        resources=_resources(workspace_root),
         candidate_acceptance=_acceptance(runner),
         limits=ReviewLimits(process_output_max_bytes=1),
     )
@@ -987,7 +1006,7 @@ def test_review_carries_validated_sandbox_resource_limits_to_the_runner(tmp_path
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
         limits=ReviewLimits(sandbox_resources=sandbox_resources),
     )
@@ -1016,7 +1035,7 @@ def test_review_fails_when_successful_workspace_cleanup_fails(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(ReturningAdapter(b'{"findings":[]}')),
     )
     request = ReviewRequest(
@@ -1062,7 +1081,7 @@ def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -1090,7 +1109,7 @@ def test_review_accepts_a_candidate_at_the_exact_byte_limit(tmp_path: Path) -> N
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(ReturningAdapter(candidate)),
     )
     request = ReviewRequest(
@@ -1115,7 +1134,7 @@ def test_review_rejects_a_candidate_immediately_beyond_the_byte_limit(tmp_path: 
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -1144,7 +1163,7 @@ def test_grounding_rejects_a_traversal_location(tmp_path: Path) -> None:
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
         ),
@@ -1182,7 +1201,7 @@ def test_grounding_accepts_head_files_and_deleted_changed_paths(tmp_path: Path) 
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
         ),
@@ -1214,7 +1233,7 @@ def test_review_preserves_the_fake_runners_finding_order(tmp_path: Path) -> None
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             ReturningAdapter(AgentReview(findings=(first, second)).model_dump_json().encode())
         ),
@@ -1263,7 +1282,7 @@ def test_grounding_rejects_ungrounded_locations(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
         ),
@@ -1290,7 +1309,7 @@ def test_runner_timeout_is_normalized_and_cleans_workspace(tmp_path: Path) -> No
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -1328,7 +1347,7 @@ def test_runner_terminal_errors_propagate_after_cleanup(
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -1348,13 +1367,13 @@ def test_runner_terminal_errors_propagate_after_cleanup(
     assert not runner.workspace.exists()
 
 
-def test_each_review_uses_a_unique_workspace(tmp_path: Path) -> None:
+def test_reviewer_uses_only_its_assigned_attempt_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
     runner = HistoryAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
@@ -1369,7 +1388,9 @@ def test_each_review_uses_a_unique_workspace(tmp_path: Path) -> None:
     reviewer.review(request)
     reviewer.review(request)
 
-    assert len(set(runner.workspaces)) == 2
+    assert set(runner.workspaces) == {
+        tmp_path / "workspaces" / ("review-agent-workspace-" + "a" * 32)
+    }
     assert all(not workspace.exists() for workspace in runner.workspaces)
 
 
@@ -1556,7 +1577,7 @@ def test_a_failed_review_produces_no_publishable_comment(tmp_path: Path) -> None
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
-        workspace_root=tmp_path / "workspaces",
+        resources=_resources(tmp_path / "workspaces"),
         candidate_acceptance=_acceptance(
             ReturningAdapter(
                 AgentReview(

@@ -1,5 +1,6 @@
 import logging
 import os
+import uuid
 from collections.abc import Mapping
 from typing import Protocol
 
@@ -10,6 +11,7 @@ from review_agent.configuration import ProductionSettings
 from review_agent.core import CandidateAcceptance, GitHubRepository, Reviewer
 from review_agent.github import GitHubAppClient
 from review_agent.readiness import ProductionReadiness
+from review_agent.resources import ReviewResourceManager
 from review_agent.sandbox import (
     CodexSandboxAdapter,
     DockerSandboxClient,
@@ -39,9 +41,16 @@ def create_production_app(
     sandbox_client = DockerSandboxClient(
         config=runtime.sandbox_operation,
     )
+    resource_manager = ReviewResourceManager(
+        workspace_root=attempt.workspace_root,
+        sandbox_prefix=runtime.sandbox_name_prefix,
+        sandbox_client=sandbox_client,
+    )
+    resource_manager.sweep_stale()
+    resources = resource_manager.for_attempt(uuid.uuid4().hex)
     adapter = CodexSandboxAdapter(
         client=sandbox_client,
-        sandbox_prefix=runtime.sandbox_name_prefix,
+        resources=resources,
         kit=attempt.review_kit_path,
         config=runtime.codex_execution,
     )
@@ -57,7 +66,7 @@ def create_production_app(
     try:
         reviewer = Reviewer(
             repository=webhook.repository,
-            workspace_root=attempt.workspace_root,
+            resources=resources,
             candidate_acceptance=candidate_acceptance,
             source_repository=GitHubRepository(credentials=github),
             limits=runtime.review_limits,
