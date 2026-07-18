@@ -195,7 +195,8 @@ uv run mypy
 uv run pytest
 ```
 
-Normal tests use fake GitHub and runner adapters and require no GitHub, Docker, OpenAI credentials,
-network access, or model budget. Docker lifecycle and live profiles are opt-in and documented in
+Normal tests use fake GitHub and raw-byte candidate adapters through real candidate acceptance.
+They require no GitHub, Docker, OpenAI credentials, network access, or model budget. Docker
+lifecycle and live profiles are opt-in and documented in
 [`tests/live/README.md`](tests/live/README.md). Run the full checkpoint C before rollout; a failure
 blocks rollout rather than weakening validation or isolation.

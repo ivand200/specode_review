@@ -7,12 +7,12 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
-from review_agent.core import GitHubRepository, Reviewer, ReviewLimits
+from review_agent.core import CandidateAcceptance, GitHubRepository, Reviewer, ReviewLimits
 from review_agent.github import GitHubAppClient
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
     CodexExecutionConfig,
-    CodexSandboxRunner,
+    CodexSandboxAdapter,
     DockerSandboxClient,
     DockerSandboxConfig,
 )
@@ -40,15 +40,18 @@ def create_production_app(
             cleanup_timeout_seconds=resolved_settings.sandbox_cleanup_timeout_seconds,
         )
     )
-    runner = CodexSandboxRunner(
+    adapter = CodexSandboxAdapter(
         client=sandbox_client,
         sandbox_prefix=resolved_settings.sandbox_name_prefix,
         kit=resolved_settings.review_kit_path,
         config=CodexExecutionConfig(
             model=resolved_settings.codex_model,
             reasoning_effort=resolved_settings.openai_reasoning_effort,
-            candidate_output_max_bytes=resolved_settings.candidate_output_max_bytes,
         ),
+    )
+    candidate_acceptance = CandidateAcceptance(
+        adapter=adapter,
+        max_bytes=resolved_settings.candidate_output_max_bytes,
     )
     github = GitHubAppClient(
         repository=resolved_settings.repository,
@@ -59,7 +62,7 @@ def create_production_app(
         reviewer = Reviewer(
             repository=resolved_settings.repository,
             workspace_root=resolved_settings.workspace_root,
-            runner=runner,
+            candidate_acceptance=candidate_acceptance,
             source_repository=GitHubRepository(credentials=github),
             limits=ReviewLimits(
                 process_output_max_bytes=resolved_settings.process_output_max_bytes,

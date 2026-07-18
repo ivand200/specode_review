@@ -18,6 +18,8 @@ from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
 from review_agent.core import (
+    CandidateAcceptance,
+    CandidateContract,
     GitHubRepository,
     ReviewContext,
     Reviewer,
@@ -30,7 +32,7 @@ from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
     CodexExecutionConfig,
-    CodexSandboxRunner,
+    CodexSandboxAdapter,
     DockerSandboxClient,
     DockerSandboxConfig,
 )
@@ -76,20 +78,27 @@ class RecordingPublisher:
         self.published.set()
 
 
-class RecordingRunner:
+class RecordingAdapter:
     def __init__(
         self,
-        runner: CodexSandboxRunner,
+        adapter: CodexSandboxAdapter,
         *,
         repository_control_markers: Mapping[Path, str],
     ) -> None:
-        self._runner = runner
+        self._adapter = adapter
         self._repository_control_markers = repository_control_markers
         self.context: ReviewContext | None = None
         self.host_checkout_unchanged = False
         self.repository_controls_present = False
 
-    def run(self, context: ReviewContext) -> object:
+    def sweep_orphans(self) -> None:
+        self._adapter.sweep_orphans()
+
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
         self.context = context
         self.repository_controls_present = all(
             marker in (context.checkout / relative_path).read_text(encoding="utf-8")
@@ -99,7 +108,7 @@ class RecordingRunner:
             message = "checkpoint C repository control fixtures are missing"
             raise RuntimeError(message)
         before = self._checkout_identity(context.checkout)
-        candidate = self._runner.run(context)
+        candidate = self._adapter.produce(context, contract)
         self.host_checkout_unchanged = self._checkout_identity(context.checkout) == before
         return candidate
 
@@ -127,9 +136,7 @@ class ReviewFailureHandler(logging.Handler):
         self.message: str | None = None
 
     def emit(self, record: logging.LogRecord) -> None:
-        if record.name == "review_agent.web" and record.getMessage().startswith(
-            "review failed "
-        ):
+        if record.name == "review_agent.web" and record.getMessage().startswith("review failed "):
             self.message = record.getMessage()
             self.failed.set()
 
@@ -337,7 +344,7 @@ def _wait_for_publication_or_failure(
 
 def _assert_checkpoint_isolation(
     *,
-    runner: RecordingRunner,
+    runner: RecordingAdapter,
     sandbox_client: VerifyingCodexSandboxClient,
     process_runner: RecordingProcessRunner,
     settings: ProductionSettings,
@@ -414,15 +421,14 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
             ),
         )
     )
-    runner = RecordingRunner(
-        CodexSandboxRunner(
+    runner = RecordingAdapter(
+        CodexSandboxAdapter(
             client=sandbox_client,
             sandbox_prefix=settings.sandbox_name_prefix,
             kit=settings.review_kit_path,
             config=CodexExecutionConfig(
                 model=settings.codex_model,
                 reasoning_effort=settings.openai_reasoning_effort,
-                candidate_output_max_bytes=settings.candidate_output_max_bytes,
             ),
         ),
         repository_control_markers={
@@ -433,7 +439,10 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     reviewer = Reviewer(
         repository=settings.repository,
         workspace_root=settings.workspace_root,
-        runner=runner,
+        candidate_acceptance=CandidateAcceptance(
+            adapter=runner,
+            max_bytes=settings.candidate_output_max_bytes,
+        ),
         source_repository=GitHubRepository(credentials=github),
         limits=ReviewLimits(
             process_output_max_bytes=settings.process_output_max_bytes,
@@ -488,9 +497,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         in publisher.body
     )
     assert expected_finding.casefold() in publisher.body.casefold()
-    assert all(
-        marker not in publisher.body for marker in (forbidden_instruction, forbidden_config)
-    )
+    assert all(marker not in publisher.body for marker in (forbidden_instruction, forbidden_config))
     _assert_checkpoint_isolation(
         runner=runner,
         sandbox_client=sandbox_client,

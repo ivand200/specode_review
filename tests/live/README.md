@@ -3,7 +3,8 @@
 This opt-in checkpoint starts the FastAPI service on a real local socket, sends a signed
 GitHub-shaped webhook for one real pull request, and uses the configured GitHub App to
 clone the base repository, fetch `refs/pull/<number>/head`, review the exact accepted head
-with the deterministic clean runner, and create one real top-level pull-request comment.
+with the deterministic clean candidate adapter, and create one real top-level pull-request
+comment.
 It does not use Docker Sandboxes, OpenAI authentication, or model budget.
 
 The repository name must contain `test`, and the explicit E2E repository must equal the

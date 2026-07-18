@@ -65,13 +65,165 @@ class ReviewContext:
     sandbox_resources: SandboxResourceLimits
 
 
-class ReviewRunner(Protocol):
-    def run(self, context: ReviewContext) -> object: ...
+@dataclass(frozen=True, slots=True)
+class CandidateContract:
+    schema_json: bytes
+    max_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.max_bytes <= 0:
+            message = "candidate output limit must be positive"
+            raise ValueError(message)
+
+
+class _CandidateAdapter(Protocol):
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes: ...
 
 
 @runtime_checkable
 class _OrphanSweeper(Protocol):
     def sweep_orphans(self) -> None: ...
+
+
+class CandidateAcceptance:
+    def __init__(self, *, adapter: _CandidateAdapter, max_bytes: int) -> None:
+        if max_bytes <= 0:
+            message = "candidate output limit must be positive"
+            raise ValueError(message)
+        schema = AgentReview.model_json_schema()
+        self._verify_schema_invariants(schema)
+        schema_json = json.dumps(
+            schema,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self._adapter = adapter
+        self._contract = CandidateContract(schema_json=schema_json, max_bytes=max_bytes)
+        if isinstance(self._adapter, _OrphanSweeper):
+            self._adapter.sweep_orphans()
+
+    def accept(self, context: ReviewContext) -> AgentReview:
+        remaining_review_time(stage="review_runner")
+        try:
+            candidate_bytes = self._adapter.produce(context, self._contract)
+        except TimeoutError as error:
+            raise ReviewError(FailureCategory.TIMEOUT, stage="review_runner") from error
+        remaining_review_time(stage="review_runner")
+        if not isinstance(candidate_bytes, bytes):
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="candidate_validation",
+            )
+        if len(candidate_bytes) > self._contract.max_bytes:
+            raise ReviewError(FailureCategory.CODEX_OR_LIMIT, stage="candidate_output")
+        try:
+            candidate = AgentReview.model_validate_json(candidate_bytes, strict=True)
+        except ValidationError as error:
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="candidate_validation",
+            ) from error
+        try:
+            remaining_review_time(stage="candidate_grounding")
+            self._ground_candidate(context.checkout, context.manifest, candidate)
+            remaining_review_time(stage="candidate_grounding")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="candidate_grounding",
+            ) from error
+        return candidate
+
+    @classmethod
+    def _verify_schema_invariants(cls, node: object) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if node.get("type") == "object" or isinstance(properties, dict):
+                declared_properties = properties if isinstance(properties, dict) else {}
+                required = node.get("required")
+                if (
+                    node.get("additionalProperties") is not False
+                    or not isinstance(required, list)
+                    or len(required) != len(declared_properties)
+                    or set(required) != set(declared_properties)
+                ):
+                    message = "candidate schema object invariants are not satisfied"
+                    raise RuntimeError(message)
+            for value in node.values():
+                cls._verify_schema_invariants(value)
+        elif isinstance(node, list):
+            for value in node:
+                cls._verify_schema_invariants(value)
+
+    @staticmethod
+    def _ground_candidate(
+        checkout: Path,
+        manifest: ChangedPathManifest,
+        candidate: AgentReview,
+    ) -> None:
+        checkout_root = checkout.resolve()
+        changed_paths = frozenset(manifest.paths)
+        for finding in candidate.findings:
+            has_changed_location = False
+            for location in finding.locations:
+                is_changed = CandidateAcceptance._ground_location(
+                    checkout,
+                    checkout_root,
+                    changed_paths,
+                    location,
+                )
+                has_changed_location = has_changed_location or is_changed
+
+            if not has_changed_location:
+                message = "each finding requires at least one changed-path location"
+                raise ValueError(message)
+
+    @staticmethod
+    def _ground_location(
+        checkout: Path,
+        checkout_root: Path,
+        changed_paths: frozenset[str],
+        location: Location,
+    ) -> bool:
+        relative_path = PurePosixPath(location.path)
+        if relative_path.is_absolute() or ".." in relative_path.parts or "\x00" in location.path:
+            message = "location path must remain inside the checkout"
+            raise ValueError(message)
+
+        candidate_path = checkout.joinpath(*relative_path.parts)
+        try:
+            candidate_path.resolve(strict=False).relative_to(checkout_root)
+        except ValueError as error:
+            message = "location path escapes the checkout"
+            raise ValueError(message) from error
+
+        is_changed = location.path in changed_paths
+        path_exists = lexists(candidate_path)
+        if not path_exists and not is_changed:
+            message = "location path does not exist at the reviewed head"
+            raise ValueError(message)
+        if path_exists and not (candidate_path.is_file() or candidate_path.is_symlink()):
+            message = "location path must identify a file"
+            raise ValueError(message)
+
+        if location.line is None:
+            return is_changed
+        if not path_exists or not candidate_path.is_file():
+            message = "line locations require a file at the reviewed head"
+            raise ValueError(message)
+        contents = candidate_path.read_bytes()
+        if b"\x00" in contents:
+            message = "line locations cannot reference binary files"
+            raise ValueError(message)
+        if location.line > len(contents.splitlines()):
+            message = "location line is outside the reviewed head file"
+            raise ValueError(message)
+        return is_changed
 
 
 class InstallationCredentials(Protocol):
@@ -90,19 +242,17 @@ class Reviewer:
         *,
         repository: str,
         workspace_root: Path,
-        runner: ReviewRunner,
+        candidate_acceptance: CandidateAcceptance,
         source_repository: Path | GitHubRepository,
         limits: ReviewLimits | None = None,
     ) -> None:
         self._repository = repository
         self._source_repository = source_repository
         self._workspace_root = workspace_root
-        self._runner = runner
+        self._candidate_acceptance = candidate_acceptance
         self._limits = limits or ReviewLimits()
         self._workspace_root.mkdir(parents=True, exist_ok=True)
         self._sweep_orphan_workspaces()
-        if isinstance(self._runner, _OrphanSweeper):
-            self._runner.sweep_orphans()
         git_executable = shutil.which("git")
         if git_executable is None:
             raise ReviewError(
@@ -122,16 +272,7 @@ class Reviewer:
         primary_failed = False
         try:
             context = self._prepare_context(workspace, checkout, request)
-            candidate = self._candidate_from_runner(context)
-            try:
-                remaining_review_time(stage="candidate_grounding")
-                self._ground_candidate(checkout, context.manifest, candidate)
-                remaining_review_time(stage="candidate_grounding")
-            except (OSError, RuntimeError, ValueError) as error:
-                raise ReviewError(
-                    FailureCategory.INVALID_MODEL_OUTPUT,
-                    stage="candidate_grounding",
-                ) from error
+            candidate = self._candidate_acceptance.accept(context)
             status: Literal["issues_found", "no_important_issues"] = (
                 "issues_found" if candidate.findings else "no_important_issues"
             )
@@ -220,44 +361,6 @@ class Reviewer:
             manifest=manifest,
             sandbox_resources=self._limits.sandbox_resources,
         )
-
-    def _candidate_from_runner(self, context: ReviewContext) -> AgentReview:
-        remaining_review_time(stage="review_runner")
-        try:
-            raw_candidate = self._runner.run(context)
-        except TimeoutError as error:
-            raise ReviewError(FailureCategory.TIMEOUT, stage="review_runner") from error
-        remaining_review_time(stage="review_runner")
-        try:
-            candidate_bytes = self._candidate_bytes(raw_candidate)
-        except (TypeError, ValueError) as error:
-            raise ReviewError(
-                FailureCategory.INVALID_MODEL_OUTPUT,
-                stage="candidate_validation",
-            ) from error
-        if len(candidate_bytes) > CANDIDATE_OUTPUT_MAX_BYTES:
-            raise ReviewError(FailureCategory.CODEX_OR_LIMIT, stage="candidate_output")
-        try:
-            return AgentReview.model_validate_json(candidate_bytes)
-        except ValidationError as error:
-            raise ReviewError(
-                FailureCategory.INVALID_MODEL_OUTPUT,
-                stage="candidate_validation",
-            ) from error
-
-    @staticmethod
-    def _candidate_bytes(raw_candidate: object) -> bytes:
-        if isinstance(raw_candidate, bytes):
-            return raw_candidate
-        if isinstance(raw_candidate, str):
-            return raw_candidate.encode("utf-8")
-        if isinstance(raw_candidate, AgentReview):
-            return raw_candidate.model_dump_json().encode("utf-8")
-        return json.dumps(
-            raw_candidate,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
 
     def _materialize_repository(
         self,
@@ -425,68 +528,3 @@ class Reviewer:
                 continue
             changed_lines += int(added) + int(deleted)
         return changed_lines
-
-    @staticmethod
-    def _ground_candidate(
-        checkout: Path,
-        manifest: ChangedPathManifest,
-        candidate: AgentReview,
-    ) -> None:
-        checkout_root = checkout.resolve()
-        changed_paths = frozenset(manifest.paths)
-        for finding in candidate.findings:
-            has_changed_location = False
-            for location in finding.locations:
-                is_changed = Reviewer._ground_location(
-                    checkout,
-                    checkout_root,
-                    changed_paths,
-                    location,
-                )
-                has_changed_location = has_changed_location or is_changed
-
-            if not has_changed_location:
-                msg = "each finding requires at least one changed-path location"
-                raise ValueError(msg)
-
-    @staticmethod
-    def _ground_location(
-        checkout: Path,
-        checkout_root: Path,
-        changed_paths: frozenset[str],
-        location: Location,
-    ) -> bool:
-        relative_path = PurePosixPath(location.path)
-        if relative_path.is_absolute() or ".." in relative_path.parts or "\x00" in location.path:
-            msg = "location path must remain inside the checkout"
-            raise ValueError(msg)
-
-        candidate_path = checkout.joinpath(*relative_path.parts)
-        try:
-            candidate_path.resolve(strict=False).relative_to(checkout_root)
-        except ValueError as error:
-            msg = "location path escapes the checkout"
-            raise ValueError(msg) from error
-
-        is_changed = location.path in changed_paths
-        path_exists = lexists(candidate_path)
-        if not path_exists and not is_changed:
-            msg = "location path does not exist at the reviewed head"
-            raise ValueError(msg)
-        if path_exists and not (candidate_path.is_file() or candidate_path.is_symlink()):
-            msg = "location path must identify a file"
-            raise ValueError(msg)
-
-        if location.line is None:
-            return is_changed
-        if not path_exists or not candidate_path.is_file():
-            msg = "line locations require a file at the reviewed head"
-            raise ValueError(msg)
-        contents = candidate_path.read_bytes()
-        if b"\x00" in contents:
-            msg = "line locations cannot reference binary files"
-            raise ValueError(msg)
-        if location.line > len(contents.splitlines()):
-            msg = "location line is outside the reviewed head file"
-            raise ValueError(msg)
-        return is_changed

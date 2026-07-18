@@ -8,9 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TypeVar
 
-from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, ReviewContext, SandboxResourceLimits
+from review_agent.core import CandidateContract, ReviewContext, SandboxResourceLimits
 from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import AgentReview
 from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
 
 _SANDBOX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")
@@ -32,20 +31,6 @@ _CODEX_PROMPT = (
 )
 
 
-def _make_strict_output_schema(node: object) -> None:
-    if isinstance(node, dict):
-        node.pop("default", None)
-        properties = node.get("properties")
-        if isinstance(properties, dict):
-            node["required"] = list(properties)
-            node["additionalProperties"] = False
-        for value in node.values():
-            _make_strict_output_schema(value)
-    elif isinstance(node, list):
-        for value in node:
-            _make_strict_output_schema(value)
-
-
 @dataclass(frozen=True, slots=True)
 class DockerSandboxConfig:
     process_output_max_bytes: int = 1_048_576
@@ -62,7 +47,6 @@ class DockerSandboxConfig:
 class CodexExecutionConfig:
     model: str
     reasoning_effort: str
-    candidate_output_max_bytes: int = CANDIDATE_OUTPUT_MAX_BYTES
 
     def __post_init__(self) -> None:
         if not self.model or len(self.model) > _CODEX_MODEL_MAX_CHARS:
@@ -70,9 +54,6 @@ class CodexExecutionConfig:
             raise ValueError(message)
         if self.reasoning_effort not in _CODEX_REASONING_EFFORTS:
             message = "Codex reasoning effort must be a supported value"
-            raise ValueError(message)
-        if self.candidate_output_max_bytes <= 0:
-            message = "candidate output limit must be positive"
             raise ValueError(message)
 
 
@@ -105,9 +86,7 @@ class DockerSandboxClient:
         self._run_process = process_runner
         self._process_output_max_bytes = resolved_config.process_output_max_bytes
         self._cleanup_timeout_seconds = resolved_config.cleanup_timeout_seconds
-        self._environment = dict(
-            _default_sbx_environment() if environment is None else environment
-        )
+        self._environment = dict(_default_sbx_environment() if environment is None else environment)
         self._deny_network = resolved_config.deny_network
 
     def create(
@@ -311,9 +290,7 @@ class _SandboxLifecycle:
         self._sandbox_prefix = sandbox_prefix
         self._timeout_stage = timeout_stage
         self._failure_stage = failure_stage
-        self._owned_name = re.compile(
-            rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$"
-        )
+        self._owned_name = re.compile(rf"^{re.escape(self._sandbox_prefix)}[0-9a-f]{{32}}$")
 
     def sweep_orphans(self) -> None:
         try:
@@ -394,12 +371,16 @@ class _SandboxLifecycle:
             context,
             ("cp", "-R", f"{context.checkout}/.", _VM_CHECKOUT),
         )
-        copied_head = self._execute(
-            sandbox_name,
-            context,
-            ("git", "rev-parse", "HEAD"),
-            workdir=_VM_CHECKOUT,
-        ).decode("ascii").strip()
+        copied_head = (
+            self._execute(
+                sandbox_name,
+                context,
+                ("git", "rev-parse", "HEAD"),
+                workdir=_VM_CHECKOUT,
+            )
+            .decode("ascii")
+            .strip()
+        )
         if copied_head != context.request.head_sha:
             raise ReviewError(
                 FailureCategory.SANDBOX_LIFECYCLE,
@@ -437,7 +418,7 @@ class _SandboxLifecycle:
         )
 
 
-class CodexSandboxRunner:
+class CodexSandboxAdapter:
     def __init__(
         self,
         *,
@@ -456,19 +437,27 @@ class CodexSandboxRunner:
         self._kit = kit
         self._model = config.model
         self._reasoning_effort = config.reasoning_effort
-        self._candidate_output_max_bytes = config.candidate_output_max_bytes
 
     def sweep_orphans(self) -> None:
         self._lifecycle.sweep_orphans()
 
-    def run(self, context: ReviewContext) -> bytes:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
         control = context.workspace / "control"
         schema_path = control / "review.schema.json"
         request_path = control / "request.json"
         result_path = control / "result.json"
 
         def prepare_control() -> None:
-            self._write_control_artifacts(context, schema_path, request_path)
+            self._write_control_artifacts(
+                context,
+                contract,
+                schema_path,
+                request_path,
+            )
 
         def create(sandbox_name: str) -> None:
             self._client.create_codex(
@@ -496,7 +485,7 @@ class CodexSandboxRunner:
                 result_path=result_path,
                 snapshot=trusted_artifacts,
             )
-            return self._read_candidate(result_path)
+            return self._read_candidate(result_path, contract.max_bytes)
 
         return self._lifecycle.run(
             context,
@@ -554,7 +543,7 @@ class CodexSandboxRunner:
                 stage="codex_execution",
             ) from error
 
-    def _read_candidate(self, result_path: Path) -> bytes:
+    def _read_candidate(self, result_path: Path, max_bytes: int) -> bytes:
         if result_path.is_symlink():
             raise ReviewError(
                 FailureCategory.INVALID_MODEL_OUTPUT,
@@ -562,13 +551,13 @@ class CodexSandboxRunner:
             )
         try:
             with result_path.open("rb") as candidate_file:
-                candidate = candidate_file.read(self._candidate_output_max_bytes + 1)
+                candidate = candidate_file.read(max_bytes + 1)
         except OSError as error:
             raise ReviewError(
                 FailureCategory.INVALID_MODEL_OUTPUT,
                 stage="codex_candidate_output",
             ) from error
-        if len(candidate) > self._candidate_output_max_bytes:
+        if len(candidate) > max_bytes:
             raise ReviewError(
                 FailureCategory.CODEX_OR_LIMIT,
                 stage="codex_candidate_output",
@@ -578,15 +567,11 @@ class CodexSandboxRunner:
     @staticmethod
     def _write_control_artifacts(
         context: ReviewContext,
+        contract: CandidateContract,
         schema_path: Path,
         request_path: Path,
     ) -> None:
-        output_schema = AgentReview.model_json_schema()
-        _make_strict_output_schema(output_schema)
-        schema_path.write_text(
-            json.dumps(output_schema, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        schema_path.write_bytes(contract.schema_json)
         request_path.write_text(
             json.dumps(
                 {
@@ -631,9 +616,7 @@ class CodexSandboxRunner:
     ) -> None:
         try:
             current_paths = {
-                path
-                for path in control.rglob("*")
-                if path != result_path and path.is_file()
+                path for path in control.rglob("*") if path != result_path and path.is_file()
             }
             intact = current_paths == set(snapshot) and all(
                 path.read_bytes() == contents and path.stat().st_mode & 0o777 == mode
@@ -648,7 +631,7 @@ class CodexSandboxRunner:
             )
 
 
-class SandboxLifecycleRunner:
+class SandboxLifecycleAdapter:
     def __init__(
         self,
         *,
@@ -668,7 +651,11 @@ class SandboxLifecycleRunner:
     def sweep_orphans(self) -> None:
         self._lifecycle.sweep_orphans()
 
-    def run(self, context: ReviewContext) -> object:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
         control = context.workspace / "control"
 
         def create(sandbox_name: str) -> None:
@@ -679,15 +666,23 @@ class SandboxLifecycleRunner:
                 resources=context.sandbox_resources,
             )
 
-        def review(sandbox_name: str) -> object:
+        def review(sandbox_name: str) -> bytes:
             if self._review_command is not None:
-                return self._lifecycle.execute(
+                candidate = self._lifecycle.execute(
                     sandbox_name,
                     context,
                     self._review_command,
                     workdir=_VM_CHECKOUT,
                 )
-            return AgentReview(findings=())
+            else:
+                candidate = b'{"findings":[]}'
+            bounded_candidate = candidate[: contract.max_bytes + 1]
+            if len(bounded_candidate) > contract.max_bytes:
+                raise ReviewError(
+                    FailureCategory.CODEX_OR_LIMIT,
+                    stage="sandbox_candidate_output",
+                )
+            return bounded_candidate
 
         return self._lifecycle.run(
             context,

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from review_agent import (
     AgentReview,
+    CandidateAcceptance,
     DiffRange,
     FailureCategory,
     Finding,
@@ -22,7 +23,8 @@ from review_agent import (
     publish_review_result,
     render_review_comment,
 )
-from review_agent.sandbox import SandboxLifecycleRunner
+from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, CandidateContract
+from review_agent.sandbox import SandboxLifecycleAdapter
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -127,13 +129,26 @@ def _github_pull_ref_repository(root: Path) -> tuple[Path, str, str, str, str]:
     return repository, merge_base, base_sha, accepted_head, newer_head
 
 
-class CapturingRunner:
+def _acceptance(
+    adapter: object,
+    *,
+    max_bytes: int = CANDIDATE_OUTPUT_MAX_BYTES,
+) -> CandidateAcceptance:
+    return CandidateAcceptance(adapter=adapter, max_bytes=max_bytes)  # type: ignore[arg-type]
+
+
+class CapturingAdapter:
     def __init__(self) -> None:
         self.context: ReviewContext | None = None
         self.checked_out_head: str | None = None
         self.was_detached = False
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.context = context
         self.checked_out_head = _git(context.checkout, "rev-parse", "HEAD")
         symbolic_ref = subprocess.run(
@@ -142,36 +157,51 @@ class CapturingRunner:
             capture_output=True,
         )
         self.was_detached = symbolic_ref.returncode != 0
-        return AgentReview(findings=())
+        return b'{"findings":[]}'
 
 
-class ReturningRunner:
+class ReturningAdapter:
     def __init__(self, candidate: object) -> None:
         self.candidate = candidate
         self.workspace: Path | None = None
 
-    def run(self, context: ReviewContext) -> object:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.workspace = context.workspace
-        return self.candidate
+        return self.candidate  # type: ignore[return-value]
 
 
-class RaisingRunner:
+class RaisingAdapter:
     def __init__(self, error: BaseException) -> None:
         self.error = error
         self.workspace: Path | None = None
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.workspace = context.workspace
         raise self.error
 
 
-class HistoryRunner:
+class HistoryAdapter:
     def __init__(self) -> None:
         self.workspaces: list[Path] = []
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.workspaces.append(context.workspace)
-        return AgentReview(findings=())
+        return b'{"findings":[]}'
 
 
 class RecordingSandboxClient:
@@ -231,17 +261,22 @@ class RecordingSandboxClient:
         return self.existing_names
 
 
-class GitHubCapturingRunner:
+class GitHubCapturingAdapter:
     def __init__(self) -> None:
         self.context: ReviewContext | None = None
         self.checked_out_head: str | None = None
         self.remote_url: str | None = None
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.context = context
         self.checked_out_head = _git(context.checkout, "rev-parse", "HEAD")
         self.remote_url = _git(context.checkout, "remote", "get-url", "origin")
-        return AgentReview(findings=(_finding(),))
+        return AgentReview(findings=(_finding(),)).model_dump_json().encode()
 
 
 class FakeInstallationCredentials:
@@ -322,12 +357,12 @@ def test_review_request_counts_unicode_text_by_character_and_truncates_descripti
 def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> None:
     source, merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
     workspace_root = tmp_path / "workspaces"
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -358,13 +393,13 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
 def test_review_creates_exact_writable_sandbox_copy_and_removes_it(tmp_path: Path) -> None:
     source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
     client = RecordingSandboxClient(head_sha=head_sha)
-    runner = SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-")
+    runner = SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
     resources = SandboxResourceLimits(cpus=3, memory_mib=2_048, pids=64)
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
         limits=ReviewLimits(sandbox_resources=resources),
     )
     request = ReviewRequest(
@@ -427,7 +462,9 @@ def test_review_rejects_an_inexact_sandbox_copy_after_forced_removal(tmp_path: P
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -457,13 +494,13 @@ def test_sandbox_startup_sweep_removes_only_strictly_owned_names(tmp_path: Path)
             "other-" + "b" * 32,
         ),
     )
-    runner = SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-")
+    runner = SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
 
     Reviewer(
         repository="octo-org/example",
         source_repository=tmp_path / "unused-origin",
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
 
     assert client.removed == [owned]
@@ -483,7 +520,7 @@ def test_reviewer_startup_sweep_removes_only_strictly_owned_workspaces(tmp_path:
         repository="octo-org/example",
         source_repository=tmp_path / "unused-origin",
         workspace_root=workspace_root,
-        runner=CapturingRunner(),
+        candidate_acceptance=_acceptance(CapturingAdapter()),
     )
 
     assert not owned.exists()
@@ -502,10 +539,13 @@ def test_review_returns_only_the_candidate_from_the_vm_local_copy(tmp_path: Path
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(
-            client=client,
-            sandbox_prefix="review-agent-",
-            review_command=review_command,
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(
+                client=client,
+                sandbox_prefix="review-agent-",
+                review_command=review_command,
+            ),
+            max_bytes=len(b'{"findings":[]}'),
         ),
     )
     request = ReviewRequest(
@@ -537,7 +577,9 @@ def test_review_fails_when_forced_sandbox_removal_fails(tmp_path: Path) -> None:
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -579,10 +621,12 @@ def test_sandbox_command_terminal_failures_force_removal(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(
-            client=client,
-            sandbox_prefix="review-agent-",
-            review_command=review_command,
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(
+                client=client,
+                sandbox_prefix="review-agent-",
+                review_command=review_command,
+            )
         ),
     )
     request = ReviewRequest(
@@ -614,10 +658,12 @@ def test_invalid_sandbox_candidate_is_rejected_after_forced_removal(tmp_path: Pa
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(
-            client=client,
-            sandbox_prefix="review-agent-",
-            review_command=review_command,
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(
+                client=client,
+                sandbox_prefix="review-agent-",
+                review_command=review_command,
+            )
         ),
     )
     request = ReviewRequest(
@@ -636,6 +682,45 @@ def test_invalid_sandbox_candidate_is_rejected_after_forced_removal(tmp_path: Pa
     assert client.removed == [client.created[0][0]]
 
 
+def test_sandbox_lifecycle_adapter_detects_candidate_overflow_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
+    review_command = ("probe",)
+    client = RecordingSandboxClient(
+        head_sha=head_sha,
+        command_outputs={review_command: b'{"findings":[]}'},
+    )
+    reviewer = Reviewer(
+        repository="octo-org/example",
+        source_repository=source,
+        workspace_root=tmp_path / "workspaces",
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(
+                client=client,
+                sandbox_prefix="review-agent-",
+                review_command=review_command,
+            ),
+            max_bytes=len(b'{"findings":[]}') - 1,
+        ),
+    )
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        title="Bound lifecycle candidate bytes",
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        reviewer.review(request)
+
+    assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
+    assert failure.value.stage == "sandbox_candidate_output"
+    assert client.removed == [client.created[0][0]]
+
+
 def test_sandbox_setup_failure_still_attempts_forced_removal(tmp_path: Path) -> None:
     source, _merge_base, base_sha, head_sha = _diverged_repository(tmp_path)
     client = RecordingSandboxClient(
@@ -646,7 +731,9 @@ def test_sandbox_setup_failure_still_attempts_forced_removal(tmp_path: Path) -> 
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=SandboxLifecycleRunner(client=client, sandbox_prefix="review-agent-"),
+        candidate_acceptance=_acceptance(
+            SandboxLifecycleAdapter(client=client, sandbox_prefix="review-agent-")
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -671,13 +758,13 @@ def test_review_rejects_more_than_one_hundred_changed_files_before_the_runner(
         tmp_path,
         {f"changed-{index:03}.txt": b"changed\n" for index in range(101)},
     )
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     workspace_root = tmp_path / "workspaces"
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -707,12 +794,12 @@ def test_review_accepts_exact_file_and_text_line_limits_without_counting_binary_
         changes,
         base_files={"text.txt": b"old line\n" * 2_500},
     )
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -739,12 +826,12 @@ def test_review_rejects_more_than_five_thousand_changed_text_lines_before_the_ru
         tmp_path,
         {"text.txt": b"line\n" * 5_001},
     )
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -768,11 +855,11 @@ def test_github_materialization_uses_pull_ref_but_reviews_the_accepted_head(
 ) -> None:
     source, merge_base, base_sha, accepted_head, newer_head = _github_pull_ref_repository(tmp_path)
     credentials = FakeInstallationCredentials()
-    runner = GitHubCapturingRunner()
+    runner = GitHubCapturingAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
         source_repository=GitHubRepository(
             credentials=credentials,
             clone_url=str(source),
@@ -813,7 +900,7 @@ def test_github_materialization_failure_redacts_credentials_and_cleans_workspace
     reviewer = Reviewer(
         repository="octo-org/example",
         workspace_root=workspace_root,
-        runner=CapturingRunner(),
+        candidate_acceptance=_acceptance(CapturingAdapter()),
         source_repository=GitHubRepository(
             credentials=credentials,
             clone_url=str(tmp_path / "missing-origin"),
@@ -844,7 +931,7 @@ def test_repository_failure_is_normalized_and_cleans_the_workspace(tmp_path: Pat
         repository="octo-org/example",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=CapturingRunner(),
+        candidate_acceptance=_acceptance(CapturingAdapter()),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -865,13 +952,13 @@ def test_repository_failure_is_normalized_and_cleans_the_workspace(tmp_path: Pat
 
 def test_review_bounds_captured_git_process_output(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     workspace_root = tmp_path / "workspaces"
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
         limits=ReviewLimits(process_output_max_bytes=1),
     )
     request = ReviewRequest(
@@ -894,13 +981,13 @@ def test_review_bounds_captured_git_process_output(tmp_path: Path) -> None:
 
 def test_review_carries_validated_sandbox_resource_limits_to_the_runner(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = CapturingRunner()
+    runner = CapturingAdapter()
     sandbox_resources = SandboxResourceLimits(cpus=2, memory_mib=4_096, pids=256)
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
         limits=ReviewLimits(sandbox_resources=sandbox_resources),
     )
     request = ReviewRequest(
@@ -929,7 +1016,7 @@ def test_review_fails_when_successful_workspace_cleanup_fails(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(AgentReview(findings=())),
+        candidate_acceptance=_acceptance(ReturningAdapter(b'{"findings":[]}')),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -957,7 +1044,7 @@ def test_review_fails_when_successful_workspace_cleanup_fails(
 
 def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = ReturningRunner(
+    runner = ReturningAdapter(
         {
             "findings": [
                 {
@@ -975,7 +1062,7 @@ def test_invalid_runner_candidate_fails_the_review_and_cleans_workspace(tmp_path
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1003,7 +1090,7 @@ def test_review_accepts_a_candidate_at_the_exact_byte_limit(tmp_path: Path) -> N
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(candidate),
+        candidate_acceptance=_acceptance(ReturningAdapter(candidate)),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1023,12 +1110,12 @@ def test_review_rejects_a_candidate_immediately_beyond_the_byte_limit(tmp_path: 
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
     candidate = b'{"findings":[]}'
     candidate += b" " * (65_537 - len(candidate))
-    runner = ReturningRunner(candidate)
+    runner = ReturningAdapter(candidate)
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1057,7 +1144,9 @@ def test_grounding_rejects_a_traversal_location(tmp_path: Path) -> None:
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(AgentReview(findings=(finding,))),
+        candidate_acceptance=_acceptance(
+            ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1093,7 +1182,9 @@ def test_grounding_accepts_head_files_and_deleted_changed_paths(tmp_path: Path) 
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(AgentReview(findings=(finding,))),
+        candidate_acceptance=_acceptance(
+            ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1123,7 +1214,9 @@ def test_review_preserves_the_fake_runners_finding_order(tmp_path: Path) -> None
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(AgentReview(findings=(first, second))),
+        candidate_acceptance=_acceptance(
+            ReturningAdapter(AgentReview(findings=(first, second)).model_dump_json().encode())
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1170,7 +1263,9 @@ def test_grounding_rejects_ungrounded_locations(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(AgentReview(findings=(finding,))),
+        candidate_acceptance=_acceptance(
+            ReturningAdapter(AgentReview(findings=(finding,)).model_dump_json().encode())
+        ),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1190,12 +1285,12 @@ def test_grounding_rejects_ungrounded_locations(
 
 def test_runner_timeout_is_normalized_and_cleans_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = RaisingRunner(TimeoutError())
+    runner = RaisingAdapter(TimeoutError())
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1228,12 +1323,12 @@ def test_runner_terminal_errors_propagate_after_cleanup(
     error: BaseException,
 ) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = RaisingRunner(error)
+    runner = RaisingAdapter(error)
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1254,12 +1349,12 @@ def test_runner_terminal_errors_propagate_after_cleanup(
 
 def test_each_review_uses_a_unique_workspace(tmp_path: Path) -> None:
     source, _, base_sha, head_sha = _diverged_repository(tmp_path)
-    runner = HistoryRunner()
+    runner = HistoryAdapter()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     request = ReviewRequest(
         repository="octo-org/example",
@@ -1317,14 +1412,16 @@ def test_typed_models_enforce_identity_and_result_bounds() -> None:
         finding.title = "Mutated"  # type: ignore[misc]
 
 
-def test_location_line_and_description_can_be_omitted() -> None:
-    location = Location.model_validate({"path": "feature.txt"})
+def test_location_nullable_fields_must_be_explicitly_present() -> None:
+    with pytest.raises(ValidationError):
+        Location.model_validate({"path": "feature.txt"})
+
+    location = Location.model_validate({"path": "feature.txt", "line": None, "description": None})
 
     assert location.line is None
     assert location.description is None
     required_fields = set(Location.model_json_schema()["required"])
-    assert "line" not in required_fields
-    assert "description" not in required_fields
+    assert {"path", "line", "description"} == required_fields
 
 
 def test_finding_models_enforce_all_declared_string_and_collection_bounds() -> None:
@@ -1411,8 +1508,7 @@ def test_every_maximum_sized_review_renders_below_githubs_comment_limit(fill: st
         severity="important",
         title=fill * 160,
         locations=tuple(
-            Location(path=fill * 512, line=None, description=fill * 240)
-            for _ in range(3)
+            Location(path=fill * 512, line=None, description=fill * 240) for _ in range(3)
         ),
         evidence=fill * 1_200,
         impact=fill * 600,
@@ -1460,17 +1556,25 @@ def test_a_failed_review_produces_no_publishable_comment(tmp_path: Path) -> None
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=ReturningRunner(
-            AgentReview(
-                findings=(
-                    _finding().model_copy(
-                        update={
-                            "locations": (
-                                Location(path="not-real.txt", line=None, description=None),
-                            )
-                        },
-                    ),
+        candidate_acceptance=_acceptance(
+            ReturningAdapter(
+                AgentReview(
+                    findings=(
+                        _finding().model_copy(
+                            update={
+                                "locations": (
+                                    Location(
+                                        path="not-real.txt",
+                                        line=None,
+                                        description=None,
+                                    ),
+                                )
+                            },
+                        ),
+                    )
                 )
+                .model_dump_json()
+                .encode()
             )
         ),
     )

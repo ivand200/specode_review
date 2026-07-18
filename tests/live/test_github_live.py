@@ -15,23 +15,29 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent import (
-    AgentReview,
+    CandidateAcceptance,
     GitHubRepository,
     ReviewContext,
     Reviewer,
 )
+from review_agent.core import CandidateContract
 from review_agent.github import GitHubAppClient
 from review_agent.publishing import ReviewPublisher
 from review_agent.web import create_app
 
 
-class CleanRunner:
+class CleanAdapter:
     def __init__(self) -> None:
         self.context: ReviewContext | None = None
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.context = context
-        return AgentReview(findings=())
+        return b'{"findings":[]}'
 
 
 class RecordingPublisher:
@@ -153,11 +159,11 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
-    runner = CleanRunner()
+    runner = CleanAdapter()
     reviewer = Reviewer(
         repository=repository,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
         source_repository=GitHubRepository(credentials=github),
     )
     publisher = RecordingPublisher(github, resources_path=resources_path)

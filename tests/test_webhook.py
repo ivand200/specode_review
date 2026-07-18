@@ -19,7 +19,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent import (
-    AgentReview,
+    CandidateAcceptance,
     DiffRange,
     FailureCategory,
     ReviewContext,
@@ -28,6 +28,7 @@ from review_agent import (
     ReviewRequest,
     ReviewResult,
 )
+from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, CandidateContract
 from review_agent.web import create_app
 
 
@@ -59,18 +60,30 @@ def _repository(root: Path) -> tuple[Path, str, str]:
     return repository, base_sha, head_sha
 
 
-class BlockingRunner:
+def _acceptance(adapter: object) -> CandidateAcceptance:
+    return CandidateAcceptance(
+        adapter=adapter,  # type: ignore[arg-type]
+        max_bytes=CANDIDATE_OUTPUT_MAX_BYTES,
+    )
+
+
+class BlockingAdapter:
     def __init__(self) -> None:
         self.started = threading.Event()
         self.release = threading.Event()
         self.context: ReviewContext | None = None
 
-    def run(self, context: ReviewContext) -> AgentReview:
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del contract
         self.context = context
         self.started.set()
         if not self.release.wait(timeout=5):
             raise TimeoutError
-        return AgentReview(findings=())
+        return b'{"findings":[]}'
 
 
 class CapturingPublisher:
@@ -139,15 +152,19 @@ class FirstPublicationFails:
         self.second_published.set()
 
 
-class FirstRunnerExceedsDeadline:
+class FirstAdapterExceedsDeadline:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.calls = 0
         self.active = 0
         self.maximum_active = 0
 
-    def run(self, context: ReviewContext) -> AgentReview:
-        del context
+    def produce(
+        self,
+        context: ReviewContext,
+        contract: CandidateContract,
+    ) -> bytes:
+        del context, contract
         with self._lock:
             self.calls += 1
             call_number = self.calls
@@ -156,7 +173,7 @@ class FirstRunnerExceedsDeadline:
         try:
             if call_number == 1:
                 time.sleep(1.1)
-            return AgentReview(findings=())
+            return b'{"findings":[]}'
         finally:
             with self._lock:
                 self.active -= 1
@@ -331,13 +348,13 @@ def test_signed_opened_pull_request_is_accepted_before_review_and_published(
     tmp_path: Path,
 ) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -394,13 +411,13 @@ def test_signed_opened_pull_request_is_accepted_before_review_and_published(
 
 def test_invalid_signature_is_rejected_before_payload_parsing(tmp_path: Path) -> None:
     source, _, _ = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -424,13 +441,13 @@ def test_invalid_signature_is_rejected_before_payload_parsing(tmp_path: Path) ->
 
 def test_signed_non_pull_request_event_is_a_successful_no_op(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -471,13 +488,13 @@ def test_signed_non_pull_request_event_is_a_successful_no_op(tmp_path: Path) -> 
 
 def test_signed_ineligible_pull_requests_are_successful_no_ops(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -521,13 +538,13 @@ def test_signed_ineligible_pull_requests_are_successful_no_ops(tmp_path: Path) -
 
 def test_malformed_eligible_payload_returns_a_generic_client_error(tmp_path: Path) -> None:
     source, _, _ = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -561,13 +578,13 @@ def test_malformed_eligible_payload_returns_a_generic_client_error(tmp_path: Pat
 
 def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -609,13 +626,13 @@ def test_full_review_queue_returns_service_unavailable(tmp_path: Path) -> None:
 
 def test_eligible_webhook_visibly_bounds_the_pull_request_description(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -698,13 +715,13 @@ def test_review_size_failure_is_logged_and_publishes_no_comment(
 
 def test_duplicate_deliveries_can_create_duplicate_comments(tmp_path: Path) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = BlockingRunner()
+    runner = BlockingAdapter()
     publisher = CapturingPublisher()
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=tmp_path / "workspaces",
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     app = create_app(
         repository="octo-org/example",
@@ -796,13 +813,13 @@ def test_expired_review_deadline_skips_publication_and_allows_later_work(
     tmp_path: Path,
 ) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
-    runner = FirstRunnerExceedsDeadline()
+    runner = FirstAdapterExceedsDeadline()
     workspace_root = tmp_path / "workspaces"
     reviewer = Reviewer(
         repository="octo-org/example",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=runner,
+        candidate_acceptance=_acceptance(runner),
     )
     publisher = CapturingPublisher()
     caplog.set_level(logging.WARNING, logger="review_agent.web")

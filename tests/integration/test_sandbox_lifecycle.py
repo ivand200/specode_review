@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from review_agent import (
+    CandidateAcceptance,
     FailureCategory,
     Reviewer,
     ReviewError,
@@ -16,7 +17,7 @@ from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.sandbox import (
     DockerSandboxClient,
     DockerSandboxConfig,
-    SandboxLifecycleRunner,
+    SandboxLifecycleAdapter,
 )
 
 pytestmark = [
@@ -113,7 +114,7 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
         "rm feature.txt; "
         "printf '{\"findings\":[]}'",
     )
-    runner = SandboxLifecycleRunner(
+    runner = SandboxLifecycleAdapter(
         client=client,
         sandbox_prefix=prefix,
         review_command=probe_command,
@@ -122,7 +123,7 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
         repository="octo-org/sandbox-fixture",
         source_repository=source,
         workspace_root=workspace_root,
-        runner=runner,
+        candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
     )
     request = _request(base_sha=base_sha, head_sha=head_sha, title="No-model lifecycle")
 
@@ -137,7 +138,7 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
         assert _git(source, "rev-parse", "HEAD") == head_sha
         assert list(workspace_root.iterdir()) == []
 
-        timeout_runner = SandboxLifecycleRunner(
+        timeout_runner = SandboxLifecycleAdapter(
             client=client,
             sandbox_prefix=prefix,
             review_command=("sleep", "30"),
@@ -146,7 +147,10 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
             repository="octo-org/sandbox-fixture",
             source_repository=source,
             workspace_root=workspace_root,
-            runner=timeout_runner,
+            candidate_acceptance=CandidateAcceptance(
+                adapter=timeout_runner,
+                max_bytes=65_536,
+            ),
         )
         with (
             review_deadline_scope(ReviewDeadline.after(1)),
@@ -172,7 +176,10 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
             repository="octo-org/sandbox-fixture",
             source_repository=source,
             workspace_root=workspace_root,
-            runner=SandboxLifecycleRunner(client=client, sandbox_prefix=prefix),
+            candidate_acceptance=CandidateAcceptance(
+                adapter=SandboxLifecycleAdapter(client=client, sandbox_prefix=prefix),
+                max_bytes=65_536,
+            ),
         )
 
         assert not orphan_workspace.exists()

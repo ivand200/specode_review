@@ -1,10 +1,10 @@
 from review_agent.core import (
+    CandidateAcceptance,
     ChangedPathManifest,
     GitHubRepository,
     ReviewContext,
     Reviewer,
     ReviewLimits,
-    ReviewRunner,
     SandboxResourceLimits,
 )
 from review_agent.errors import FailureCategory, ReviewError
@@ -25,6 +25,7 @@ from review_agent.publishing import (
 
 __all__ = [
     "AgentReview",
+    "CandidateAcceptance",
     "ChangedPathManifest",
     "DiffRange",
     "FailureCategory",
@@ -39,7 +40,6 @@ __all__ = [
     "ReviewPublisher",
     "ReviewRequest",
     "ReviewResult",
-    "ReviewRunner",
     "Reviewer",
     "SandboxResourceLimits",
     "publish_review_result",
