@@ -35,7 +35,7 @@ from review_agent.sandbox import (
     DockerSandboxClient,
 )
 from review_agent.web import create_app
-from review_agent.worker import SingleReviewWorker
+from tests.fixtures.inline_review_manager import InlineReviewManager
 
 
 class RecordingPublisher:
@@ -263,12 +263,12 @@ class VerifyingCodexSandboxClient:
 @contextmanager
 def _watch_review_failures() -> Iterator[ReviewFailureHandler]:
     failure_handler = ReviewFailureHandler()
-    worker_logger = logging.getLogger("review_agent.web")
-    worker_logger.addHandler(failure_handler)
+    attempt_logger = logging.getLogger("review_agent.web")
+    attempt_logger.addHandler(failure_handler)
     try:
         yield failure_handler
     finally:
-        worker_logger.removeHandler(failure_handler)
+        attempt_logger.removeHandler(failure_handler)
 
 
 def _required_environment(name: str) -> str:
@@ -334,7 +334,7 @@ def _wait_for_publication_or_failure(
     while not publisher.published.wait(timeout=0.1):
         if failure_handler.failed.is_set():
             pytest.fail(
-                f"checkpoint C worker failed: {failure_handler.message}; {diagnostics()}",
+                f"checkpoint C attempt failed: {failure_handler.message}; {diagnostics()}",
                 pytrace=False,
             )
         if time.monotonic() >= wait_deadline:
@@ -453,7 +453,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     app = create_app(
         repository=webhook.repository,
         webhook_secret=webhook.secret,
-        manager=SingleReviewWorker(
+        manager=InlineReviewManager(
             reviewer=reviewer,
             publisher=publisher,
             review_timeout_seconds=attempt.runtime.review_timeout_seconds,

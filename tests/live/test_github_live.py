@@ -26,7 +26,7 @@ from review_agent.github import GitHubAppClient
 from review_agent.publishing import ReviewPublisher
 from review_agent.resources import AttemptResources
 from review_agent.web import create_app
-from review_agent.worker import SingleReviewWorker
+from tests.fixtures.inline_review_manager import InlineReviewManager
 
 
 class CleanAdapter:
@@ -177,7 +177,7 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
     app = create_app(
         repository=repository,
         webhook_secret=webhook_secret,
-        manager=SingleReviewWorker(
+        manager=InlineReviewManager(
             reviewer=reviewer,
             publisher=publisher,
             review_timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS,
