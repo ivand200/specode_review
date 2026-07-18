@@ -444,6 +444,9 @@ class RecordingWorker:
     def submit(self, request: ReviewRequest) -> SubmissionOutcome:
         raise AssertionError(request)
 
+    async def start(self, request: ReviewRequest) -> SubmissionOutcome:
+        raise AssertionError(request)
+
 
 class LifecycleReviewer:
     def __init__(self, events: list[str]) -> None:
@@ -496,7 +499,7 @@ def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() ->
     app = create_app(
         repository="octo-org/example",
         webhook_secret="a" * 32,
-        worker=RecordingWorker(events),
+        manager=RecordingWorker(events),
         startup_check=reject_startup,
     )
 
@@ -519,7 +522,7 @@ def test_application_lifespan_releases_production_resources_on_shutdown() -> Non
     app = create_app(
         repository="octo-org/example",
         webhook_secret="a" * 32,
-        worker=RecordingWorker(events),
+        manager=RecordingWorker(events),
         startup_check=lambda: events.append("readiness"),
         shutdown_callback=lambda: events.append("closed"),
     )
@@ -544,7 +547,7 @@ def test_application_lifespan_finishes_active_publication_before_resource_cleanu
     app = create_app(
         repository="octo-org/example",
         webhook_secret="a" * 32,
-        worker=worker,
+        manager=worker,
         startup_check=lambda: events.append("readiness"),
         shutdown_callback=lambda: events.append("closed"),
     )

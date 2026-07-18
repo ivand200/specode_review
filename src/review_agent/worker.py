@@ -8,17 +8,12 @@ from typing import Protocol, Self
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import ReviewRequest, ReviewResult
+from review_agent.process_manager import SubmissionOutcome
 from review_agent.publishing import ReviewPublisher, publish_review_result
 
 logger = logging.getLogger(__name__)
 _WAITING_CAPACITY = 10
 _STOP = object()
-
-
-class SubmissionOutcome(Enum):
-    ACCEPTED = auto()
-    AT_CAPACITY = auto()
-    STOPPING = auto()
 
 
 class ReviewWorker(Protocol):
@@ -32,6 +27,8 @@ class ReviewWorker(Protocol):
     ) -> None: ...
 
     def submit(self, request: ReviewRequest) -> SubmissionOutcome: ...
+
+    async def start(self, request: ReviewRequest) -> SubmissionOutcome: ...
 
 
 class ReviewService(Protocol):
@@ -108,6 +105,9 @@ class SingleReviewWorker:
         except asyncio.QueueFull:
             return SubmissionOutcome.AT_CAPACITY
         return SubmissionOutcome.ACCEPTED
+
+    async def start(self, request: ReviewRequest) -> SubmissionOutcome:
+        return self.submit(request)
 
     async def _process(self) -> None:
         while True:

@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from review_agent.models import ReviewRequest, bound_description
-from review_agent.worker import ReviewWorker, SubmissionOutcome
+from review_agent.process_manager import ReviewExecutionManager, SubmissionOutcome
 
 
 def _review_request_from_payload(payload: object) -> ReviewRequest:
@@ -68,7 +68,7 @@ async def _accept_github_webhook(
     *,
     repository: str,
     webhook_secret: str,
-    worker: ReviewWorker,
+    manager: ReviewExecutionManager,
 ) -> JSONResponse:
     body = await request.body()
     expected = (
@@ -106,16 +106,21 @@ async def _accept_github_webhook(
             detail="malformed pull request webhook",
         ) from error
 
-    outcome = worker.submit(review_request)
+    outcome = await manager.start(review_request)
     if outcome is SubmissionOutcome.AT_CAPACITY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="review queue is full",
+            detail="review execution capacity is full",
         )
     if outcome is SubmissionOutcome.STOPPING:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="review service is shutting down",
+        )
+    if outcome is SubmissionOutcome.UNAVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="review execution is unavailable",
         )
     return JSONResponse({"status": "accepted"}, status_code=status.HTTP_202_ACCEPTED)
 
@@ -124,7 +129,7 @@ def create_app(
     *,
     repository: str,
     webhook_secret: str,
-    worker: ReviewWorker,
+    manager: ReviewExecutionManager,
     startup_check: Callable[[], None] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -134,7 +139,7 @@ def create_app(
         if startup_check is not None:
             startup_check()
         try:
-            async with worker:
+            async with manager:
                 yield
         finally:
             if shutdown_callback is not None:
@@ -148,7 +153,7 @@ def create_app(
             request,
             repository=repository,
             webhook_secret=webhook_secret,
-            worker=worker,
+            manager=manager,
         )
 
     return app

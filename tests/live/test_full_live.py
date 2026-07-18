@@ -453,7 +453,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     app = create_app(
         repository=webhook.repository,
         webhook_secret=webhook.secret,
-        worker=SingleReviewWorker(
+        manager=SingleReviewWorker(
             reviewer=reviewer,
             publisher=publisher,
             review_timeout_seconds=attempt.runtime.review_timeout_seconds,

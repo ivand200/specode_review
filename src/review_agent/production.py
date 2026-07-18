@@ -77,7 +77,7 @@ def create_production_app(
     return create_app(
         repository=webhook.repository,
         webhook_secret=webhook.secret,
-        worker=SingleReviewWorker(
+        manager=SingleReviewWorker(
             reviewer=reviewer,
             publisher=github,
             review_timeout_seconds=runtime.review_timeout_seconds,

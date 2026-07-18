@@ -12,11 +12,11 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from review_agent.models import ReviewRequest
+from review_agent.process_manager import SubmissionOutcome
 from review_agent.web import create_app
-from review_agent.worker import SubmissionOutcome
 
 
-class ScriptedWorker:
+class ScriptedManager:
     def __init__(
         self,
         outcomes: tuple[SubmissionOutcome, ...] = (SubmissionOutcome.ACCEPTED,),
@@ -35,16 +35,16 @@ class ScriptedWorker:
     ) -> None:
         del exc_type, exc_value, traceback
 
-    def submit(self, request: ReviewRequest) -> SubmissionOutcome:
+    async def start(self, request: ReviewRequest) -> SubmissionOutcome:
         self.submissions.append(request)
         return next(self._outcomes)
 
 
-def _worker_app(worker: ScriptedWorker) -> FastAPI:
+def _manager_app(manager: ScriptedManager) -> FastAPI:
     return create_app(
         repository="octo-org/example",
         webhook_secret="correct horse battery staple",
-        worker=worker,
+        manager=manager,
     )
 
 
@@ -66,13 +66,13 @@ def webhook_payload() -> dict[str, object]:
 
 
 @pytest.fixture
-def scripted_worker() -> ScriptedWorker:
-    return ScriptedWorker()
+def scripted_manager() -> ScriptedManager:
+    return ScriptedManager()
 
 
 @pytest.fixture
-def webhook_client(scripted_worker: ScriptedWorker) -> Iterator[TestClient]:
-    with TestClient(_worker_app(scripted_worker)) as client:
+def webhook_client(scripted_manager: ScriptedManager) -> Iterator[TestClient]:
+    with TestClient(_manager_app(scripted_manager)) as client:
         yield client
 
 
@@ -117,7 +117,7 @@ def _post_signed_webhook(
 def test_signed_opened_pull_request_is_accepted_and_derives_trusted_review_request(
     webhook_client: TestClient,
     webhook_payload: dict[str, object],
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     response = _post_signed_webhook(
         webhook_client,
@@ -127,7 +127,7 @@ def test_signed_opened_pull_request_is_accepted_and_derives_trusted_review_reque
 
     assert response.status_code == 202
     assert response.text == '{"status":"accepted"}'
-    assert scripted_worker.submissions == [
+    assert scripted_manager.submissions == [
         ReviewRequest(
             repository="octo-org/example",
             pr_number=17,
@@ -142,7 +142,7 @@ def test_signed_opened_pull_request_is_accepted_and_derives_trusted_review_reque
 
 def test_invalid_signature_is_rejected_before_payload_parsing(
     webhook_client: TestClient,
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     response = _post_raw_webhook(
         webhook_client,
@@ -152,13 +152,13 @@ def test_invalid_signature_is_rejected_before_payload_parsing(
 
     assert response.status_code == 401
     assert response.text == '{"detail":"invalid webhook signature"}'
-    assert scripted_worker.submissions == []
+    assert scripted_manager.submissions == []
 
 
 def test_signed_non_pull_request_event_is_a_successful_no_op(
     webhook_client: TestClient,
     webhook_payload: dict[str, object],
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     response = _post_signed_webhook(
         webhook_client,
@@ -169,13 +169,13 @@ def test_signed_non_pull_request_event_is_a_successful_no_op(
 
     assert response.status_code == 200
     assert response.text == '{"status":"ignored"}'
-    assert scripted_worker.submissions == []
+    assert scripted_manager.submissions == []
 
 
 def test_signed_ineligible_pull_requests_are_successful_no_ops(
     webhook_client: TestClient,
     webhook_payload: dict[str, object],
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     closed = deepcopy(webhook_payload)
     closed["action"] = "closed"
@@ -196,12 +196,12 @@ def test_signed_ineligible_pull_requests_are_successful_no_ops(
     assert [(response.status_code, response.text) for response in responses] == [
         (200, '{"status":"ignored"}')
     ] * 3
-    assert scripted_worker.submissions == []
+    assert scripted_manager.submissions == []
 
 
 def test_malformed_eligible_payload_returns_a_generic_client_error(
     webhook_client: TestClient,
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     incomplete_payload = json.dumps(
         {
@@ -224,13 +224,13 @@ def test_malformed_eligible_payload_returns_a_generic_client_error(
     assert [(response.status_code, response.text) for response in responses] == [
         (400, '{"detail":"malformed pull request webhook"}')
     ] * 2
-    assert scripted_worker.submissions == []
+    assert scripted_manager.submissions == []
 
 
 def test_eligible_webhook_visibly_bounds_the_pull_request_description(
     webhook_client: TestClient,
     webhook_payload: dict[str, object],
-    scripted_worker: ScriptedWorker,
+    scripted_manager: ScriptedManager,
 ) -> None:
     webhook_payload["pull_request"]["body"] = "x" * 10_001  # type: ignore[index]
 
@@ -242,8 +242,8 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(
 
     assert response.status_code == 202
     assert response.text == '{"status":"accepted"}'
-    assert len(scripted_worker.submissions) == 1
-    description = scripted_worker.submissions[0].description
+    assert len(scripted_manager.submissions) == 1
+    description = scripted_manager.submissions[0].description
     assert len(description) == 10_000
     assert description.endswith("\n\n[truncated]")
 
@@ -260,7 +260,7 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(
         pytest.param(
             SubmissionOutcome.AT_CAPACITY,
             503,
-            '{"detail":"review queue is full"}',
+            '{"detail":"review execution capacity is full"}',
             id="at-capacity",
         ),
         pytest.param(
@@ -268,6 +268,12 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(
             503,
             '{"detail":"review service is shutting down"}',
             id="stopping",
+        ),
+        pytest.param(
+            SubmissionOutcome.UNAVAILABLE,
+            503,
+            '{"detail":"review execution is unavailable"}',
+            id="unavailable",
         ),
     ],
 )
@@ -277,9 +283,9 @@ def test_submission_outcome_maps_to_exact_webhook_response_once(
     expected_status: int,
     expected_body: str,
 ) -> None:
-    worker = ScriptedWorker((outcome,))
+    manager = ScriptedManager((outcome,))
 
-    with TestClient(_worker_app(worker)) as client:
+    with TestClient(_manager_app(manager)) as client:
         response = _post_signed_webhook(
             client,
             webhook_payload,
@@ -288,4 +294,4 @@ def test_submission_outcome_maps_to_exact_webhook_response_once(
 
     assert response.status_code == expected_status
     assert response.text == expected_body
-    assert len(worker.submissions) == 1
+    assert len(manager.submissions) == 1

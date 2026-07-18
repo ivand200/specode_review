@@ -177,7 +177,7 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
     app = create_app(
         repository=repository,
         webhook_secret=webhook_secret,
-        worker=SingleReviewWorker(
+        manager=SingleReviewWorker(
             reviewer=reviewer,
             publisher=publisher,
             review_timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS,
