@@ -2,13 +2,18 @@ import asyncio
 import logging
 import subprocess
 import threading
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import TracebackType
 from typing import Self
 
 import pytest
 
-from review_agent.configuration import ConfigurationError, ProductionSettings
+from review_agent.configuration import (
+    ConfigurationError,
+    ProductionSettings,
+    ReasoningEffort,
+)
 from review_agent.models import DiffRange, ReviewRequest, ReviewResult
 from review_agent.production import create_production_app
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
@@ -54,16 +59,103 @@ def test_production_settings_accept_the_complete_bounded_configuration(
     assert settings.app_id == 1234
     assert settings.private_key_path == tmp_path / "github-app.pem"
     assert settings.webhook_secret == "a" * 32
-    assert settings.codex_model == "gpt-5.4"
-    assert settings.openai_reasoning_effort == "high"
-    assert settings.review_timeout_seconds == 900
-    assert settings.sandbox_resources.cpus == 2
-    assert settings.sandbox_resources.memory_mib == 4096
-    assert settings.sandbox_resources.pids == 256
-    assert settings.process_output_max_bytes == 1_048_576
-    assert settings.candidate_output_max_bytes == 65_536
-    assert settings.sandbox_cleanup_timeout_seconds == 30
-    assert settings.sandbox_name_prefix == "review-agent-"
+    assert settings.runtime.codex_execution.model == "gpt-5.4"
+    assert settings.runtime.codex_execution.reasoning_effort is ReasoningEffort.HIGH
+    assert settings.runtime.review_timeout_seconds == 900
+    assert settings.runtime.review_limits.sandbox_resources.cpus == 2
+    assert settings.runtime.review_limits.sandbox_resources.memory_mib == 4096
+    assert settings.runtime.review_limits.sandbox_resources.pids == 256
+    assert settings.runtime.review_limits.process_output_max_bytes == 1_048_576
+    assert settings.runtime.sandbox_operation.process_output_max_bytes == 1_048_576
+    assert settings.runtime.candidate_output_max_bytes == 65_536
+    assert settings.runtime.sandbox_operation.cleanup_timeout_seconds == 30
+    assert settings.runtime.sandbox_operation.deny_network is True
+    assert settings.runtime.sandbox_name_prefix == "review-agent-"
+
+
+def test_production_settings_preserve_every_runtime_default(tmp_path: Path) -> None:
+    environment = _valid_environment(tmp_path)
+    for name in (
+        "REVIEW_TIMEOUT_SECONDS",
+        "SANDBOX_CPUS",
+        "SANDBOX_MEMORY_MIB",
+        "SANDBOX_PIDS",
+        "PROCESS_OUTPUT_MAX_BYTES",
+        "CANDIDATE_OUTPUT_MAX_BYTES",
+        "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
+        "SANDBOX_NAME_PREFIX",
+    ):
+        environment.pop(name)
+
+    runtime = ProductionSettings.from_environment(environment).runtime
+
+    assert runtime.review_timeout_seconds == 900
+    assert runtime.review_limits.sandbox_resources.cpus == 2
+    assert runtime.review_limits.sandbox_resources.memory_mib == 4_096
+    assert runtime.review_limits.sandbox_resources.pids == 256
+    assert runtime.review_limits.process_output_max_bytes == 1_048_576
+    assert runtime.sandbox_operation.process_output_max_bytes == 1_048_576
+    assert runtime.candidate_output_max_bytes == 65_536
+    assert runtime.sandbox_operation.cleanup_timeout_seconds == 30
+    assert runtime.sandbox_operation.deny_network is True
+    assert runtime.sandbox_name_prefix == "review-agent-"
+
+
+def test_production_settings_expose_only_one_immutable_runtime_policy(tmp_path: Path) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+
+    for old_name in (
+        "codex_model",
+        "openai_reasoning_effort",
+        "review_timeout_seconds",
+        "sandbox_resources",
+        "process_output_max_bytes",
+        "candidate_output_max_bytes",
+        "sandbox_cleanup_timeout_seconds",
+        "sandbox_name_prefix",
+    ):
+        assert not hasattr(settings, old_name)
+
+    with pytest.raises(FrozenInstanceError):
+        settings.runtime.review_timeout_seconds = 1
+
+
+@pytest.mark.parametrize(
+    "configured",
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+)
+def test_production_settings_parse_each_supported_reasoning_effort(
+    tmp_path: Path,
+    configured: str,
+) -> None:
+    environment = _valid_environment(tmp_path)
+    environment["OPENAI_REASONING_EFFORT"] = configured
+
+    reasoning_effort = ProductionSettings.from_environment(
+        environment
+    ).runtime.codex_execution.reasoning_effort
+
+    assert isinstance(reasoning_effort, ReasoningEffort)
+    assert reasoning_effort.value == configured
+
+
+def test_production_settings_keep_future_codex_model_names_configurable(
+    tmp_path: Path,
+) -> None:
+    environment = _valid_environment(tmp_path)
+    environment["CODEX_MODEL"] = "future-model-2030"
+
+    settings = ProductionSettings.from_environment(environment)
+
+    assert settings.runtime.codex_execution.model == "future-model-2030"
+
+
+def test_production_settings_exclude_the_webhook_secret_from_representations(
+    tmp_path: Path,
+) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+
+    assert settings.webhook_secret not in repr(settings)
 
 
 @pytest.mark.parametrize(
@@ -73,6 +165,9 @@ def test_production_settings_accept_the_complete_bounded_configuration(
         ("GITHUB_APP_ID", "0"),
         ("GITHUB_WEBHOOK_SECRET", "short"),
         ("CODEX_MODEL", ""),
+        ("CODEX_MODEL", " future-model"),
+        ("CODEX_MODEL", "future-model "),
+        ("CODEX_MODEL", "x" * 129),
         ("OPENAI_REASONING_EFFORT", "extreme"),
         ("REVIEW_TIMEOUT_SECONDS", "0"),
         ("SANDBOX_CPUS", "0"),
@@ -161,14 +256,15 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     readiness.check(settings)
 
     assert settings.workspace_root.is_dir()
+    process_output_max_bytes = settings.runtime.sandbox_operation.process_output_max_bytes
     assert runner.calls == [
-        ((sbx, "version"), settings.process_output_max_bytes),
-        ((codex, "--version"), settings.process_output_max_bytes),
-        ((git, "--version"), settings.process_output_max_bytes),
-        ((sbx, "diagnose"), settings.process_output_max_bytes),
+        ((sbx, "version"), process_output_max_bytes),
+        ((codex, "--version"), process_output_max_bytes),
+        ((git, "--version"), process_output_max_bytes),
+        ((sbx, "diagnose"), process_output_max_bytes),
         (
             (sbx, "kit", "validate", str(settings.review_kit_path)),
-            settings.process_output_max_bytes,
+            process_output_max_bytes,
         ),
     ]
 
@@ -235,8 +331,8 @@ def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
         readiness.check(settings)
 
     assert failure.value.stage == "review_kit_validation"
-    observable = str(failure.value) + "\n" + "\n".join(
-        record.getMessage() for record in caplog.records
+    observable = (
+        str(failure.value) + "\n" + "\n".join(record.getMessage() for record in caplog.records)
     )
     assert "raw-secret" not in observable
     assert "untrusted prompt contents" not in observable

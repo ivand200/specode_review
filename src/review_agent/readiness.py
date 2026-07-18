@@ -66,6 +66,7 @@ class ProductionReadiness:
 
     def check(self, settings: ProductionSettings) -> None:
         self._verify_paths(settings)
+        process_output_max_bytes = settings.runtime.sandbox_operation.process_output_max_bytes
         sbx = self._executable("sbx")
         codex = self._executable("codex")
         git = self._executable("git")
@@ -74,29 +75,29 @@ class ProductionReadiness:
             stage="sbx_version",
             expected=PINNED_SBX_VERSION,
             pattern=rb"\bsbx version: v([0-9]+\.[0-9]+\.[0-9]+)\b",
-            output_max_bytes=settings.process_output_max_bytes,
+            output_max_bytes=process_output_max_bytes,
         )
         self._verify_version(
             (codex, "--version"),
             stage="codex_version",
             expected=PINNED_CODEX_VERSION,
             pattern=rb"\bcodex-cli ([0-9]+\.[0-9]+\.[0-9]+)\b",
-            output_max_bytes=settings.process_output_max_bytes,
+            output_max_bytes=process_output_max_bytes,
         )
         self._command(
             (git, "--version"),
             stage="git_capability",
-            output_max_bytes=settings.process_output_max_bytes,
+            output_max_bytes=process_output_max_bytes,
         )
         self._command(
             (sbx, "diagnose"),
             stage="sandbox_host_capability",
-            output_max_bytes=settings.process_output_max_bytes,
+            output_max_bytes=process_output_max_bytes,
         )
         self._command(
             (sbx, "kit", "validate", str(settings.review_kit_path)),
             stage="review_kit_validation",
-            output_max_bytes=settings.process_output_max_bytes,
+            output_max_bytes=process_output_max_bytes,
         )
 
     @staticmethod

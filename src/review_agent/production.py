@@ -7,14 +7,12 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
-from review_agent.core import CandidateAcceptance, GitHubRepository, Reviewer, ReviewLimits
+from review_agent.core import CandidateAcceptance, GitHubRepository, Reviewer
 from review_agent.github import GitHubAppClient
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
-    CodexExecutionConfig,
     CodexSandboxAdapter,
     DockerSandboxClient,
-    DockerSandboxConfig,
 )
 from review_agent.web import create_app
 from review_agent.worker import SingleReviewWorker
@@ -35,24 +33,19 @@ def create_production_app(
     )
     (readiness or ProductionReadiness()).check(resolved_settings)
 
+    runtime = resolved_settings.runtime
     sandbox_client = DockerSandboxClient(
-        config=DockerSandboxConfig(
-            process_output_max_bytes=resolved_settings.process_output_max_bytes,
-            cleanup_timeout_seconds=resolved_settings.sandbox_cleanup_timeout_seconds,
-        )
+        config=runtime.sandbox_operation,
     )
     adapter = CodexSandboxAdapter(
         client=sandbox_client,
-        sandbox_prefix=resolved_settings.sandbox_name_prefix,
+        sandbox_prefix=runtime.sandbox_name_prefix,
         kit=resolved_settings.review_kit_path,
-        config=CodexExecutionConfig(
-            model=resolved_settings.codex_model,
-            reasoning_effort=resolved_settings.openai_reasoning_effort,
-        ),
+        config=runtime.codex_execution,
     )
     candidate_acceptance = CandidateAcceptance(
         adapter=adapter,
-        max_bytes=resolved_settings.candidate_output_max_bytes,
+        max_bytes=runtime.candidate_output_max_bytes,
     )
     github = GitHubAppClient(
         repository=resolved_settings.repository,
@@ -65,10 +58,7 @@ def create_production_app(
             workspace_root=resolved_settings.workspace_root,
             candidate_acceptance=candidate_acceptance,
             source_repository=GitHubRepository(credentials=github),
-            limits=ReviewLimits(
-                process_output_max_bytes=resolved_settings.process_output_max_bytes,
-                sandbox_resources=resolved_settings.sandbox_resources,
-            ),
+            limits=runtime.review_limits,
         )
     except BaseException:
         github.close()
@@ -79,7 +69,7 @@ def create_production_app(
         worker=SingleReviewWorker(
             reviewer=reviewer,
             publisher=github,
-            review_timeout_seconds=resolved_settings.review_timeout_seconds,
+            review_timeout_seconds=runtime.review_timeout_seconds,
         ),
         shutdown_callback=github.close,
     )

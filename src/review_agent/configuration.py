@@ -1,18 +1,15 @@
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn
-
-from review_agent.core import (
-    CANDIDATE_OUTPUT_MAX_BYTES,
-    PROCESS_OUTPUT_MAX_BYTES,
-    SandboxResourceLimits,
-)
 
 DEFAULT_SANDBOX_NAME_PREFIX = "review-agent-"
 DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 15 * 60
+CANDIDATE_OUTPUT_MAX_BYTES = 65_536
+PROCESS_OUTPUT_MAX_BYTES = 1_048_576
 PINNED_SBX_VERSION = "0.35.0"
 PINNED_CODEX_VERSION = "0.144.5"
 
@@ -21,9 +18,97 @@ _SANDBOX_PREFIX = re.compile(r"^[a-z0-9][a-z0-9.-]{1,29}-$")
 _WEBHOOK_SECRET_MIN_CHARS = 32
 _WEBHOOK_SECRET_MAX_CHARS = 1_024
 _CODEX_MODEL_MAX_CHARS = 128
-_OPENAI_REASONING_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxResourceLimits:
+    cpus: int = 2
+    memory_mib: int = 4_096
+    pids: int = 256
+
+    def __post_init__(self) -> None:
+        if self.cpus <= 0 or self.memory_mib <= 0 or self.pids <= 0:
+            message = "sandbox resource limits must be positive"
+            raise ValueError(message)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewLimits:
+    process_output_max_bytes: int = PROCESS_OUTPUT_MAX_BYTES
+    sandbox_resources: SandboxResourceLimits = field(default_factory=SandboxResourceLimits)
+
+    def __post_init__(self) -> None:
+        if self.process_output_max_bytes <= 0:
+            message = "process output limit must be positive"
+            raise ValueError(message)
+
+
+class ReasoningEffort(StrEnum):
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+    ULTRA = "ultra"
+
+
+@dataclass(frozen=True, slots=True)
+class CodexExecutionPolicy:
+    model: str
+    reasoning_effort: ReasoningEffort
+
+    def __post_init__(self) -> None:
+        if (
+            not self.model
+            or len(self.model) > _CODEX_MODEL_MAX_CHARS
+            or self.model.strip() != self.model
+        ):
+            message = "Codex model must be a non-empty bounded value"
+            raise ValueError(message)
+        if not isinstance(self.reasoning_effort, ReasoningEffort):
+            message = "Codex reasoning effort must be a ReasoningEffort"
+            raise TypeError(message)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxOperationPolicy:
+    process_output_max_bytes: int = PROCESS_OUTPUT_MAX_BYTES
+    cleanup_timeout_seconds: float = DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS
+    deny_network: bool = True
+
+    def __post_init__(self) -> None:
+        if self.process_output_max_bytes <= 0 or self.cleanup_timeout_seconds <= 0:
+            message = "sandbox process limits must be positive"
+            raise ValueError(message)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimePolicy:
+    codex_execution: CodexExecutionPolicy
+    sandbox_operation: SandboxOperationPolicy
+    review_limits: ReviewLimits
+    candidate_output_max_bytes: int
+    review_timeout_seconds: float
+    sandbox_name_prefix: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.sandbox_operation.process_output_max_bytes
+            != self.review_limits.process_output_max_bytes
+        ):
+            message = "runtime process output limits must agree"
+            raise ValueError(message)
+        if not self.sandbox_operation.deny_network:
+            message = "production sandbox network access must be denied"
+            raise ValueError(message)
+        if self.candidate_output_max_bytes <= 0 or self.review_timeout_seconds <= 0:
+            message = "runtime limits must be positive"
+            raise ValueError(message)
+        if _SANDBOX_PREFIX.fullmatch(self.sandbox_name_prefix) is None:
+            message = "sandbox name prefix is invalid"
+            raise ValueError(message)
 
 
 class ConfigurationError(ValueError):
@@ -106,16 +191,9 @@ class ProductionSettings:
     app_id: int
     private_key_path: Path
     webhook_secret: str = field(repr=False)
-    codex_model: str
-    openai_reasoning_effort: str
     review_kit_path: Path
     workspace_root: Path
-    review_timeout_seconds: float
-    sandbox_resources: SandboxResourceLimits
-    process_output_max_bytes: int
-    candidate_output_max_bytes: int
-    sandbox_cleanup_timeout_seconds: float
-    sandbox_name_prefix: str
+    runtime: RuntimePolicy
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "ProductionSettings":
@@ -131,8 +209,9 @@ class ProductionSettings:
         if len(codex_model) > _CODEX_MODEL_MAX_CHARS or codex_model.strip() != codex_model:
             _invalid("CODEX_MODEL")
 
-        openai_reasoning_effort = _required(environment, "OPENAI_REASONING_EFFORT")
-        if openai_reasoning_effort not in _OPENAI_REASONING_EFFORTS:
+        try:
+            reasoning_effort = ReasoningEffort(_required(environment, "OPENAI_REASONING_EFFORT"))
+        except ValueError:
             _invalid("OPENAI_REASONING_EFFORT")
 
         workspace_root = _absolute_path(environment, "WORKSPACE_ROOT")
@@ -146,39 +225,54 @@ class ProductionSettings:
         if _SANDBOX_PREFIX.fullmatch(sandbox_name_prefix) is None:
             _invalid("SANDBOX_NAME_PREFIX")
 
+        review_timeout_seconds = _positive_float(
+            environment,
+            "REVIEW_TIMEOUT_SECONDS",
+            default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
+        )
+        sandbox_resources = SandboxResourceLimits(
+            cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
+            memory_mib=_positive_int(environment, "SANDBOX_MEMORY_MIB", default=4_096),
+            pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
+        )
+        process_output_max_bytes = _positive_int(
+            environment,
+            "PROCESS_OUTPUT_MAX_BYTES",
+            default=PROCESS_OUTPUT_MAX_BYTES,
+        )
+        candidate_output_max_bytes = _positive_int(
+            environment,
+            "CANDIDATE_OUTPUT_MAX_BYTES",
+            default=CANDIDATE_OUTPUT_MAX_BYTES,
+        )
+        sandbox_cleanup_timeout_seconds = _positive_float(
+            environment,
+            "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
+            default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
+        )
+
         return cls(
             repository=repository,
             app_id=_positive_int(environment, "GITHUB_APP_ID"),
             private_key_path=_existing_file(environment, "GITHUB_PRIVATE_KEY_PATH"),
             webhook_secret=webhook_secret,
-            codex_model=codex_model,
-            openai_reasoning_effort=openai_reasoning_effort,
             review_kit_path=_existing_directory(environment, "REVIEW_KIT_PATH"),
             workspace_root=workspace_root,
-            review_timeout_seconds=_positive_float(
-                environment,
-                "REVIEW_TIMEOUT_SECONDS",
-                default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
+            runtime=RuntimePolicy(
+                codex_execution=CodexExecutionPolicy(
+                    model=codex_model,
+                    reasoning_effort=reasoning_effort,
+                ),
+                sandbox_operation=SandboxOperationPolicy(
+                    process_output_max_bytes=process_output_max_bytes,
+                    cleanup_timeout_seconds=sandbox_cleanup_timeout_seconds,
+                ),
+                review_limits=ReviewLimits(
+                    process_output_max_bytes=process_output_max_bytes,
+                    sandbox_resources=sandbox_resources,
+                ),
+                candidate_output_max_bytes=candidate_output_max_bytes,
+                review_timeout_seconds=review_timeout_seconds,
+                sandbox_name_prefix=sandbox_name_prefix,
             ),
-            sandbox_resources=SandboxResourceLimits(
-                cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
-                memory_mib=_positive_int(environment, "SANDBOX_MEMORY_MIB", default=4_096),
-                pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
-            ),
-            process_output_max_bytes=_positive_int(
-                environment,
-                "PROCESS_OUTPUT_MAX_BYTES",
-                default=PROCESS_OUTPUT_MAX_BYTES,
-            ),
-            candidate_output_max_bytes=_positive_int(
-                environment,
-                "CANDIDATE_OUTPUT_MAX_BYTES",
-                default=CANDIDATE_OUTPUT_MAX_BYTES,
-            ),
-            sandbox_cleanup_timeout_seconds=_positive_float(
-                environment,
-                "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
-                default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
-            ),
-            sandbox_name_prefix=sandbox_name_prefix,
         )

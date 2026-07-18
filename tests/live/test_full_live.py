@@ -23,7 +23,6 @@ from review_agent.core import (
     GitHubRepository,
     ReviewContext,
     Reviewer,
-    ReviewLimits,
     SandboxResourceLimits,
 )
 from review_agent.github import GitHubAppClient
@@ -31,10 +30,8 @@ from review_agent.process import ProcessOptions, _run_bounded_process
 from review_agent.publishing import ReviewPublisher
 from review_agent.readiness import ProductionReadiness
 from review_agent.sandbox import (
-    CodexExecutionConfig,
     CodexSandboxAdapter,
     DockerSandboxClient,
-    DockerSandboxConfig,
 )
 from review_agent.web import create_app
 from review_agent.worker import SingleReviewWorker
@@ -356,10 +353,13 @@ def _assert_checkpoint_isolation(
     assert sandbox_client.forbidden_network_denied
     assert process_runner.created_with_kit(settings.review_kit_path)
     assert process_runner.codex_ignored_repository_configuration()
-    assert process_runner.codex_used_reasoning_effort(settings.openai_reasoning_effort)
+    assert process_runner.codex_used_reasoning_effort(
+        settings.runtime.codex_execution.reasoning_effort.value
+    )
     assert list(settings.workspace_root.iterdir()) == []
     assert not any(
-        name.startswith(settings.sandbox_name_prefix) for name in sandbox_client.list_names()
+        name.startswith(settings.runtime.sandbox_name_prefix)
+        for name in sandbox_client.list_names()
     )
 
 
@@ -416,21 +416,15 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     sandbox_client = VerifyingCodexSandboxClient(
         DockerSandboxClient(
             process_runner=process_runner,
-            config=DockerSandboxConfig(
-                process_output_max_bytes=settings.process_output_max_bytes,
-                cleanup_timeout_seconds=settings.sandbox_cleanup_timeout_seconds,
-            ),
+            config=settings.runtime.sandbox_operation,
         )
     )
     runner = RecordingAdapter(
         CodexSandboxAdapter(
             client=sandbox_client,
-            sandbox_prefix=settings.sandbox_name_prefix,
+            sandbox_prefix=settings.runtime.sandbox_name_prefix,
             kit=settings.review_kit_path,
-            config=CodexExecutionConfig(
-                model=settings.codex_model,
-                reasoning_effort=settings.openai_reasoning_effort,
-            ),
+            config=settings.runtime.codex_execution,
         ),
         repository_control_markers={
             Path("AGENTS.md"): forbidden_instruction,
@@ -442,13 +436,10 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         workspace_root=settings.workspace_root,
         candidate_acceptance=CandidateAcceptance(
             adapter=runner,
-            max_bytes=settings.candidate_output_max_bytes,
+            max_bytes=settings.runtime.candidate_output_max_bytes,
         ),
         source_repository=GitHubRepository(credentials=github),
-        limits=ReviewLimits(
-            process_output_max_bytes=settings.process_output_max_bytes,
-            sandbox_resources=settings.sandbox_resources,
-        ),
+        limits=settings.runtime.review_limits,
     )
     publisher = RecordingPublisher(github, resources_path)
     app = create_app(
@@ -457,7 +448,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         worker=SingleReviewWorker(
             reviewer=reviewer,
             publisher=publisher,
-            review_timeout_seconds=settings.review_timeout_seconds,
+            review_timeout_seconds=settings.runtime.review_timeout_seconds,
         ),
         shutdown_callback=github.close,
     )
@@ -485,7 +476,7 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
         _wait_for_publication_or_failure(
             publisher,
             failure_handler,
-            timeout_seconds=settings.review_timeout_seconds,
+            timeout_seconds=settings.runtime.review_timeout_seconds,
             diagnostics=process_runner.diagnostics,
         )
 

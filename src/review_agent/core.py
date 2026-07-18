@@ -4,13 +4,14 @@ import re
 import shutil
 import subprocess
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from os.path import lexists
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import ValidationError
 
+from review_agent.configuration import ReviewLimits, SandboxResourceLimits
 from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
@@ -18,8 +19,6 @@ from review_agent.process import ProcessOptions, _run_bounded_process
 
 MAX_CHANGED_FILES = 100
 MAX_CHANGED_TEXT_LINES = 5_000
-CANDIDATE_OUTPUT_MAX_BYTES = 65_536
-PROCESS_OUTPUT_MAX_BYTES = 1_048_576
 WORKSPACE_PREFIX = "review-agent-workspace-"
 _OWNED_WORKSPACE = re.compile(rf"^{re.escape(WORKSPACE_PREFIX)}[0-9a-f]{{32}}$")
 
@@ -30,29 +29,6 @@ class ChangedPathManifest:
     paths: tuple[str, ...]
     changed_files: int
     changed_text_lines: int
-
-
-@dataclass(frozen=True, slots=True)
-class SandboxResourceLimits:
-    cpus: int = 2
-    memory_mib: int = 4_096
-    pids: int = 256
-
-    def __post_init__(self) -> None:
-        if self.cpus <= 0 or self.memory_mib <= 0 or self.pids <= 0:
-            message = "sandbox resource limits must be positive"
-            raise ValueError(message)
-
-
-@dataclass(frozen=True, slots=True)
-class ReviewLimits:
-    process_output_max_bytes: int = PROCESS_OUTPUT_MAX_BYTES
-    sandbox_resources: SandboxResourceLimits = field(default_factory=SandboxResourceLimits)
-
-    def __post_init__(self) -> None:
-        if self.process_output_max_bytes <= 0:
-            message = "process output limit must be positive"
-            raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)

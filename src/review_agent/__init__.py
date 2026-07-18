@@ -1,11 +1,10 @@
+from review_agent.configuration import ReviewLimits, SandboxResourceLimits
 from review_agent.core import (
     CandidateAcceptance,
     ChangedPathManifest,
     GitHubRepository,
     ReviewContext,
     Reviewer,
-    ReviewLimits,
-    SandboxResourceLimits,
 )
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient, GitHubError

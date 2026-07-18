@@ -23,7 +23,8 @@ from review_agent import (
     publish_review_result,
     render_review_comment,
 )
-from review_agent.core import CANDIDATE_OUTPUT_MAX_BYTES, CandidateContract
+from review_agent.configuration import CANDIDATE_OUTPUT_MAX_BYTES
+from review_agent.core import CandidateContract
 from review_agent.sandbox import SandboxLifecycleAdapter
 
 

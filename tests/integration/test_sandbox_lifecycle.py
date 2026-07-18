@@ -13,10 +13,10 @@ from review_agent import (
     ReviewRequest,
     SandboxResourceLimits,
 )
+from review_agent.configuration import SandboxOperationPolicy
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.sandbox import (
     DockerSandboxClient,
-    DockerSandboxConfig,
     SandboxLifecycleAdapter,
 )
 
@@ -58,7 +58,7 @@ def _repository(root: Path) -> tuple[Path, str, str]:
 class RecordingDockerSandboxClient(DockerSandboxClient):
     def __init__(self) -> None:
         super().__init__(
-            config=DockerSandboxConfig(
+            config=SandboxOperationPolicy(
                 process_output_max_bytes=65_536,
                 cleanup_timeout_seconds=30,
             )

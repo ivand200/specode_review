@@ -14,12 +14,15 @@ from review_agent import (
     ReviewRequest,
     SandboxResourceLimits,
 )
+from review_agent.configuration import (
+    CodexExecutionPolicy,
+    ReasoningEffort,
+    SandboxOperationPolicy,
+)
 from review_agent.core import CandidateContract
 from review_agent.sandbox import (
-    CodexExecutionConfig,
     CodexSandboxAdapter,
     DockerSandboxClient,
-    DockerSandboxConfig,
     ProcessOptions,
 )
 
@@ -151,7 +154,7 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     contract = _candidate_contract()
@@ -208,7 +211,7 @@ def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -231,7 +234,7 @@ def test_codex_sandbox_runner_rejects_injected_control_configuration(
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -251,7 +254,7 @@ def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> No
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -272,7 +275,7 @@ def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None
         client=client,
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     with pytest.raises(ReviewError) as failure:
@@ -295,7 +298,7 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
         ),
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
 
     assert (
@@ -314,7 +317,7 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
         ),
         sandbox_prefix="review-agent-",
         kit=Path("review-kit"),
-        config=CodexExecutionConfig(model="gpt-5.4", reasoning_effort="high"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
     )
     with pytest.raises(ReviewError) as failure:
         oversized_adapter.produce(
@@ -355,7 +358,7 @@ def test_docker_sandbox_client_creates_a_bounded_isolated_mount_set(tmp_path: Pa
         executable=Path("/opt/review-agent/bin/sbx"),
         process_runner=process_runner,
         environment={},
-        config=DockerSandboxConfig(process_output_max_bytes=4_096),
+        config=SandboxOperationPolicy(process_output_max_bytes=4_096),
     )
     control = tmp_path / "control"
     checkout = tmp_path / "checkout"
@@ -408,7 +411,7 @@ def test_docker_sandbox_client_creates_codex_with_the_application_kit(
         executable=Path("/opt/review-agent/bin/sbx"),
         process_runner=process_runner,
         environment={},
-        config=DockerSandboxConfig(process_output_max_bytes=4_096),
+        config=SandboxOperationPolicy(process_output_max_bytes=4_096),
     )
     control = tmp_path / "control"
     checkout = tmp_path / "checkout"
@@ -451,7 +454,7 @@ def test_docker_sandbox_client_executes_with_process_and_output_limits() -> None
         executable=Path("/opt/review-agent/bin/sbx"),
         process_runner=process_runner,
         environment={},
-        config=DockerSandboxConfig(process_output_max_bytes=8_192),
+        config=SandboxOperationPolicy(process_output_max_bytes=8_192),
     )
 
     output = client.execute(
@@ -490,7 +493,7 @@ def test_docker_sandbox_client_lists_names_and_forces_bounded_removal() -> None:
         executable=Path("/opt/review-agent/bin/sbx"),
         process_runner=process_runner,
         environment={},
-        config=DockerSandboxConfig(
+        config=SandboxOperationPolicy(
             process_output_max_bytes=16_384,
             cleanup_timeout_seconds=7,
         ),
