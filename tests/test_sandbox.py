@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 from dataclasses import dataclass
@@ -43,9 +44,9 @@ class RecordingProcessRunner:
         return subprocess.CompletedProcess(arguments, 0, stdout=self.stdout, stderr=b"")
 
 
-def _resources(workspace_root: Path) -> AttemptResources:
+def _resources(workspace_root: Path, *, attempt_id: str = "a" * 32) -> AttemptResources:
     return AttemptResources.for_attempt(
-        "a" * 32,
+        attempt_id,
         workspace_root=workspace_root,
         sandbox_prefix="review-agent-",
     )
@@ -55,8 +56,12 @@ def _resources(workspace_root: Path) -> AttemptResources:
 class RecordingCodexSandboxClient:
     head_sha: str
     tamper_control: bool = False
-    codex_error: Exception | None = None
+    codex_error: BaseException | None = None
+    create_error: BaseException | None = None
+    command_error: BaseException | None = None
+    remove_error: Exception | None = None
     write_result: bool = True
+    symlink_result: bool = False
     add_control_config: bool = False
     result_bytes: bytes = b'{"findings":[]}'
 
@@ -75,6 +80,8 @@ class RecordingCodexSandboxClient:
         resources: SandboxResourceLimits,
     ) -> None:
         self.created.append((name, control, checkout, kit, resources))
+        if self.create_error is not None:
+            raise self.create_error
 
     def execute(
         self,
@@ -85,13 +92,19 @@ class RecordingCodexSandboxClient:
         process_limit: int,
     ) -> bytes:
         self.executed.append((name, command, workdir, process_limit))
+        if self.command_error is not None:
+            raise self.command_error
         if command[:2] == ("codex", "exec") and self.codex_error is not None:
             raise self.codex_error
         if command == ("git", "rev-parse", "HEAD"):
             return f"{self.head_sha}\n".encode()
         if command[:2] == ("codex", "exec"):
             result_path = Path(command[command.index("--output-last-message") + 1])
-            if self.write_result:
+            if self.symlink_result:
+                target = result_path.parent.parent / "candidate-target.json"
+                target.write_bytes(self.result_bytes)
+                result_path.symlink_to(target)
+            elif self.write_result:
                 result_path.write_bytes(self.result_bytes)
             if self.tamper_control:
                 request_path = result_path.with_name("request.json")
@@ -109,6 +122,22 @@ class RecordingCodexSandboxClient:
 
     def remove(self, name: str) -> None:
         self.removed.append(name)
+        if self.remove_error is not None:
+            raise self.remove_error
+
+
+def _adapter(
+    tmp_path: Path,
+    client: RecordingCodexSandboxClient,
+    *,
+    attempt_id: str = "a" * 32,
+) -> CodexSandboxAdapter:
+    return CodexSandboxAdapter(
+        client=client,
+        resources=_resources(tmp_path, attempt_id=attempt_id),
+        kit=Path("review-kit"),
+        config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
+    )
 
 
 def _review_context(tmp_path: Path, *, title: str = "Safe title") -> ReviewContext:
@@ -213,6 +242,75 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert output_schema_bytes == contract.schema_json
 
 
+def test_codex_sandbox_adapter_prepares_an_exact_vm_local_copy_before_codex(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(context.request.head_sha)
+
+    _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    sandbox_name = client.created[0][0]
+    assert client.executed[:4] == [
+        (
+            sandbox_name,
+            (
+                "sh",
+                "-c",
+                'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
+                "review-agent-read-only-check",
+                str(context.checkout),
+            ),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("mkdir", "-p", "/home/agent/review/repo"),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("cp", "-R", f"{context.checkout}/.", "/home/agent/review/repo"),
+            None,
+            64,
+        ),
+        (
+            sandbox_name,
+            ("git", "rev-parse", "HEAD"),
+            "/home/agent/review/repo",
+            64,
+        ),
+    ]
+    assert client.executed[4][1][:2] == ("codex", "exec")
+    assert client.removed == [sandbox_name]
+
+
+def test_codex_sandbox_adapter_uses_a_fresh_sandbox_for_each_attempt(
+    tmp_path: Path,
+) -> None:
+    first_context = _review_context(tmp_path / "first")
+    second_context = _review_context(tmp_path / "second")
+    client = RecordingCodexSandboxClient(first_context.request.head_sha)
+
+    _adapter(tmp_path, client, attempt_id="a" * 32).produce(
+        first_context,
+        _candidate_contract(),
+    )
+    _adapter(tmp_path, client, attempt_id="b" * 32).produce(
+        second_context,
+        _candidate_contract(),
+    )
+
+    created_names = [created[0] for created in client.created]
+    assert created_names == [
+        "review-agent-" + "a" * 32,
+        "review-agent-" + "b" * 32,
+    ]
+    assert client.removed == created_names
+
+
 def test_codex_sandbox_runner_rejects_agent_tampering_with_trusted_inputs(
     tmp_path: Path,
 ) -> None:
@@ -256,6 +354,38 @@ def test_codex_sandbox_runner_rejects_injected_control_configuration(
 
     assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
     assert failure.value.stage == "trusted_control_integrity"
+    assert client.removed == [client.created[0][0]]
+
+
+def test_codex_sandbox_adapter_rejects_an_inexact_vm_local_copy(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient("f" * 40)
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "sandbox_head_verification"
+    assert client.removed == [client.created[0][0]]
+
+
+def test_codex_sandbox_adapter_rejects_a_symbolic_link_candidate(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        symlink_result=True,
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
+    assert failure.value.stage == "codex_candidate_output"
+    assert client.removed == [client.created[0][0]]
 
 
 def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> None:
@@ -279,6 +409,88 @@ def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> No
     assert client.removed == [client.created[0][0]]
 
 
+def test_codex_sandbox_adapter_normalizes_lifecycle_failure_and_forces_removal(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        create_error=RuntimeError("untrusted setup detail"),
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "codex_sandbox_lifecycle"
+    assert client.removed == [client.created[0][0]]
+
+
+def test_codex_sandbox_adapter_fails_closed_when_the_read_only_probe_fails(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        command_error=RuntimeError("checkout was writable"),
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "codex_sandbox_lifecycle"
+    assert len(client.executed) == 1
+    assert client.executed[0][1][3] == "review-agent-read-only-check"
+    assert client.removed == [client.created[0][0]]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type", "expected_category", "expected_stage"),
+    [
+        (
+            TimeoutError(),
+            ReviewError,
+            FailureCategory.TIMEOUT,
+            "codex_execution",
+        ),
+        (
+            asyncio.CancelledError(),
+            asyncio.CancelledError,
+            None,
+            None,
+        ),
+        (
+            KeyboardInterrupt(),
+            KeyboardInterrupt,
+            None,
+            None,
+        ),
+    ],
+)
+def test_codex_sandbox_adapter_forces_removal_after_terminal_execution_failures(
+    tmp_path: Path,
+    error: BaseException,
+    expected_type: type[BaseException],
+    expected_category: FailureCategory | None,
+    expected_stage: str | None,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        codex_error=error,
+    )
+
+    with pytest.raises(expected_type) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    if expected_category is not None:
+        assert isinstance(failure.value, ReviewError)
+        assert failure.value.category is expected_category
+        assert failure.value.stage == expected_stage
+    assert client.removed == [client.created[0][0]]
+
+
 def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None:
     context = _review_context(tmp_path)
     client = RecordingCodexSandboxClient(
@@ -298,6 +510,7 @@ def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None
     assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
     assert failure.value.stage == "codex_candidate_output"
     assert len([call for call in client.executed if call[1][:2] == ("codex", "exec")]) == 1
+    assert client.removed == [client.created[0][0]]
 
 
 def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
@@ -324,11 +537,12 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
     )
 
     oversized_context = _review_context(tmp_path / "oversized")
+    oversized_client = RecordingCodexSandboxClient(
+        oversized_context.request.head_sha,
+        result_bytes=exact_candidate + b"x",
+    )
     oversized_adapter = CodexSandboxAdapter(
-        client=RecordingCodexSandboxClient(
-            oversized_context.request.head_sha,
-            result_bytes=exact_candidate + b"x",
-        ),
+        client=oversized_client,
         resources=_resources(tmp_path),
         kit=Path("review-kit"),
         config=CodexExecutionPolicy(model="gpt-5.4", reasoning_effort=ReasoningEffort.HIGH),
@@ -341,6 +555,42 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
 
     assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
     assert failure.value.stage == "codex_candidate_output"
+    assert oversized_client.removed == [oversized_client.created[0][0]]
+
+
+def test_codex_sandbox_adapter_surfaces_cleanup_failure_after_success(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        remove_error=RuntimeError("untrusted cleanup detail"),
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
+    assert failure.value.stage == "sandbox_cleanup"
+    assert client.removed == [client.created[0][0]]
+
+
+def test_codex_sandbox_adapter_preserves_primary_failure_when_cleanup_also_fails(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        codex_error=subprocess.CalledProcessError(1, ("codex", "exec")),
+        remove_error=RuntimeError("untrusted cleanup detail"),
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
+    assert failure.value.stage == "codex_execution"
+    assert client.removed == [client.created[0][0]]
 
 
 def test_application_owned_review_kit_contains_trusted_policy_and_skill() -> None:
