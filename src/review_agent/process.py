@@ -35,9 +35,7 @@ def _run_bounded_process(  # noqa: C901, PLR0912, PLR0915
     options: ProcessOptions,
 ) -> subprocess.CompletedProcess[bytes]:
     timeout_at = (
-        None
-        if options.timeout_seconds is None
-        else time.monotonic() + options.timeout_seconds
+        None if options.timeout_seconds is None else time.monotonic() + options.timeout_seconds
     )
     process = subprocess.Popen(  # noqa: S603 - arguments are structured and never use a shell.
         arguments,
@@ -89,9 +87,7 @@ def _run_bounded_process(  # noqa: C901, PLR0912, PLR0915
                 raise TimeoutError
         else:
             wait_timeout = (
-                remaining_review_time(stage=options.stage)
-                if options.use_review_deadline
-                else None
+                remaining_review_time(stage=options.stage) if options.use_review_deadline else None
             )
         try:
             return_code = process.wait(timeout=wait_timeout)

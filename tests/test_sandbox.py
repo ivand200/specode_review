@@ -185,6 +185,16 @@ def test_review_execution_contract_does_not_require_global_sandbox_listing() -> 
     assert not hasattr(client, "list_names")
 
 
+def test_docker_sandbox_client_does_not_expose_generic_shell_creation() -> None:
+    client = DockerSandboxClient(
+        executable=Path("/opt/review-agent/bin/sbx"),
+        process_runner=RecordingProcessRunner(),
+        environment={},
+    )
+
+    assert not hasattr(client, "create")
+
+
 def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     tmp_path: Path,
 ) -> None:

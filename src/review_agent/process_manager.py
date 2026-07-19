@@ -176,8 +176,7 @@ class ReviewProcessManager:
                     active_key=active_key,
                 )
                 logger.warning(
-                    "review process unavailable "
-                    "attempt_id=%s stage=launch category=review_failure",
+                    "review process unavailable attempt_id=%s stage=launch category=review_failure",
                     attempt_id,
                 )
                 return SubmissionOutcome.UNAVAILABLE
@@ -230,13 +229,10 @@ class ReviewProcessManager:
         except TimeoutError:
             hard_timed_out = True
             logger.warning(
-                "review process hard timeout "
-                "attempt_id=%s stage=timeout category=review_failure",
+                "review process hard timeout attempt_id=%s stage=timeout category=review_failure",
                 command.attempt_id,
             )
-            cleanup_grace = (
-                self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
-            )
+            cleanup_grace = self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
             return_code = await _terminate_process_group(
                 process,
                 attempt_id=command.attempt_id,
@@ -275,8 +271,7 @@ class ReviewProcessManager:
             cleanup_succeeded = await self._cleanup(command.attempt_id)
             if hard_timed_out and cleanup_succeeded:
                 logger.info(
-                    "review process cleanup completed "
-                    "attempt_id=%s stage=cleanup outcome=success",
+                    "review process cleanup completed attempt_id=%s stage=cleanup outcome=success",
                     command.attempt_id,
                 )
         finally:
@@ -295,14 +290,11 @@ class ReviewProcessManager:
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(self._resource_manager.cleanup, attempt_id),
-                timeout=(
-                    self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
-                ),
+                timeout=(self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds),
             )
         except Exception:  # noqa: BLE001 - exact parent cleanup failure boundary.
             logger.warning(
-                "review process cleanup failed "
-                "attempt_id=%s stage=cleanup category=review_failure",
+                "review process cleanup failed attempt_id=%s stage=cleanup category=review_failure",
                 attempt_id,
             )
             return False

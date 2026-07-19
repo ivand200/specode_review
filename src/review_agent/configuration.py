@@ -227,9 +227,7 @@ class AttemptSettings:
             _invalid("CODEX_MODEL")
 
         try:
-            reasoning_effort = ReasoningEffort(
-                _required(environment, "OPENAI_REASONING_EFFORT")
-            )
+            reasoning_effort = ReasoningEffort(_required(environment, "OPENAI_REASONING_EFFORT"))
         except ValueError:
             _invalid("OPENAI_REASONING_EFFORT")
 
@@ -303,8 +301,7 @@ class AttemptSettings:
         rendered = {
             name: value
             for name, value in parent_environment.items()
-            if name in _EXECUTOR_OS_ENVIRONMENT
-            or name.startswith("DOCKER_SANDBOXES_")
+            if name in _EXECUTOR_OS_ENVIRONMENT or name.startswith("DOCKER_SANDBOXES_")
         }
         rendered.update(
             {

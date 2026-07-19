@@ -27,9 +27,7 @@ def create_production_app(
     child_arguments: tuple[str, ...] | None = None,
 ) -> FastAPI:
     resolved_environment = os.environ if environment is None else environment
-    resolved_settings = settings or ProductionSettings.from_environment(
-        resolved_environment
-    )
+    resolved_settings = settings or ProductionSettings.from_environment(resolved_environment)
     (readiness or ProductionReadiness()).check(resolved_settings)
 
     webhook = resolved_settings.webhook

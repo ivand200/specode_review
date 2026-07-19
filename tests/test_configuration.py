@@ -144,10 +144,7 @@ def test_attempt_settings_render_a_revalidatable_allowlisted_executor_environmen
     assert executor_environment["HOME"] == "/trusted/home"
     assert executor_environment["TMPDIR"] == "/trusted/tmp"
     assert executor_environment["DOCKER_HOST"] == "unix:///trusted/docker.sock"
-    assert (
-        executor_environment["DOCKER_SANDBOXES_CONTEXT"]
-        == "trusted-sandbox-context"
-    )
+    assert executor_environment["DOCKER_SANDBOXES_CONTEXT"] == "trusted-sandbox-context"
     assert executor_environment["SSL_CERT_FILE"] == "/trusted/cert.pem"
     for excluded in (
         "GITHUB_REPOSITORY",
@@ -343,9 +340,7 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     readiness.check(settings)
 
     assert settings.attempt.workspace_root.is_dir()
-    process_output_max_bytes = (
-        settings.attempt.runtime.sandbox_operation.process_output_max_bytes
-    )
+    process_output_max_bytes = settings.attempt.runtime.sandbox_operation.process_output_max_bytes
     assert runner.calls == [
         ((sbx, "version"), process_output_max_bytes),
         ((codex, "--version"), process_output_max_bytes),

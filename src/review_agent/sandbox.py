@@ -61,54 +61,6 @@ class DockerSandboxClient:
         self._process_output_max_bytes = resolved_config.process_output_max_bytes
         self._cleanup_timeout_seconds = resolved_config.cleanup_timeout_seconds
         self._environment = dict(_default_sbx_environment() if environment is None else environment)
-        self._deny_network = resolved_config.deny_network
-
-    def create(
-        self,
-        *,
-        name: str,
-        control: Path,
-        checkout: Path,
-        resources: SandboxResourceLimits,
-    ) -> None:
-        self._run_process(
-            (
-                self._executable,
-                "create",
-                "--quiet",
-                "--name",
-                name,
-                "--cpus",
-                str(resources.cpus),
-                "--memory",
-                f"{resources.memory_mib}m",
-                "shell",
-                str(control),
-                f"{checkout}:ro",
-            ),
-            ProcessOptions(
-                output_max_bytes=self._process_output_max_bytes,
-                stage="sandbox_create",
-                env=self._environment,
-            ),
-        )
-        if self._deny_network:
-            self._run_process(
-                (
-                    self._executable,
-                    "policy",
-                    "deny",
-                    "network",
-                    "--sandbox",
-                    name,
-                    "**",
-                ),
-                ProcessOptions(
-                    output_max_bytes=self._process_output_max_bytes,
-                    stage="sandbox_network_policy",
-                    env=self._environment,
-                ),
-            )
 
     def create_codex(
         self,
@@ -197,30 +149,6 @@ class DockerSandboxClient:
         return tuple(completed.stdout.decode("utf-8").splitlines())
 
 
-class SandboxClient(Protocol):
-    def create(
-        self,
-        *,
-        name: str,
-        control: Path,
-        checkout: Path,
-        resources: SandboxResourceLimits,
-    ) -> None: ...
-
-    def execute(
-        self,
-        *,
-        name: str,
-        command: tuple[str, ...],
-        workdir: str | None,
-        process_limit: int,
-    ) -> bytes: ...
-
-    def remove(self, name: str) -> None: ...
-
-    def list_names(self) -> tuple[str, ...]: ...
-
-
 @runtime_checkable
 class ReviewExecutionClient(Protocol):
     """Production boundary for one disposable Codex review sandbox."""
@@ -254,7 +182,7 @@ class _SandboxLifecycle:
     def __init__(
         self,
         *,
-        client: SandboxClient | ReviewExecutionClient,
+        client: ReviewExecutionClient,
         resources: AttemptResources,
         timeout_stage: str,
         failure_stage: str,
@@ -590,62 +518,3 @@ class CodexSandboxAdapter:
                 FailureCategory.INVALID_MODEL_OUTPUT,
                 stage="trusted_control_integrity",
             )
-
-
-class SandboxLifecycleAdapter:
-    def __init__(
-        self,
-        *,
-        client: SandboxClient,
-        resources: AttemptResources,
-        review_command: tuple[str, ...] | None = None,
-    ) -> None:
-        self._client = client
-        self._lifecycle = _SandboxLifecycle(
-            client=client,
-            resources=resources,
-            timeout_stage="sandbox_lifecycle",
-            failure_stage="sandbox_lifecycle",
-        )
-        self._review_command = review_command
-
-    def produce(
-        self,
-        context: ReviewContext,
-        contract: CandidateContract,
-    ) -> bytes:
-        control = context.workspace / "control"
-
-        def create(sandbox_name: str) -> None:
-            self._client.create(
-                name=sandbox_name,
-                control=control,
-                checkout=context.checkout,
-                resources=context.sandbox_resources,
-            )
-
-        def review(sandbox_name: str) -> bytes:
-            if self._review_command is not None:
-                candidate = self._lifecycle.execute(
-                    sandbox_name,
-                    context,
-                    self._review_command,
-                    workdir=_VM_CHECKOUT,
-                )
-            else:
-                candidate = b'{"findings":[]}'
-            bounded_candidate = candidate[: contract.max_bytes + 1]
-            if len(bounded_candidate) > contract.max_bytes:
-                raise ReviewError(
-                    FailureCategory.CODEX_OR_LIMIT,
-                    stage="sandbox_candidate_output",
-                )
-            return bounded_candidate
-
-        return self._lifecycle.run(
-            context,
-            control=control,
-            prepare_control=None,
-            create=create,
-            action=review,
-        )

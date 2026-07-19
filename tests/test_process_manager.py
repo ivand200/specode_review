@@ -606,9 +606,7 @@ def test_overlong_attempt_gets_sigterm_after_review_and_cleanup_budget(
 
     assert terminated.exists()
     assert elapsed >= 0.24
-    assert not any(
-        "signal=SIGKILL" in record.getMessage() for record in caplog.records
-    )
+    assert not any("signal=SIGKILL" in record.getMessage() for record in caplog.records)
 
 
 def test_sigterm_ignoring_attempt_and_descendant_are_hard_stopped(
@@ -654,9 +652,7 @@ def test_sigterm_ignoring_attempt_and_descendant_are_hard_stopped(
     assert any("signal=SIGTERM" in message for message in messages)
     assert any("signal=SIGKILL" in message for message in messages)
     assert any("stage=timeout" in message for message in messages)
-    assert any(
-        "outcome=hard_timeout child_status=signal_9" in message for message in messages
-    )
+    assert any("outcome=hard_timeout child_status=signal_9" in message for message in messages)
     assert any("stage=cleanup outcome=success" in message for message in messages)
     correlated = [
         message

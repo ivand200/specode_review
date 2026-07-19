@@ -115,9 +115,12 @@ def test_child_rejects_invalid_process_input_without_starting_review(
 
     assert completed.returncode != 0
     assert completed.stdout == b""
-    assert completed.stderr.decode().strip().endswith(
-        "review attempt failed "
-        "attempt_id=unknown stage=launch_command category=review_failure"
+    assert (
+        completed.stderr.decode()
+        .strip()
+        .endswith(
+            "review attempt failed attempt_id=unknown stage=launch_command category=review_failure"
+        )
     )
     assert "untrusted-pull-request-content" not in completed.stderr.decode()
     assert "unsafe-command-value" not in completed.stderr.decode()
@@ -135,10 +138,14 @@ def test_child_revalidates_executor_settings_before_starting_review(tmp_path: Pa
 
     assert completed.returncode != 0
     assert completed.stdout == b""
-    assert completed.stderr.decode().strip().endswith(
-        "review attempt failed "
-        "attempt_id=0123456789abcdef0123456789abcdef "
-        "stage=launch_configuration category=review_failure"
+    assert (
+        completed.stderr.decode()
+        .strip()
+        .endswith(
+            "review attempt failed "
+            "attempt_id=0123456789abcdef0123456789abcdef "
+            "stage=launch_configuration category=review_failure"
+        )
     )
 
 
@@ -153,8 +160,7 @@ def test_production_child_rejects_every_command_line_payload(tmp_path: Path) -> 
     assert completed.stdout == b""
     stderr = completed.stderr.decode().strip()
     assert stderr.endswith(
-        "review attempt failed "
-        "attempt_id=unknown stage=launch_command category=review_failure"
+        "review attempt failed attempt_id=unknown stage=launch_command category=review_failure"
     )
     assert "untrusted-pull-request-title" not in stderr
 
