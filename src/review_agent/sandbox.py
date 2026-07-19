@@ -4,7 +4,7 @@ import re
 import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 from review_agent.configuration import (
     CodexExecutionPolicy,
@@ -221,7 +221,10 @@ class SandboxClient(Protocol):
     def list_names(self) -> tuple[str, ...]: ...
 
 
-class CodexSandboxClient(Protocol):
+@runtime_checkable
+class ReviewExecutionClient(Protocol):
+    """Production boundary for one disposable Codex review sandbox."""
+
     def create_codex(
         self,
         *,
@@ -243,8 +246,6 @@ class CodexSandboxClient(Protocol):
 
     def remove(self, name: str) -> None: ...
 
-    def list_names(self) -> tuple[str, ...]: ...
-
 
 _ResultT = TypeVar("_ResultT")
 
@@ -253,7 +254,7 @@ class _SandboxLifecycle:
     def __init__(
         self,
         *,
-        client: SandboxClient | CodexSandboxClient,
+        client: SandboxClient | ReviewExecutionClient,
         resources: AttemptResources,
         timeout_stage: str,
         failure_stage: str,
@@ -385,7 +386,7 @@ class CodexSandboxAdapter:
     def __init__(
         self,
         *,
-        client: CodexSandboxClient,
+        client: ReviewExecutionClient,
         resources: AttemptResources,
         kit: Path,
         config: CodexExecutionPolicy,

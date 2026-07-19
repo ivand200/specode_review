@@ -25,6 +25,7 @@ from review_agent.sandbox import (
     CodexSandboxAdapter,
     DockerSandboxClient,
     ProcessOptions,
+    ReviewExecutionClient,
 )
 
 
@@ -109,9 +110,6 @@ class RecordingCodexSandboxClient:
     def remove(self, name: str) -> None:
         self.removed.append(name)
 
-    def list_names(self) -> tuple[str, ...]:
-        return ()
-
 
 def _review_context(tmp_path: Path, *, title: str = "Safe title") -> ReviewContext:
     start_sha = "a" * 40
@@ -149,6 +147,13 @@ def _candidate_contract(*, max_bytes: int = 1_024) -> CandidateContract:
         schema_json=b'{"additionalProperties":false,"properties":{"findings":{}}}',
         max_bytes=max_bytes,
     )
+
+
+def test_review_execution_contract_does_not_require_global_sandbox_listing() -> None:
+    client = RecordingCodexSandboxClient("b" * 40)
+
+    assert isinstance(client, ReviewExecutionClient)
+    assert not hasattr(client, "list_names")
 
 
 def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
