@@ -10,15 +10,12 @@ from review_agent import (
     Reviewer,
     ReviewError,
     ReviewRequest,
-    SandboxResourceLimits,
 )
 from review_agent.configuration import SandboxOperationPolicy
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
-from review_agent.resources import ReviewResourceManager
-from review_agent.sandbox import (
-    DockerSandboxClient,
-    SandboxLifecycleAdapter,
-)
+from review_agent.resources import AttemptResources, ReviewResourceManager
+
+from .no_model_sandbox_probe import NoModelDockerSandboxProbe
 
 pytestmark = [
     pytest.mark.docker_sandbox,
@@ -55,38 +52,6 @@ def _repository(root: Path) -> tuple[Path, str, str]:
     return repository, base_sha, _git(repository, "rev-parse", "HEAD")
 
 
-class RecordingDockerSandboxClient(DockerSandboxClient):
-    def __init__(self) -> None:
-        super().__init__(
-            config=SandboxOperationPolicy(
-                process_output_max_bytes=65_536,
-                cleanup_timeout_seconds=30,
-            )
-        )
-        self.created_names: list[str] = []
-        self.removed_names: list[str] = []
-
-    def create(
-        self,
-        *,
-        name: str,
-        control: Path,
-        checkout: Path,
-        resources: SandboxResourceLimits,
-    ) -> None:
-        self.created_names.append(name)
-        super().create(
-            name=name,
-            control=control,
-            checkout=checkout,
-            resources=resources,
-        )
-
-    def remove(self, name: str) -> None:
-        self.removed_names.append(name)
-        super().remove(name)
-
-
 def _request(*, base_sha: str, head_sha: str, title: str) -> ReviewRequest:
     return ReviewRequest(
         repository="octo-org/sandbox-fixture",
@@ -98,65 +63,77 @@ def _request(*, base_sha: str, head_sha: str, title: str) -> ReviewRequest:
     )
 
 
-def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -> None:
+def _reviewer(
+    *,
+    source: Path,
+    resources: AttemptResources,
+    probe: NoModelDockerSandboxProbe,
+    timeout: bool = False,
+) -> Reviewer:
+    return Reviewer(
+        repository="octo-org/sandbox-fixture",
+        source_repository=source,
+        resources=resources,
+        candidate_acceptance=CandidateAcceptance(
+            adapter=probe.candidate_adapter(resources=resources, timeout=timeout),
+            max_bytes=65_536,
+        ),
+    )
+
+
+def test_test_only_no_model_probe_is_fresh_bounded_and_swept(  # noqa: PLR0915
+    tmp_path: Path,
+) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
     workspace_root = tmp_path / "workspaces"
-    client = RecordingDockerSandboxClient()
+    probe = NoModelDockerSandboxProbe(
+        config=SandboxOperationPolicy(
+            process_output_max_bytes=65_536,
+            cleanup_timeout_seconds=30,
+        )
+    )
     prefix = "review-agent-it-"
     resource_manager = ReviewResourceManager(
         workspace_root=workspace_root,
         sandbox_prefix=prefix,
-        sandbox_client=client,
+        sandbox_client=probe,
     )
     resources = resource_manager.for_attempt("a" * 32)
-    probe_command = (
-        "sh",
-        "-c",
-        "set -eu; "
-        "command -v curl >/dev/null; "
-        "if curl -fsS --max-time 3 https://example.com >/dev/null 2>&1; then exit 74; fi; "
-        "test ! -e /home/agent/review-attempt-marker; "
-        "touch /home/agent/review-attempt-marker; "
-        "rm feature.txt; "
-        "printf '{\"findings\":[]}'",
-    )
-    runner = SandboxLifecycleAdapter(
-        client=client,
+    reviewer = _reviewer(
+        source=source,
         resources=resources,
-        review_command=probe_command,
+        probe=probe,
     )
-    reviewer = Reviewer(
-        repository="octo-org/sandbox-fixture",
-        source_repository=source,
-        resources=resources,
-        candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
-    )
-    request = _request(base_sha=base_sha, head_sha=head_sha, title="No-model lifecycle")
+    request = _request(base_sha=base_sha, head_sha=head_sha, title="Test-only no-model probe")
+    cleanup_names: list[str] = [resources.sandbox_name]
 
     try:
         first = reviewer.review(request)
 
         assert first.status == "no_important_issues"
-        assert client.created_names == [resources.sandbox_name]
-        assert client.removed_names == client.created_names
+        assert resources.sandbox_name not in probe.list_names()
         assert _git(source, "status", "--short") == ""
         assert _git(source, "rev-parse", "HEAD") == head_sha
         assert list(workspace_root.iterdir()) == []
 
-        timeout_resources = resource_manager.for_attempt("b" * 32)
-        timeout_runner = SandboxLifecycleAdapter(
-            client=client,
-            resources=timeout_resources,
-            review_command=("sleep", "30"),
+        fresh_resources = resource_manager.for_attempt("d" * 32)
+        cleanup_names.append(fresh_resources.sandbox_name)
+        fresh_reviewer = _reviewer(
+            source=source,
+            resources=fresh_resources,
+            probe=probe,
         )
-        timeout_reviewer = Reviewer(
-            repository="octo-org/sandbox-fixture",
-            source_repository=source,
+
+        assert fresh_reviewer.review(request).status == "no_important_issues"
+        assert fresh_resources.sandbox_name not in probe.list_names()
+
+        timeout_resources = resource_manager.for_attempt("b" * 32)
+        cleanup_names.append(timeout_resources.sandbox_name)
+        timeout_reviewer = _reviewer(
+            source=source,
             resources=timeout_resources,
-            candidate_acceptance=CandidateAcceptance(
-                adapter=timeout_runner,
-                max_bytes=65_536,
-            ),
+            probe=probe,
+            timeout=True,
         )
         with (
             review_deadline_scope(ReviewDeadline.after(1)),
@@ -164,27 +141,43 @@ def test_no_model_sandbox_lifecycle_is_fresh_bounded_and_swept(tmp_path: Path) -
         ):
             timeout_reviewer.review(request)
         assert timeout_failure.value.category is FailureCategory.TIMEOUT
+        assert timeout_resources.sandbox_name not in probe.list_names()
         assert list(workspace_root.iterdir()) == []
 
         orphan_resources = resource_manager.for_attempt("c" * 32)
+        cleanup_names.append(orphan_resources.sandbox_name)
         orphan_workspace = orphan_resources.workspace
         orphan_workspace.mkdir()
         orphan_control = tmp_path / "orphan-control"
         orphan_control.mkdir()
         orphan_name = orphan_resources.sandbox_name
-        client.create(
-            name=orphan_name,
+        probe.create_stale(
+            resources=orphan_resources,
             control=orphan_control,
             checkout=source,
-            resources=SandboxResourceLimits(),
+        )
+        unrelated_manager = ReviewResourceManager(
+            workspace_root=workspace_root,
+            sandbox_prefix="unrelated-it-",
+            sandbox_client=probe,
+        )
+        unrelated_resources = unrelated_manager.for_attempt("e" * 32)
+        cleanup_names.append(unrelated_resources.sandbox_name)
+        unrelated_control = tmp_path / "unrelated-control"
+        unrelated_control.mkdir()
+        probe.create_stale(
+            resources=unrelated_resources,
+            control=unrelated_control,
+            checkout=source,
         )
 
         resource_manager.sweep_stale()
 
         assert not orphan_workspace.exists()
-        assert orphan_name in client.removed_names
-        assert not any(name.startswith(prefix) for name in client.list_names())
+        visible_names = probe.list_names()
+        assert orphan_name not in visible_names
+        assert unrelated_resources.sandbox_name in visible_names
+        assert not any(name.startswith(prefix) for name in visible_names)
     finally:
-        for name in client.list_names():
-            if name.startswith(prefix):
-                client.remove(name)
+        probe.cleanup(cleanup_names)
+        probe.cleanup(cleanup_names)

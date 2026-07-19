@@ -39,7 +39,7 @@ Docker Sandboxes runtime but no OpenAI authentication or model budget.
 
 Run it explicitly with:
 
-    RUN_DOCKER_SANDBOX_E2E=1 uv run pytest tests/integration/test_sandbox_lifecycle.py -q
+    RUN_DOCKER_SANDBOX_E2E=1 uv run pytest tests/integration/test_no_model_sandbox_probe.py -q
 
 ## Full live sandboxed review (checkpoint C)
 

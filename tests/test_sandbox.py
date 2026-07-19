@@ -616,57 +616,6 @@ def test_application_owned_review_kit_contains_trusted_policy_and_skill() -> Non
     assert diff_tool.stat().st_mode & 0o111
 
 
-def test_docker_sandbox_client_creates_a_bounded_isolated_mount_set(tmp_path: Path) -> None:
-    process_runner = RecordingProcessRunner()
-    client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
-        process_runner=process_runner,
-        environment={},
-        config=SandboxOperationPolicy(process_output_max_bytes=4_096),
-    )
-    control = tmp_path / "control"
-    checkout = tmp_path / "checkout"
-
-    client.create(
-        name="review-agent-" + "a" * 32,
-        control=control,
-        checkout=checkout,
-        resources=SandboxResourceLimits(cpus=3, memory_mib=2_048, pids=64),
-    )
-
-    assert process_runner.calls == [
-        (
-            (
-                "/opt/review-agent/bin/sbx",
-                "create",
-                "--quiet",
-                "--name",
-                "review-agent-" + "a" * 32,
-                "--cpus",
-                "3",
-                "--memory",
-                "2048m",
-                "shell",
-                str(control),
-                f"{checkout}:ro",
-            ),
-            ProcessOptions(output_max_bytes=4_096, stage="sandbox_create", env={}),
-        ),
-        (
-            (
-                "/opt/review-agent/bin/sbx",
-                "policy",
-                "deny",
-                "network",
-                "--sandbox",
-                "review-agent-" + "a" * 32,
-                "**",
-            ),
-            ProcessOptions(output_max_bytes=4_096, stage="sandbox_network_policy", env={}),
-        ),
-    ]
-
-
 def test_docker_sandbox_client_creates_codex_with_the_application_kit(
     tmp_path: Path,
 ) -> None:
@@ -811,12 +760,6 @@ def test_docker_sandbox_client_does_not_forward_raw_credentials(
         process_runner=process_runner,
     )
 
-    client.create(
-        name="review-agent-" + "c" * 32,
-        control=tmp_path / "control",
-        checkout=tmp_path / "checkout",
-        resources=SandboxResourceLimits(),
-    )
     client.create_codex(
         name="review-agent-" + "d" * 32,
         control=tmp_path / "codex-control",
