@@ -1,11 +1,21 @@
+from collections.abc import Callable
+
 import pytest
 
-from review_agent.github import ReviewComment, ReviewCommentApp
+from review_agent.github import (
+    GitHubError,
+    GitHubMutationError,
+    GitHubOperation,
+    ReviewComment,
+    ReviewCommentApp,
+)
 from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
 from review_agent.publishing import (
+    PUBLICATION_RECHECK_DELAYS_SECONDS,
     PublicationConsistencyError,
     PublicationDisposition,
     PublicationReceipt,
+    PublicationUnknownError,
     publish_review_result,
     render_review_comment,
 )
@@ -94,6 +104,142 @@ class FailingUpdateGateway(ScriptedCommentGateway):
         raise RuntimeError(message)
 
 
+class AmbiguousCreateGateway(ScriptedCommentGateway):
+    def __init__(self, *, reconciled_comment: Callable[[], ReviewComment]) -> None:
+        super().__init__()
+        self._reconciled_comment = reconciled_comment
+
+    def list_review_comments(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        comments = super().list_review_comments(
+            repository=repository,
+            pr_number=pr_number,
+            installation_id=installation_id,
+        )
+        if self.listed > 1:
+            return (self._reconciled_comment(),)
+        return comments
+
+    def create_review_comment(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> ReviewComment:
+        del repository, pr_number, installation_id
+        self.created.append(body)
+        raise GitHubMutationError(GitHubOperation.REVIEW_COMMENT_CREATE)
+
+
+class AmbiguousUpdateGateway(ScriptedCommentGateway):
+    def __init__(self, *, stale: ReviewComment, reconciled: ReviewComment) -> None:
+        super().__init__(comments=(stale,))
+        self._reconciled = reconciled
+
+    def list_review_comments(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        comments = super().list_review_comments(
+            repository=repository,
+            pr_number=pr_number,
+            installation_id=installation_id,
+        )
+        return (self._reconciled,) if self.listed > 1 else comments
+
+    def update_review_comment(
+        self,
+        *,
+        repository: str,
+        comment_id: int,
+        installation_id: int,
+        body: str,
+    ) -> ReviewComment:
+        del repository, installation_id
+        self.updated.append((comment_id, body))
+        raise GitHubMutationError(GitHubOperation.REVIEW_COMMENT_UPDATE)
+
+
+class UnconfirmedCreateGateway(ScriptedCommentGateway):
+    def create_review_comment(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> ReviewComment:
+        del repository, pr_number, installation_id
+        self.created.append(body)
+        raise GitHubMutationError(GitHubOperation.REVIEW_COMMENT_CREATE)
+
+
+class DuplicateAfterCreateGateway(UnconfirmedCreateGateway):
+    def __init__(self, *, duplicates: tuple[ReviewComment, ...]) -> None:
+        super().__init__()
+        self._duplicates = duplicates
+
+    def list_review_comments(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        comments = super().list_review_comments(
+            repository=repository,
+            pr_number=pr_number,
+            installation_id=installation_id,
+        )
+        return self._duplicates if self.listed > 1 else comments
+
+
+class IncompleteRecheckGateway(UnconfirmedCreateGateway):
+    def list_review_comments(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        comments = super().list_review_comments(
+            repository=repository,
+            pr_number=pr_number,
+            installation_id=installation_id,
+        )
+        if self.listed > 1:
+            raise GitHubError(GitHubOperation.REVIEW_COMMENT_LIST)
+        return comments
+
+
+class RateLimitedCreateGateway(AmbiguousCreateGateway):
+    def create_review_comment(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+        body: str,
+    ) -> ReviewComment:
+        del repository, pr_number, installation_id
+        self.created.append(body)
+        raise GitHubMutationError(
+            GitHubOperation.REVIEW_COMMENT_CREATE,
+            status_code=429,
+            retry_after_seconds=7.0,
+        )
+
+
 def _request(**updates: object) -> ReviewRequest:
     return ReviewRequest(
         repository="Octo-Org/Example",
@@ -150,6 +296,188 @@ def test_missing_or_deleted_revision_comment_is_recreated_with_the_marker() -> N
         comment_id=101,
         disposition=PublicationDisposition.CREATED,
     )
+
+
+def test_ambiguous_create_is_reconciled_when_a_recheck_confirms_the_comment() -> None:
+    gateway = AmbiguousCreateGateway(
+        reconciled_comment=lambda: ReviewComment(
+            id=102,
+            body=_expected_body(),
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        )
+    )
+
+    receipt = publish_review_result(
+        request=_request(),
+        result=_result(),
+        gateway=gateway,
+        sleeper=lambda _delay: None,
+    )
+
+    assert gateway.listed == 2
+    assert gateway.created == [_expected_body()]
+    assert gateway.updated == []
+    assert receipt == PublicationReceipt(
+        comment_id=102,
+        disposition=PublicationDisposition.RECONCILED,
+    )
+
+
+def test_ambiguous_update_is_reconciled_without_issuing_another_mutation() -> None:
+    stale = ReviewComment(
+        id=103,
+        body=_expected_body(),
+        performed_via_github_app=ReviewCommentApp(id=12345),
+    )
+    gateway = AmbiguousUpdateGateway(
+        stale=stale,
+        reconciled=stale.model_copy(update={"body": _expected_body(_findings_result())}),
+    )
+
+    receipt = publish_review_result(
+        request=_request(),
+        result=_findings_result(),
+        gateway=gateway,
+        sleeper=lambda _delay: None,
+    )
+
+    assert gateway.listed == 2
+    assert gateway.created == []
+    assert gateway.updated == [(103, _expected_body(_findings_result()))]
+    assert receipt == PublicationReceipt(
+        comment_id=103,
+        disposition=PublicationDisposition.RECONCILED,
+    )
+
+
+def test_ambiguous_create_with_no_match_stops_after_fixed_rechecks() -> None:
+    gateway = UnconfirmedCreateGateway()
+    sleeps: list[float] = []
+
+    with pytest.raises(PublicationUnknownError):
+        publish_review_result(
+            request=_request(),
+            result=_result(),
+            gateway=gateway,
+            sleeper=sleeps.append,
+        )
+
+    assert gateway.listed == 1 + len(PUBLICATION_RECHECK_DELAYS_SECONDS)
+    assert len(gateway.created) == 1
+    assert gateway.updated == []
+    assert sleeps == [delay for delay in PUBLICATION_RECHECK_DELAYS_SECONDS if delay]
+
+
+def test_ambiguous_update_with_only_the_stale_body_remains_unknown() -> None:
+    stale = ReviewComment(
+        id=104,
+        body=_expected_body(),
+        performed_via_github_app=ReviewCommentApp(id=12345),
+    )
+    gateway = AmbiguousUpdateGateway(stale=stale, reconciled=stale)
+
+    with pytest.raises(PublicationUnknownError):
+        publish_review_result(
+            request=_request(),
+            result=_findings_result(),
+            gateway=gateway,
+            sleeper=lambda _delay: None,
+        )
+
+    assert gateway.listed == 1 + len(PUBLICATION_RECHECK_DELAYS_SECONDS)
+    assert gateway.created == []
+    assert gateway.updated == [(104, _expected_body(_findings_result()))]
+
+
+def test_ambiguous_mutation_recheck_with_multiple_matches_is_inconsistent() -> None:
+    duplicates = tuple(
+        ReviewComment(
+            id=comment_id,
+            body=_expected_body(),
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        )
+        for comment_id in (105, 106)
+    )
+    gateway = DuplicateAfterCreateGateway(duplicates=duplicates)
+
+    with pytest.raises(PublicationConsistencyError):
+        publish_review_result(
+            request=_request(),
+            result=_result(),
+            gateway=gateway,
+            sleeper=lambda _delay: None,
+        )
+
+    assert gateway.listed == 2
+    assert len(gateway.created) == 1
+    assert gateway.updated == []
+
+
+def test_ambiguous_mutation_with_an_incomplete_recheck_remains_unknown() -> None:
+    gateway = IncompleteRecheckGateway()
+
+    with pytest.raises(PublicationUnknownError):
+        publish_review_result(
+            request=_request(),
+            result=_result(),
+            gateway=gateway,
+            sleeper=lambda _delay: None,
+        )
+
+    assert gateway.listed == 2
+    assert len(gateway.created) == 1
+    assert gateway.updated == []
+
+
+def test_rate_limit_delay_is_honored_when_it_fits_the_review_deadline() -> None:
+    gateway = RateLimitedCreateGateway(
+        reconciled_comment=lambda: ReviewComment(
+            id=107,
+            body=_expected_body(),
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        )
+    )
+    sleeps: list[float] = []
+
+    receipt = publish_review_result(
+        request=_request(),
+        result=_result(),
+        gateway=gateway,
+        sleeper=sleeps.append,
+        remaining_time=lambda: 8.0,
+    )
+
+    assert sleeps == [7.0]
+    assert gateway.listed == 2
+    assert receipt == PublicationReceipt(
+        comment_id=107,
+        disposition=PublicationDisposition.RECONCILED,
+    )
+
+
+def test_rate_limit_delay_that_cannot_fit_leaves_publication_unknown() -> None:
+    gateway = RateLimitedCreateGateway(
+        reconciled_comment=lambda: ReviewComment(
+            id=108,
+            body=_expected_body(),
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        )
+    )
+    sleeps: list[float] = []
+
+    with pytest.raises(PublicationUnknownError):
+        publish_review_result(
+            request=_request(),
+            result=_result(),
+            gateway=gateway,
+            sleeper=sleeps.append,
+            remaining_time=lambda: 7.0,
+        )
+
+    assert sleeps == []
+    assert gateway.listed == 1
+    assert len(gateway.created) == 1
+    assert gateway.updated == []
 
 
 def test_same_revision_with_the_current_owned_comment_reuses_it_without_a_write() -> None:

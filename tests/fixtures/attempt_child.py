@@ -5,6 +5,7 @@ from review_agent.configuration import AttemptSettings
 from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
+from review_agent.publishing import PublicationUnknownError
 
 
 def _record(event: str) -> None:
@@ -67,6 +68,8 @@ class FixtureServices:
         if self._mode == "publication_failure":
             message = "secret publication exception with token and rendered model comment"
             raise RuntimeError(message)
+        if self._mode == "publication_unknown":
+            raise PublicationUnknownError
 
     def close(self) -> None:
         assert remaining_review_time(stage="fixture_cleanup") is not None

@@ -179,6 +179,14 @@ def test_child_returns_trusted_findings_status_without_finding_text(tmp_path: Pa
             "review_failure",
         ),
         (
+            "publication_unknown",
+            AttemptStatus.FAILED,
+            AttemptPublication.UNKNOWN,
+            None,
+            "publication",
+            "review_failure",
+        ),
+        (
             "cleanup_failure",
             AttemptStatus.FAILED,
             AttemptPublication.PUBLISHED,

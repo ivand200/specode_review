@@ -13,7 +13,7 @@ from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient
 from review_agent.models import ReviewRequest, ReviewResult
-from review_agent.publishing import publish_review_result
+from review_agent.publishing import PublicationUnknownError, publish_review_result
 from review_agent.resources import ReviewResourceManager
 from review_agent.sandbox import CodexSandboxAdapter, DockerSandboxClient
 
@@ -380,6 +380,8 @@ def _execute_configured_attempt(
             publication = AttemptPublication.PUBLISHED
             deadline.remaining(stage=stage)
         except Exception as error:  # noqa: BLE001 - child attempt isolation boundary.
+            if isinstance(error, PublicationUnknownError):
+                publication = AttemptPublication.UNKNOWN
             failure = _failure_details(error, stage=stage)
         finally:
             if services is not None:

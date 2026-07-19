@@ -1,9 +1,17 @@
+import logging
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from unicodedata import category
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from review_agent.deadline import remaining_review_time
+from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import (
+    GitHubError,
+    GitHubMutationError,
     ReviewComment,
     ReviewCommentGateway,
     derive_review_identity,
@@ -11,6 +19,8 @@ from review_agent.github import (
 from review_agent.models import ReviewRequest, ReviewResult
 
 GITHUB_COMMENT_MAX_BYTES = 65_536
+PUBLICATION_RECHECK_DELAYS_SECONDS = (0.0, 0.25, 1.0)
+logger = logging.getLogger(__name__)
 
 
 class PublicationDisposition(StrEnum):
@@ -29,6 +39,26 @@ class PublicationReceipt(BaseModel):
 
 class PublicationConsistencyError(Exception):
     """GitHub comment state cannot be resolved without operator intervention."""
+
+
+class PublicationUnknownError(ReviewError):
+    """A comment mutation may have succeeded but its final state is unconfirmed."""
+
+    def __init__(
+        self,
+        category: FailureCategory = FailureCategory.REVIEW_FAILURE,
+    ) -> None:
+        super().__init__(category, stage="publication")
+
+
+def _publication_remaining_time() -> float | None:
+    return remaining_review_time(stage="publication_reconciliation")
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationTiming:
+    sleeper: Callable[[float], None]
+    remaining_time: Callable[[], float | None]
 
 
 def _longest_backtick_run(value: str) -> int:
@@ -184,16 +214,13 @@ def _confirmed_receipt(
     return PublicationReceipt(comment_id=comment.id, disposition=disposition)
 
 
-def publish_review_result(
+def _owned_marker_matches(
     *,
     request: ReviewRequest,
-    result: ReviewResult,
     gateway: ReviewCommentGateway,
-) -> PublicationReceipt:
-    _validate_publication_input(request, result)
-    expected_body = _expected_review_comment(request, result)
-    marker = _review_marker(request)
-    matches = tuple(
+    marker: str,
+) -> tuple[ReviewComment, ...]:
+    return tuple(
         comment
         for comment in gateway.list_review_comments(
             repository=request.repository,
@@ -206,6 +233,99 @@ def publish_review_result(
             app_id=gateway.app_id,
         )
     )
+
+
+def _reconcile_ambiguous_mutation(
+    *,
+    request: ReviewRequest,
+    gateway: ReviewCommentGateway,
+    expected_body: str,
+    mutation_error: GitHubMutationError,
+    timing: _PublicationTiming,
+) -> PublicationReceipt:
+    review_id = derive_review_identity(request).external_id
+    marker = expected_body.splitlines()[-1]
+    for index, policy_delay in enumerate(PUBLICATION_RECHECK_DELAYS_SECONDS):
+        delay = (
+            max(policy_delay, mutation_error.retry_after_seconds)
+            if index == 0 and mutation_error.retry_after_seconds is not None
+            else policy_delay
+        )
+        if delay:
+            try:
+                remaining = timing.remaining_time()
+            except ReviewError as error:
+                logger.warning(
+                    "comment reconciliation stopped review_id=%s outcome=deadline_exhausted",
+                    review_id,
+                )
+                raise PublicationUnknownError(error.category) from error
+            if remaining is not None and delay >= remaining:
+                logger.warning(
+                    "comment reconciliation stopped review_id=%s outcome=delay_exceeds_deadline",
+                    review_id,
+                )
+                raise PublicationUnknownError from mutation_error
+            timing.sleeper(delay)
+        try:
+            matches = _owned_marker_matches(
+                request=request,
+                gateway=gateway,
+                marker=marker,
+            )
+        except (GitHubError, ReviewError) as error:
+            logger.warning(
+                "comment reconciliation stopped review_id=%s outcome=incomplete_scan",
+                review_id,
+            )
+            category = (
+                error.category
+                if isinstance(error, ReviewError)
+                else FailureCategory.REVIEW_FAILURE
+            )
+            raise PublicationUnknownError(category) from error
+        if len(matches) > 1:
+            logger.warning(
+                "comment reconciliation stopped review_id=%s outcome=multiple_matches",
+                review_id,
+            )
+            message = "multiple application-owned comments match the review revision"
+            raise PublicationConsistencyError(message)
+        if len(matches) == 1 and matches[0].body == expected_body:
+            logger.info(
+                "comment reconciliation confirmed review_id=%s comment_id=%s "
+                "outcome=reconciled",
+                review_id,
+                matches[0].id,
+            )
+            return PublicationReceipt(
+                comment_id=matches[0].id,
+                disposition=PublicationDisposition.RECONCILED,
+            )
+    logger.warning(
+        "comment reconciliation stopped review_id=%s outcome=rechecks_exhausted",
+        review_id,
+    )
+    raise PublicationUnknownError from mutation_error
+
+
+def publish_review_result(
+    *,
+    request: ReviewRequest,
+    result: ReviewResult,
+    gateway: ReviewCommentGateway,
+    sleeper: Callable[[float], None] = time.sleep,
+    remaining_time: Callable[[], float | None] = _publication_remaining_time,
+) -> PublicationReceipt:
+    _validate_publication_input(request, result)
+    timing = _PublicationTiming(sleeper=sleeper, remaining_time=remaining_time)
+    expected_body = _expected_review_comment(request, result)
+    marker = _review_marker(request)
+    matches = _owned_marker_matches(
+        request=request,
+        gateway=gateway,
+        marker=marker,
+    )
     if len(matches) == 1 and matches[0].body == expected_body:
         return PublicationReceipt(
             comment_id=matches[0].id,
@@ -215,24 +335,42 @@ def publish_review_result(
         message = "multiple application-owned comments match the review revision"
         raise PublicationConsistencyError(message)
     if matches:
-        updated = gateway.update_review_comment(
-            repository=request.repository,
-            comment_id=matches[0].id,
-            installation_id=request.installation_id,
-            body=expected_body,
-        )
+        try:
+            updated = gateway.update_review_comment(
+                repository=request.repository,
+                comment_id=matches[0].id,
+                installation_id=request.installation_id,
+                body=expected_body,
+            )
+        except GitHubMutationError as error:
+            return _reconcile_ambiguous_mutation(
+                request=request,
+                gateway=gateway,
+                expected_body=expected_body,
+                mutation_error=error,
+                timing=timing,
+            )
         return _confirmed_receipt(
             updated,
             expected_body=expected_body,
             app_id=gateway.app_id,
             disposition=PublicationDisposition.UPDATED,
         )
-    created = gateway.create_review_comment(
-        repository=request.repository,
-        pr_number=request.pr_number,
-        installation_id=request.installation_id,
-        body=expected_body,
-    )
+    try:
+        created = gateway.create_review_comment(
+            repository=request.repository,
+            pr_number=request.pr_number,
+            installation_id=request.installation_id,
+            body=expected_body,
+        )
+    except GitHubMutationError as error:
+        return _reconcile_ambiguous_mutation(
+            request=request,
+            gateway=gateway,
+            expected_body=expected_body,
+            mutation_error=error,
+            timing=timing,
+        )
     return _confirmed_receipt(
         created,
         expected_body=expected_body,
