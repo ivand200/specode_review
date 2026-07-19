@@ -4,7 +4,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
-LOCAL_HEALTH_URL="http://127.0.0.1:8000/openapi.json"
+LOCAL_HEALTH_URL="http://127.0.0.1:8000/health/ready"
 SERVICE_PID=""
 NGROK_PID=""
 NGROK_PUBLIC_URL=""
@@ -237,7 +237,7 @@ if ! wait_for_ngrok_url "${NGROK_PID}" 30; then
     exit 1
 fi
 
-if ! wait_for_url "${NGROK_PUBLIC_URL}/openapi.json" "${NGROK_PID}" 30 "ngrok tunnel"; then
+if ! wait_for_url "${NGROK_PUBLIC_URL}/health/ready" "${NGROK_PID}" 30 "ngrok tunnel"; then
     exit 1
 fi
 

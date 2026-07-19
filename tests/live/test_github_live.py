@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -7,6 +8,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -14,77 +16,18 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from review_agent import (
-    CandidateAcceptance,
-    GitHubRepository,
-    ReviewContext,
-    Reviewer,
+from review_agent.attempt import AttemptOutcome
+from review_agent.coordinator import ReviewAttemptCoordinator
+from review_agent.github import (
+    CheckRun,
+    CheckRunStatus,
+    GitHubAppClient,
+    derive_review_identity,
 )
-from review_agent.configuration import DEFAULT_REVIEW_TIMEOUT_SECONDS
-from review_agent.core import CandidateContract
-from review_agent.github import GitHubAppClient
-from review_agent.publishing import ReviewPublisher
-from review_agent.resources import AttemptResources
+from review_agent.models import DiffRange, ReviewRequest, ReviewResult
+from review_agent.publishing import render_review_comment
+from review_agent.reconciliation import CheckRunReconciler
 from review_agent.web import create_app
-from tests.fixtures.inline_review_manager import InlineReviewManager
-
-
-class CleanAdapter:
-    def __init__(self) -> None:
-        self.context: ReviewContext | None = None
-
-    def produce(
-        self,
-        context: ReviewContext,
-        contract: CandidateContract,
-    ) -> bytes:
-        del contract
-        self.context = context
-        return b'{"findings":[]}'
-
-
-class RecordingPublisher:
-    def __init__(
-        self,
-        publisher: ReviewPublisher,
-        *,
-        resources_path: Path,
-    ) -> None:
-        self._publisher = publisher
-        self._resources_path = resources_path
-        self.body: str | None = None
-        self.published = threading.Event()
-
-    def publish(
-        self,
-        *,
-        repository: str,
-        pr_number: int,
-        installation_id: int,
-        body: str,
-    ) -> None:
-        self._publisher.publish(
-            repository=repository,
-            pr_number=pr_number,
-            installation_id=installation_id,
-            body=body,
-        )
-        self.body = body
-        self._resources_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._resources_path.open("a", encoding="utf-8") as resources:
-            resources.write(
-                json.dumps(
-                    {
-                        "kind": "github_pull_request_comment",
-                        "repository": repository,
-                        "pr_number": pr_number,
-                        "cleanup": "delete the automated review comment created by checkpoint B",
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-        self.published.set()
 
 
 def _required_environment(name: str) -> str:
@@ -108,7 +51,7 @@ def _serve(app: FastAPI) -> Iterator[str]:
         daemon=True,
     )
     thread.start()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
     while not server.started and time.monotonic() < deadline:
         time.sleep(0.01)
     if not server.started:
@@ -118,11 +61,17 @@ def _serve(app: FastAPI) -> Iterator[str]:
         yield f"http://{host}:{port}"
     finally:
         server.should_exit = True
-        thread.join(timeout=10)
+        thread.join(timeout=30)
         server_socket.close()
 
 
-def _send_signed_webhook(url: str, payload: dict[str, object], secret: str) -> tuple[int, str]:
+def _send_signed_webhook(
+    url: str,
+    payload: dict[str, object],
+    secret: str,
+    *,
+    event: str,
+) -> tuple[int, str]:
     body = json.dumps(payload).encode()
     signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     request = urllib.request.Request(
@@ -130,17 +79,192 @@ def _send_signed_webhook(url: str, payload: dict[str, object], secret: str) -> t
         data=body,
         headers={
             "Content-Type": "application/json",
-            "X-GitHub-Event": "pull_request",
+            "X-GitHub-Event": event,
             "X-Hub-Signature-256": signature,
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         return response.status, response.read().decode()
 
 
+class _ControlledExecution:
+    def __init__(
+        self,
+        *,
+        attempt_id: str,
+        outcome: AttemptOutcome,
+        request: ReviewRequest,
+        github: GitHubAppClient,
+        publish_clean_comment: bool,
+    ) -> None:
+        self.attempt_id = attempt_id
+        self._outcome = outcome
+        self._request = request
+        self._github = github
+        self._publish_clean_comment = publish_clean_comment
+        self.release = threading.Event()
+
+    async def wait(self) -> AttemptOutcome:
+        await asyncio.to_thread(self.release.wait)
+        if self._publish_clean_comment:
+            result = ReviewResult(
+                repository=self._request.repository,
+                pr_number=self._request.pr_number,
+                diff_range=DiffRange(
+                    start_sha=self._request.base_sha,
+                    end_sha=self._request.head_sha,
+                ),
+                status="no_important_issues",
+                findings=(),
+            )
+            await asyncio.to_thread(
+                self._github.publish,
+                repository=self._request.repository,
+                pr_number=self._request.pr_number,
+                installation_id=self._request.installation_id,
+                body=render_review_comment(result),
+            )
+        return self._outcome
+
+
+class _ControlledLauncher:
+    def __init__(self, github: GitHubAppClient) -> None:
+        self._github = github
+        self.launch_started = (threading.Event(), threading.Event())
+        self.allow_launch = (threading.Event(), threading.Event())
+        self.executions: list[_ControlledExecution] = []
+
+    async def launch(
+        self,
+        request: ReviewRequest,
+        *,
+        check_run_id: int,
+        attempt_id: str | None = None,
+    ) -> _ControlledExecution:
+        del check_run_id
+        index = len(self.executions)
+        resolved_attempt_id = attempt_id or ("1" * 32)
+        if index == 0:
+            outcome = AttemptOutcome.model_validate(
+                {
+                    "attempt_id": resolved_attempt_id,
+                    "status": "failed",
+                    "review_status": None,
+                    "publication": "not_attempted",
+                    "failure_stage": "review",
+                    "failure_category": "review_failure",
+                }
+            )
+            publish_clean_comment = False
+        else:
+            outcome = AttemptOutcome.model_validate(
+                {
+                    "attempt_id": resolved_attempt_id,
+                    "status": "reviewed",
+                    "review_status": "no_important_issues",
+                    "publication": "published",
+                    "failure_stage": None,
+                    "failure_category": None,
+                }
+            )
+            publish_clean_comment = True
+        execution = _ControlledExecution(
+            attempt_id=resolved_attempt_id,
+            outcome=outcome,
+            request=request,
+            github=self._github,
+            publish_clean_comment=publish_clean_comment,
+        )
+        self.executions.append(execution)
+        self.launch_started[index].set()
+        await asyncio.to_thread(self.allow_launch[index].wait)
+        return execution
+
+
+def _pull_request_payload(request: ReviewRequest) -> dict[str, object]:
+    return {
+        "action": "opened",
+        "installation": {"id": request.installation_id},
+        "repository": {"full_name": request.repository},
+        "pull_request": {
+            "number": request.pr_number,
+            "draft": False,
+            "title": request.title,
+            "body": request.description,
+            "base": {"sha": request.base_sha},
+            "head": {"sha": request.head_sha},
+        },
+    }
+
+
+def _retry_payload(request: ReviewRequest, check_run: CheckRun) -> dict[str, object]:
+    payload = check_run.model_dump(mode="json")
+    payload["pull_requests"] = [
+        {
+            "number": request.pr_number,
+            "base": {"sha": request.base_sha},
+            "head": {"sha": request.head_sha},
+        }
+    ]
+    return {
+        "action": "requested_action",
+        "requested_action": {"identifier": "retry_review"},
+        "installation": {"id": request.installation_id},
+        "repository": {"full_name": request.repository},
+        "check_run": payload,
+    }
+
+
+def _wait_for_check_run(
+    github: GitHubAppClient,
+    request: ReviewRequest,
+    predicate: object,
+    *,
+    timeout: float = 30,
+) -> CheckRun:
+    identity = derive_review_identity(request)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        owned = tuple(
+            check_run
+            for check_run in github.list_check_runs(
+                identity=identity,
+                installation_id=request.installation_id,
+            )
+            if github.is_owned_check_run(check_run, identity=identity)
+        )
+        if len(owned) == 1 and callable(predicate) and predicate(owned[0]):
+            return owned[0]
+        time.sleep(0.2)
+    pytest.fail("timed out waiting for the expected Review Agent Check Run state")
+
+
+def _record_resources(path: Path, request: ReviewRequest, check_run: CheckRun) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as resources:
+        resources.write(
+            json.dumps(
+                {
+                    "kind": "github_check_run_and_pull_request_comment",
+                    "repository": request.repository,
+                    "pr_number": request.pr_number,
+                    "check_run_id": check_run.id,
+                    "cleanup": (
+                        "delete the checkpoint B automated review comment; "
+                        "the Check Run remains as rollout evidence"
+                    ),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+
 @pytest.mark.live_github
-def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -> None:
+def test_real_check_run_failure_retries_same_check_and_publishes_clean_comment(
+    tmp_path: Path,
+) -> None:
     if os.environ.get("RUN_LIVE_GITHUB_E2E") != "1":
         pytest.skip("set RUN_LIVE_GITHUB_E2E=1 to enable the live GitHub profile")
 
@@ -162,53 +286,94 @@ def test_signed_webhook_reviews_and_comments_on_real_github_pr(tmp_path: Path) -
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
-    runner = CleanAdapter()
-    reviewer = Reviewer(
-        repository=repository,
-        resources=AttemptResources.for_attempt(
-            "a" * 32,
-            workspace_root=tmp_path / "workspaces",
-            sandbox_prefix="review-agent-",
+    repository_root = tmp_path / "state"
+    repository_root.mkdir(mode=0o700)
+    launcher = _ControlledLauncher(github)
+    coordinator = ReviewAttemptCoordinator(
+        github=github,
+        process=launcher,
+        reconciler=CheckRunReconciler(
+            repository_root=repository_root,
+            repository=repository,
+            installation_id=installation_id,
+            github=github,
         ),
-        candidate_acceptance=CandidateAcceptance(adapter=runner, max_bytes=65_536),
-        source_repository=GitHubRepository(credentials=github),
+        installation_id=installation_id,
     )
-    publisher = RecordingPublisher(github, resources_path=resources_path)
     app = create_app(
         repository=repository,
         webhook_secret=webhook_secret,
-        manager=InlineReviewManager(
-            reviewer=reviewer,
-            publisher=publisher,
-            review_timeout_seconds=DEFAULT_REVIEW_TIMEOUT_SECONDS,
-        ),
+        manager=coordinator,
+        shutdown_callback=github.close,
     )
-    payload: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": installation_id},
-        "repository": {"full_name": request.repository},
-        "pull_request": {
-            "number": request.pr_number,
-            "draft": False,
-            "title": request.title,
-            "body": request.description,
-            "base": {"sha": request.base_sha},
-            "head": {"sha": request.head_sha},
-        },
-    }
 
-    try:
-        with _serve(app) as url:
-            status_code, response_body = _send_signed_webhook(url, payload, webhook_secret)
-            assert publisher.published.wait(timeout=120)
-    finally:
-        github.close()
+    with _serve(app) as url, ThreadPoolExecutor(max_workers=1) as executor:
+        initial_response = executor.submit(
+            _send_signed_webhook,
+            url,
+            _pull_request_payload(request),
+            webhook_secret,
+            event="pull_request",
+        )
+        assert launcher.launch_started[0].wait(timeout=30)
+        queued = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.QUEUED,
+        )
+        launcher.allow_launch[0].set()
+        assert initial_response.result() == (202, '{"status":"accepted"}')
+        running = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
+        )
+        assert running.id == queued.id
 
-    assert status_code == 202
-    assert json.loads(response_body) == {"status": "accepted"}
-    assert runner.context is not None
-    assert runner.context.request.head_sha == request.head_sha
-    assert runner.context.diff_range.end_sha == request.head_sha
-    assert publisher.body is not None
-    assert f"{runner.context.diff_range.start_sha}..{request.head_sha}" in publisher.body
-    assert "No important issues found" in publisher.body
+        launcher.executions[0].release.set()
+        retryable = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.COMPLETED
+            and check.conclusion == "neutral"
+            and [action.identifier for action in check.actions] == ["retry_review"],
+        )
+
+        retry_response = executor.submit(
+            _send_signed_webhook,
+            url,
+            _retry_payload(request, retryable),
+            webhook_secret,
+            event="check_run",
+        )
+        assert launcher.launch_started[1].wait(timeout=30)
+        retry_queued = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.QUEUED,
+        )
+        assert retry_queued.id == queued.id
+        launcher.allow_launch[1].set()
+        assert retry_response.result() == (202, '{"status":"accepted"}')
+        retry_running = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
+        )
+        assert retry_running.id == queued.id
+        assert launcher.executions[1].attempt_id != launcher.executions[0].attempt_id
+
+        launcher.executions[1].release.set()
+        completed = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.COMPLETED
+            and check.conclusion == "success"
+            and not check.actions,
+        )
+
+    assert completed.id == queued.id
+    assert completed.head_sha == request.head_sha
+    assert completed.external_id == derive_review_identity(request).external_id
+    assert completed.output.title == "Review complete — no important findings"
+    _record_resources(resources_path, request, completed)

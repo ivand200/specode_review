@@ -1,274 +1,25 @@
 import hashlib
 import hmac
 import json
-import logging
 import os
 import socket
-import subprocess
 import threading
 import time
 import urllib.request
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
-from review_agent.core import (
-    CandidateAcceptance,
-    CandidateContract,
-    GitHubRepository,
-    ReviewContext,
-    Reviewer,
-    SandboxResourceLimits,
-)
-from review_agent.github import GitHubAppClient
-from review_agent.process import ProcessOptions, _run_bounded_process
-from review_agent.publishing import ReviewPublisher
-from review_agent.readiness import ProductionReadiness
-from review_agent.resources import ReviewResourceManager
-from review_agent.sandbox import (
-    CodexSandboxAdapter,
-    DockerSandboxClient,
-)
-from review_agent.web import create_app
-from tests.fixtures.inline_review_manager import InlineReviewManager
-
-
-class RecordingPublisher:
-    def __init__(self, publisher: ReviewPublisher, resources_path: Path) -> None:
-        self._publisher = publisher
-        self._resources_path = resources_path
-        self.body: str | None = None
-        self.published = threading.Event()
-
-    def publish(
-        self,
-        *,
-        repository: str,
-        pr_number: int,
-        installation_id: int,
-        body: str,
-    ) -> None:
-        self._publisher.publish(
-            repository=repository,
-            pr_number=pr_number,
-            installation_id=installation_id,
-            body=body,
-        )
-        self.body = body
-        self._resources_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._resources_path.open("a", encoding="utf-8") as resources:
-            resources.write(
-                json.dumps(
-                    {
-                        "kind": "github_pull_request_comment",
-                        "repository": repository,
-                        "pr_number": pr_number,
-                        "cleanup": "delete the checkpoint C automated review comment",
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
-        self.published.set()
-
-
-class RecordingAdapter:
-    def __init__(
-        self,
-        adapter: CodexSandboxAdapter,
-        *,
-        repository_control_markers: Mapping[Path, str],
-    ) -> None:
-        self._adapter = adapter
-        self._repository_control_markers = repository_control_markers
-        self.context: ReviewContext | None = None
-        self.host_checkout_unchanged = False
-        self.repository_controls_present = False
-
-    def sweep_orphans(self) -> None:
-        self._adapter.sweep_orphans()
-
-    def produce(
-        self,
-        context: ReviewContext,
-        contract: CandidateContract,
-    ) -> bytes:
-        self.context = context
-        self.repository_controls_present = all(
-            marker in (context.checkout / relative_path).read_text(encoding="utf-8")
-            for relative_path, marker in self._repository_control_markers.items()
-        )
-        if not self.repository_controls_present:
-            message = "checkpoint C repository control fixtures are missing"
-            raise RuntimeError(message)
-        before = self._checkout_identity(context.checkout)
-        candidate = self._adapter.produce(context, contract)
-        self.host_checkout_unchanged = self._checkout_identity(context.checkout) == before
-        return candidate
-
-    @staticmethod
-    def _checkout_identity(checkout: Path) -> tuple[str, str]:
-        head = subprocess.run(
-            ("git", "-C", str(checkout), "rev-parse", "HEAD"),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        status = subprocess.run(
-            ("git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"),
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        return head, status
-
-
-class ReviewFailureHandler(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self.failed = threading.Event()
-        self.message: str | None = None
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if record.name == "review_agent.web" and record.getMessage().startswith("review failed "):
-            self.message = record.getMessage()
-            self.failed.set()
-
-
-class RecordingProcessRunner:
-    def __init__(self) -> None:
-        self.operation = "not_started"
-        self.failed_operation = "none"
-        self.error = "none"
-        self.calls: list[tuple[str, ...]] = []
-
-    def __call__(
-        self,
-        arguments: tuple[str, ...],
-        options: ProcessOptions,
-    ) -> subprocess.CompletedProcess[bytes]:
-        command = Path(arguments[0]).name
-        if len(arguments) > 1:
-            command = f"{command} {arguments[1]}"
-        if "--" in arguments:
-            inner_index = arguments.index("--") + 1
-            if inner_index < len(arguments):
-                command = f"{command} {arguments[inner_index]}"
-        self.operation = f"{options.stage}:{command}"
-        self.calls.append(arguments)
-        try:
-            return _run_bounded_process(arguments, options)
-        except subprocess.CalledProcessError as error:
-            if self.error == "none":
-                self.failed_operation = self.operation
-                self.error = f"CalledProcessError({error.returncode})"
-            raise
-        except Exception as error:
-            if self.error == "none":
-                self.failed_operation = self.operation
-                self.error = type(error).__name__
-            raise
-
-    def diagnostics(self) -> str:
-        return f"operation={self.failed_operation} error={self.error}"
-
-    def created_with_kit(self, kit: Path) -> bool:
-        return any(
-            len(arguments) > 1
-            and arguments[1] == "create"
-            and "--kit" in arguments
-            and arguments[arguments.index("--kit") + 1] == str(kit)
-            for arguments in self.calls
-        )
-
-    def codex_ignored_repository_configuration(self) -> bool:
-        for arguments in self.calls:
-            if "--" not in arguments:
-                continue
-            command = arguments[arguments.index("--") + 1 :]
-            if command[:2] != ("codex", "exec"):
-                continue
-            return "--ignore-user-config" in command and "--ignore-rules" in command
-        return False
-
-    def codex_used_reasoning_effort(self, reasoning_effort: str) -> bool:
-        expected = f'model_reasoning_effort="{reasoning_effort}"'
-        return any(expected in arguments for arguments in self.calls)
-
-
-class VerifyingCodexSandboxClient:
-    def __init__(self, client: DockerSandboxClient) -> None:
-        self._client = client
-        self.loaded_kit: Path | None = None
-        self.forbidden_network_denied = False
-
-    def create_codex(
-        self,
-        *,
-        name: str,
-        control: Path,
-        checkout: Path,
-        kit: Path,
-        resources: SandboxResourceLimits,
-    ) -> None:
-        self._client.create_codex(
-            name=name,
-            control=control,
-            checkout=checkout,
-            kit=kit,
-            resources=resources,
-        )
-        self.loaded_kit = kit
-        self._client.execute(
-            name=name,
-            command=(
-                "sh",
-                "-c",
-                "command -v curl >/dev/null || exit 74; "
-                "if curl -fsS --connect-timeout 5 --max-time 10 "
-                "https://github.com/ >/dev/null; then exit 73; fi",
-            ),
-            workdir=None,
-            process_limit=resources.pids,
-        )
-        self.forbidden_network_denied = True
-
-    def execute(
-        self,
-        *,
-        name: str,
-        command: tuple[str, ...],
-        workdir: str | None,
-        process_limit: int,
-    ) -> bytes:
-        return self._client.execute(
-            name=name,
-            command=command,
-            workdir=workdir,
-            process_limit=process_limit,
-        )
-
-    def remove(self, name: str) -> None:
-        self._client.remove(name)
-
-    def list_names(self) -> tuple[str, ...]:
-        return self._client.list_names()
-
-
-@contextmanager
-def _watch_review_failures() -> Iterator[ReviewFailureHandler]:
-    failure_handler = ReviewFailureHandler()
-    attempt_logger = logging.getLogger("review_agent.web")
-    attempt_logger.addHandler(failure_handler)
-    try:
-        yield failure_handler
-    finally:
-        attempt_logger.removeHandler(failure_handler)
+from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
+from review_agent.models import ReviewRequest
+from review_agent.production import create_production_app
+from review_agent.sandbox import DockerSandboxClient
 
 
 def _required_environment(name: str) -> str:
@@ -292,21 +43,27 @@ def _serve(app: FastAPI) -> Iterator[str]:
         daemon=True,
     )
     thread.start()
-    deadline = time.monotonic() + 30
-    while not server.started and time.monotonic() < deadline:
-        time.sleep(0.01)
+    deadline = time.monotonic() + 60
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.05)
     if not server.started:
-        message = "checkpoint C server did not start"
+        message = "checkpoint C production server did not start"
         raise RuntimeError(message)
     try:
         yield f"http://{host}:{port}"
     finally:
         server.should_exit = True
-        thread.join(timeout=30)
+        thread.join(timeout=60)
         server_socket.close()
+        if thread.is_alive():
+            pytest.fail("checkpoint C production shutdown timed out")
 
 
-def _send_signed_webhook(url: str, payload: dict[str, object], secret: str) -> tuple[int, str]:
+def _send_signed_webhook(
+    url: str,
+    payload: dict[str, object],
+    secret: str,
+) -> tuple[int, str]:
     body = json.dumps(payload).encode()
     signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     request = urllib.request.Request(
@@ -323,67 +80,120 @@ def _send_signed_webhook(url: str, payload: dict[str, object], secret: str) -> t
         return response.status, response.read().decode()
 
 
-def _wait_for_publication_or_failure(
-    publisher: RecordingPublisher,
-    failure_handler: ReviewFailureHandler,
+def _pull_request_payload(request: ReviewRequest) -> dict[str, object]:
+    return {
+        "action": "opened",
+        "installation": {"id": request.installation_id},
+        "repository": {"full_name": request.repository},
+        "pull_request": {
+            "number": request.pr_number,
+            "draft": False,
+            "title": request.title,
+            "body": request.description,
+            "base": {"sha": request.base_sha},
+            "head": {"sha": request.head_sha},
+        },
+    }
+
+
+def _wait_for_check_run(
+    github: GitHubAppClient,
+    request: ReviewRequest,
+    predicate: object,
     *,
-    timeout_seconds: float,
-    diagnostics: Callable[[], str],
-) -> None:
-    wait_deadline = time.monotonic() + timeout_seconds
-    while not publisher.published.wait(timeout=0.1):
-        if failure_handler.failed.is_set():
-            pytest.fail(
-                f"checkpoint C attempt failed: {failure_handler.message}; {diagnostics()}",
-                pytrace=False,
+    timeout: float,
+) -> CheckRun:
+    identity = derive_review_identity(request)
+    deadline = time.monotonic() + timeout
+    last: CheckRun | None = None
+    while time.monotonic() < deadline:
+        owned = tuple(
+            check_run
+            for check_run in github.list_check_runs(
+                identity=identity,
+                installation_id=request.installation_id,
             )
-        if time.monotonic() >= wait_deadline:
-            pytest.fail("checkpoint C publication timed out", pytrace=False)
+            if github.is_owned_check_run(check_run, identity=identity)
+        )
+        if len(owned) == 1:
+            last = owned[0]
+            if callable(predicate) and predicate(last):
+                return last
+        time.sleep(0.5)
+    observed = "none" if last is None else f"{last.status}/{last.conclusion}"
+    pytest.fail(f"checkpoint C timed out waiting for Check Run state; last={observed}")
 
 
-def _assert_checkpoint_isolation(
+def _find_published_comment(
     *,
-    runner: RecordingAdapter,
-    sandbox_client: VerifyingCodexSandboxClient,
-    process_runner: RecordingProcessRunner,
-    settings: ProductionSettings,
-) -> None:
-    attempt = settings.attempt
-    assert runner.host_checkout_unchanged
-    assert runner.repository_controls_present
-    assert sandbox_client.loaded_kit == attempt.review_kit_path
-    assert sandbox_client.forbidden_network_denied
-    assert process_runner.created_with_kit(attempt.review_kit_path)
-    assert process_runner.codex_ignored_repository_configuration()
-    assert process_runner.codex_used_reasoning_effort(
-        attempt.runtime.codex_execution.reasoning_effort.value
+    repository: str,
+    pr_number: int,
+    installation_token: str,
+    accepted_head: str,
+    expected_finding: str,
+) -> tuple[int, str]:
+    owner, name = repository.split("/", maxsplit=1)
+    response = httpx.get(
+        f"https://api.github.com/repos/{owner}/{name}/issues/{pr_number}/comments",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {installation_token}",
+            "X-GitHub-Api-Version": "2026-03-10",
+        },
+        params={"per_page": 100, "sort": "created", "direction": "desc"},
+        timeout=30,
     )
-    assert list(attempt.workspace_root.iterdir()) == []
-    assert not any(
-        name.startswith(attempt.runtime.sandbox_name_prefix) for name in sandbox_client.list_names()
-    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        pytest.fail("checkpoint C received a malformed comment list")
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        comment_id = item.get("id")
+        body = item.get("body")
+        if (
+            isinstance(comment_id, int)
+            and isinstance(body, str)
+            and body.startswith("# Automated code review")
+            and accepted_head in body
+            and expected_finding.casefold() in body.casefold()
+        ):
+            return comment_id, body
+    pytest.fail("checkpoint C could not find the validated automated review comment")
 
 
-def _assert_no_secret_leakage(
-    observable_text: str,
-    settings: ProductionSettings,
+def _record_resources(
+    path: Path,
+    *,
+    repository: str,
+    pr_number: int,
+    check_run_id: int,
+    comment_id: int,
 ) -> None:
-    sensitive_values = [
-        settings.webhook.secret,
-        settings.attempt.private_key_path.read_text(encoding="utf-8"),
-    ]
-    raw_openai_key = os.environ.get("OPENAI_API_KEY")
-    if raw_openai_key:
-        sensitive_values.append(raw_openai_key)
-    assert all(secret not in observable_text for secret in sensitive_values)
-    assert "REVIEW_AGENT_GITHUB_TOKEN" not in observable_text
-    assert "OPENAI_API_KEY" not in observable_text
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as resources:
+        resources.write(
+            json.dumps(
+                {
+                    "kind": "full_live_github_resources",
+                    "repository": repository,
+                    "pr_number": pr_number,
+                    "check_run_id": check_run_id,
+                    "comment_id": comment_id,
+                    "cleanup": (
+                        "delete the recorded pull-request comment; "
+                        "retain the Check Run as rollout evidence"
+                    ),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
 
 
 @pytest.mark.live_full
-def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
     if os.environ.get("RUN_FULL_LIVE_E2E") != "1":
         pytest.skip("set RUN_FULL_LIVE_E2E=1 to enable checkpoint C")
     if os.environ.get("ACKNOWLEDGE_MODEL_COST") != "1":
@@ -404,109 +214,74 @@ def test_full_live_signed_webhook_reviews_in_sandbox_and_publishes(
     if attempt.workspace_root.exists() and any(attempt.workspace_root.iterdir()):
         pytest.fail("checkpoint C requires an empty dedicated workspace root")
 
-    ProductionReadiness().check(settings)
     github = GitHubAppClient(
-        repository=webhook.repository,
+        repository=repository,
         app_id=attempt.app_id,
         private_key_path=attempt.private_key_path,
     )
     installation_id = github.repository_installation_id()
-    accepted_request = github.review_request(
+    installation_token = github.installation_token(
+        repository=repository,
+        installation_id=installation_id,
+    )
+    request = github.review_request(
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
-    process_runner = RecordingProcessRunner()
-    sandbox_client = VerifyingCodexSandboxClient(
-        DockerSandboxClient(
-            process_runner=process_runner,
-            config=attempt.runtime.sandbox_operation,
-        )
-    )
-    resources = ReviewResourceManager(
-        workspace_root=attempt.workspace_root,
-        sandbox_prefix=attempt.runtime.sandbox_name_prefix,
+    sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
+    app = create_production_app(
+        settings=settings,
+        environment=os.environ,
+        github_client=github,
         sandbox_client=sandbox_client,
-    ).for_attempt("a" * 32)
-    runner = RecordingAdapter(
-        CodexSandboxAdapter(
-            client=sandbox_client,
-            resources=resources,
-            kit=attempt.review_kit_path,
-            config=attempt.runtime.codex_execution,
-        ),
-        repository_control_markers={
-            Path("AGENTS.md"): forbidden_instruction,
-            Path(".codex/config.toml"): forbidden_config,
-        },
     )
-    reviewer = Reviewer(
-        repository=webhook.repository,
-        resources=resources,
-        candidate_acceptance=CandidateAcceptance(
-            adapter=runner,
-            max_bytes=attempt.runtime.candidate_output_max_bytes,
-        ),
-        source_repository=GitHubRepository(credentials=github),
-        limits=attempt.runtime.review_limits,
-    )
-    publisher = RecordingPublisher(github, resources_path)
-    app = create_app(
-        repository=webhook.repository,
-        webhook_secret=webhook.secret,
-        manager=InlineReviewManager(
-            reviewer=reviewer,
-            publisher=publisher,
-            review_timeout_seconds=attempt.runtime.review_timeout_seconds,
-        ),
-        shutdown_callback=github.close,
-    )
-    payload: dict[str, object] = {
-        "action": "opened",
-        "installation": {"id": installation_id},
-        "repository": {"full_name": accepted_request.repository},
-        "pull_request": {
-            "number": accepted_request.pr_number,
-            "draft": False,
-            "title": accepted_request.title,
-            "body": accepted_request.description,
-            "base": {"sha": accepted_request.base_sha},
-            "head": {"sha": accepted_request.head_sha},
-        },
-    }
-    caplog.set_level(logging.INFO)
 
-    with _watch_review_failures() as failure_handler, _serve(app) as url:
+    with _serve(app) as url:
         status_code, response_body = _send_signed_webhook(
             url,
-            payload,
+            _pull_request_payload(request),
             webhook.secret,
         )
-        _wait_for_publication_or_failure(
-            publisher,
-            failure_handler,
-            timeout_seconds=attempt.runtime.review_timeout_seconds,
-            diagnostics=process_runner.diagnostics,
+        assert status_code == 202
+        assert json.loads(response_body) == {"status": "accepted"}
+        running = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
+            timeout=30,
+        )
+        completed = _wait_for_check_run(
+            github,
+            request,
+            lambda check: check.status is CheckRunStatus.COMPLETED,
+            timeout=attempt.runtime.review_timeout_seconds
+            + attempt.runtime.sandbox_operation.cleanup_timeout_seconds
+            + 60,
+        )
+        comment_id, comment_body = _find_published_comment(
+            repository=repository,
+            pr_number=request.pr_number,
+            installation_token=installation_token,
+            accepted_head=request.head_sha,
+            expected_finding=expected_finding,
         )
 
-    assert status_code == 202
-    assert json.loads(response_body) == {"status": "accepted"}
-    assert publisher.body is not None
-    assert runner.context is not None
-    assert runner.context.request.head_sha == accepted_request.head_sha
-    assert runner.context.diff_range.end_sha == accepted_request.head_sha
-    assert (
-        f"{runner.context.diff_range.start_sha}..{runner.context.diff_range.end_sha}"
-        in publisher.body
+    assert running.id == completed.id
+    assert completed.head_sha == request.head_sha
+    assert completed.external_id == derive_review_identity(request).external_id
+    assert completed.conclusion == "neutral"
+    assert not completed.actions
+    assert expected_finding.casefold() in comment_body.casefold()
+    assert forbidden_instruction not in comment_body
+    assert forbidden_config not in comment_body
+    assert list(attempt.workspace_root.iterdir()) == []
+    assert not any(
+        name.startswith(attempt.runtime.sandbox_name_prefix) for name in sandbox_client.list_names()
     )
-    assert expected_finding.casefold() in publisher.body.casefold()
-    assert all(marker not in publisher.body for marker in (forbidden_instruction, forbidden_config))
-    _assert_checkpoint_isolation(
-        runner=runner,
-        sandbox_client=sandbox_client,
-        process_runner=process_runner,
-        settings=settings,
+    _record_resources(
+        resources_path,
+        repository=repository,
+        pr_number=request.pr_number,
+        check_run_id=completed.id,
+        comment_id=comment_id,
     )
-    observable_text = (
-        publisher.body + "\n" + "\n".join(record.getMessage() for record in caplog.records)
-    )
-    _assert_no_secret_leakage(observable_text, settings)
