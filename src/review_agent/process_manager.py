@@ -33,6 +33,7 @@ _MAX_CONCURRENT_REVIEWS = 10
 class SubmissionOutcome(Enum):
     ACCEPTED = auto()
     ALREADY_RUNNING = auto()
+    ALREADY_REVIEWED = auto()
     AT_CAPACITY = auto()
     STOPPING = auto()
     UNAVAILABLE = auto()
@@ -63,6 +64,48 @@ class _RunningOutcomeAttempt:
     process: asyncio.subprocess.Process
     reader: asyncio.Task[bytes]
     hard_deadline: float
+
+
+class AttemptExecution(Protocol):
+    attempt_id: str
+
+    async def wait(self) -> AttemptOutcome: ...
+
+
+class AttemptLaunchError(RuntimeError):
+    """A normalized failed launch that still identifies the attempted execution."""
+
+    def __init__(self, outcome: AttemptOutcome) -> None:
+        self.outcome = outcome
+        super().__init__("review attempt launch failed")
+
+
+@dataclass(slots=True)
+class _ProcessAttemptExecution:
+    attempt_id: str
+    running: _RunningOutcomeAttempt
+    manager: "ReviewProcessManager"
+    _waited: bool = False
+
+    async def wait(self) -> AttemptOutcome:
+        if self._waited:
+            message = "review attempt result can only be consumed once"
+            raise RuntimeError(message)
+        self._waited = True
+        outcome = await self.manager._consume_outcome_attempt(  # noqa: SLF001
+            self.running,
+            attempt_id=self.attempt_id,
+        )
+        cleanup_succeeded = await self.manager._cleanup(self.attempt_id)  # noqa: SLF001
+        if not cleanup_succeeded and outcome.status is AttemptStatus.REVIEWED:
+            return _normalized_incomplete_outcome(
+                self.attempt_id,
+                stage="cleanup",
+                category=FailureCategory.REVIEW_FAILURE,
+                publication=AttemptPublication.PUBLISHED,
+                review_status=outcome.review_status,
+            )
+        return outcome
 
 
 class ReviewProcessManager:
@@ -214,6 +257,19 @@ class ReviewProcessManager:
         check_run_id: int,
     ) -> AttemptOutcome:
         """Execute one Check Run attempt and return only its normalized result."""
+        try:
+            execution = await self.launch(request, check_run_id=check_run_id)
+        except AttemptLaunchError as error:
+            return error.outcome
+        return await execution.wait()
+
+    async def launch(
+        self,
+        request: ReviewRequest,
+        *,
+        check_run_id: int,
+    ) -> AttemptExecution:
+        """Launch one Check Run attempt, returning after its command is accepted."""
         attempt_id = uuid.uuid4().hex
         hard_deadline = (
             asyncio.get_running_loop().time()
@@ -227,23 +283,19 @@ class ReviewProcessManager:
             hard_deadline=hard_deadline,
         )
         if running is None:
-            return _normalized_incomplete_outcome(
-                attempt_id,
-                stage="launch",
-                category=FailureCategory.REVIEW_FAILURE,
-                publication=AttemptPublication.NOT_ATTEMPTED,
+            raise AttemptLaunchError(
+                _normalized_incomplete_outcome(
+                    attempt_id,
+                    stage="launch",
+                    category=FailureCategory.REVIEW_FAILURE,
+                    publication=AttemptPublication.NOT_ATTEMPTED,
+                )
             )
-        outcome = await self._consume_outcome_attempt(running, attempt_id=attempt_id)
-        cleanup_succeeded = await self._cleanup(attempt_id)
-        if not cleanup_succeeded and outcome.status is AttemptStatus.REVIEWED:
-            return _normalized_incomplete_outcome(
-                attempt_id,
-                stage="cleanup",
-                category=FailureCategory.REVIEW_FAILURE,
-                publication=AttemptPublication.PUBLISHED,
-                review_status=outcome.review_status,
-            )
-        return outcome
+        return _ProcessAttemptExecution(
+            attempt_id=attempt_id,
+            running=running,
+            manager=self,
+        )
 
     async def _launch_outcome_attempt(
         self,

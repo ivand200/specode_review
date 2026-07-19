@@ -343,16 +343,21 @@ def _render_reviewed_presentation(
             ),
             actions=(),
         )
-    if finding_count is None or not 1 <= finding_count <= MAX_REVIEW_FINDINGS:
+    if finding_count is not None and not 1 <= finding_count <= MAX_REVIEW_FINDINGS:
         message = "findings presentation requires between one and five findings"
         raise ValueError(message)
+    finding_summary = (
+        "advisory findings"
+        if finding_count is None
+        else f"{finding_count} advisory finding(s)"
+    )
     return CheckRunPresentation(
         status=CheckRunStatus.COMPLETED,
         conclusion=CheckRunConclusion.NEUTRAL,
         output=CheckRunOutput(
             title="Review complete — findings published",
             summary=(
-                f"Review Agent published {finding_count} advisory finding(s) for "
+                f"Review Agent published {finding_summary} for "
                 "accepted range "
                 f"{accepted_range} in the pull request comment."
             ),
