@@ -18,7 +18,7 @@ from review_agent.coordinator import (
 from review_agent.github import GitHubAppClient, GitHubError
 from review_agent.models import ReviewRequest
 from review_agent.ownership import RepositoryOwnership, RepositoryOwnershipError
-from review_agent.process_manager import ReviewProcessManager, SubmissionOutcome
+from review_agent.process_manager import ReviewProcessManager
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
 from review_agent.reconciliation import (
     CheckRunReconciler,
@@ -28,6 +28,7 @@ from review_agent.reconciliation import (
 )
 from review_agent.resources import ReviewResourceManager, SandboxResourceClient
 from review_agent.sandbox import DockerSandboxClient
+from review_agent.submission import SubmissionOutcome
 from review_agent.web import create_app
 
 

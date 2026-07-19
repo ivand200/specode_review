@@ -26,13 +26,14 @@ from review_agent.github import (
     derive_review_identity,
 )
 from review_agent.models import ReviewRequest
-from review_agent.process_manager import AttemptLaunchError, SubmissionOutcome
+from review_agent.process_manager import AttemptLaunchError
 from review_agent.reconciliation import (
     CheckRunReconciler,
     DesiredCheckRun,
     ReconciliationStateError,
     ReconciliationTiming,
 )
+from review_agent.submission import SubmissionOutcome
 
 
 def _request(**overrides: object) -> ReviewRequest:

@@ -3,8 +3,8 @@ from typing import Protocol, Self
 
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.models import ReviewRequest, ReviewResult
-from review_agent.process_manager import SubmissionOutcome
 from review_agent.publishing import ReviewPublisher, publish_review_result
+from review_agent.submission import SubmissionOutcome
 
 
 class ReviewService(Protocol):

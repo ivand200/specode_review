@@ -15,9 +15,9 @@ from review_agent.configuration import (
     ReasoningEffort,
 )
 from review_agent.models import ReviewRequest
-from review_agent.process_manager import SubmissionOutcome
 from review_agent.production import create_production_app
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
+from review_agent.submission import SubmissionOutcome
 from review_agent.web import create_app
 
 

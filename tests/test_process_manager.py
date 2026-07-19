@@ -11,8 +11,9 @@ import pytest
 from review_agent.attempt import AttemptCommand, AttemptPublication, AttemptStatus
 from review_agent.configuration import AttemptSettings
 from review_agent.models import ReviewRequest
-from review_agent.process_manager import ReviewProcessManager, SubmissionOutcome
+from review_agent.process_manager import ReviewProcessManager
 from review_agent.resources import WORKSPACE_PREFIX, ReviewResourceManager
+from review_agent.submission import SubmissionOutcome
 
 
 class RecordingSandboxResources:

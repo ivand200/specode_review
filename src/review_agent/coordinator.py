@@ -26,9 +26,9 @@ from review_agent.models import ReviewRequest
 from review_agent.process_manager import (
     AttemptExecution,
     AttemptLaunchError,
-    SubmissionOutcome,
 )
 from review_agent.reconciliation import DesiredCheckRun, ReconciliationStateError
+from review_agent.submission import SubmissionOutcome
 
 _MAX_CONCURRENT_REVIEWS = 10
 

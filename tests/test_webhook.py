@@ -24,8 +24,8 @@ from review_agent.github import (
     ReviewIdentity,
 )
 from review_agent.models import ReviewRequest
-from review_agent.process_manager import SubmissionOutcome
 from review_agent.reconciliation import DesiredCheckRun
+from review_agent.submission import SubmissionOutcome
 from review_agent.web import create_app
 
 

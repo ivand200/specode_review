@@ -23,33 +23,12 @@ from review_agent.configuration import AttemptSettings
 from review_agent.errors import FailureCategory
 from review_agent.models import ReviewRequest
 from review_agent.resources import ReviewResourceManager
+from review_agent.submission import SubmissionOutcome
 
 logger = logging.getLogger(__name__)
 
 type _ActiveReviewKey = tuple[str, int, str, str]
 _MAX_CONCURRENT_REVIEWS = 10
-
-
-class SubmissionOutcome(Enum):
-    ACCEPTED = auto()
-    ALREADY_RUNNING = auto()
-    ALREADY_REVIEWED = auto()
-    AT_CAPACITY = auto()
-    STOPPING = auto()
-    UNAVAILABLE = auto()
-
-
-class ReviewExecutionManager(Protocol):
-    async def __aenter__(self) -> Self: ...
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None: ...
-
-    async def start(self, request: ReviewRequest) -> SubmissionOutcome: ...
 
 
 class _Lifecycle(Enum):

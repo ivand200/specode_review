@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from review_agent.coordinator import RetryReviewRequest
 from review_agent.github import CHECK_RUN_NAME, CheckRun, ReviewIdentity
 from review_agent.models import ReviewRequest, bound_description
-from review_agent.process_manager import ReviewExecutionManager, SubmissionOutcome
+from review_agent.submission import ReviewSubmissionManager, SubmissionOutcome
 
 _MAX_WEBHOOK_BODY_BYTES = 256 * 1024
 
@@ -212,7 +212,7 @@ async def _accept_github_webhook(
     *,
     repository: str,
     webhook_secret: str,
-    manager: ReviewExecutionManager,
+    manager: ReviewSubmissionManager,
 ) -> JSONResponse:
     body = await _read_bounded_body(request)
     expected = (
@@ -263,7 +263,7 @@ def create_app(
     *,
     repository: str,
     webhook_secret: str,
-    manager: ReviewExecutionManager,
+    manager: ReviewSubmissionManager,
     startup_check: Callable[[], None] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
