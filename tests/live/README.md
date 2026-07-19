@@ -3,7 +3,14 @@
 All live profiles are opt-in and must target a disposable, open, non-draft pull request in a
 dedicated repository whose name contains `test`. Normal `pytest` runs skip them. Use a fresh
 accepted base/head revision: durable Check Run identity intentionally makes a repeated completed
-run return `already_reviewed`.
+run return `already_reviewed`. Before either profile starts its service or creates any external
+resource, it derives that deterministic review identity and requires both:
+
+- zero application-owned Check Runs for the accepted revision; and
+- zero exact-marker review comments performed by the configured numeric GitHub App ID.
+
+If either exists, stop and manually prepare a new accepted SHA on the disposable PR. The profiles
+do not create commits, move branches, delete old evidence, or repair a polluted fixture.
 
 ## Checkpoint B: real GitHub lifecycle without a model
 
@@ -35,6 +42,10 @@ E2E_GITHUB_PR_NUMBER=<number> \
 E2E_CREATED_RESOURCES_PATH=/tmp/review-agent-live-resources.jsonl \
 uv run pytest tests/live/test_github_live.py -q -s
 ```
+
+Use a manually prepared fresh accepted SHA for this invocation. The preflight runs before the HTTP
+service and controlled launcher exist, so polluted evidence fails without a Check Run/comment
+write or resource-record append.
 
 The resource file records the Check Run ID, final comment ID, PR number, and cleanup instruction.
 Delete the recorded automated review comment manually. GitHub Check Runs cannot be deleted through
@@ -74,6 +85,9 @@ Prepare the disposable PR with one known important defect plus malicious reposit
 Check Run is attached to the accepted head, observes in-progress and completed states, expects an
 advisory neutral conclusion for findings, fetches the published comment through GitHub, validates
 the expected finding and absence of both malicious markers, and proves owned resources are gone.
+Prepare a manually fresh accepted SHA immediately before the run. Its freshness preflight occurs
+before installation-token reuse, production service assembly, Docker Sandbox creation, or model
+cost.
 
 ```bash
 set -a

@@ -214,12 +214,12 @@ def _confirmed_receipt(
     return PublicationReceipt(comment_id=comment.id, disposition=disposition)
 
 
-def _owned_marker_matches(
+def owned_revision_comments(
     *,
     request: ReviewRequest,
     gateway: ReviewCommentGateway,
-    marker: str,
 ) -> tuple[ReviewComment, ...]:
+    marker = _review_marker(request)
     return tuple(
         comment
         for comment in gateway.list_review_comments(
@@ -244,7 +244,6 @@ def _reconcile_ambiguous_mutation(
     timing: _PublicationTiming,
 ) -> PublicationReceipt:
     review_id = derive_review_identity(request).external_id
-    marker = expected_body.splitlines()[-1]
     for index, policy_delay in enumerate(PUBLICATION_RECHECK_DELAYS_SECONDS):
         delay = (
             max(policy_delay, mutation_error.retry_after_seconds)
@@ -268,10 +267,9 @@ def _reconcile_ambiguous_mutation(
                 raise PublicationUnknownError from mutation_error
             timing.sleeper(delay)
         try:
-            matches = _owned_marker_matches(
+            matches = owned_revision_comments(
                 request=request,
                 gateway=gateway,
-                marker=marker,
             )
         except (GitHubError, ReviewError) as error:
             logger.warning(
@@ -320,11 +318,9 @@ def publish_review_result(
     _validate_publication_input(request, result)
     timing = _PublicationTiming(sleeper=sleeper, remaining_time=remaining_time)
     expected_body = _expected_review_comment(request, result)
-    marker = _review_marker(request)
-    matches = _owned_marker_matches(
+    matches = owned_revision_comments(
         request=request,
         gateway=gateway,
-        marker=marker,
     )
     if len(matches) == 1 and matches[0].body == expected_body:
         return PublicationReceipt(

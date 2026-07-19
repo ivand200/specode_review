@@ -26,6 +26,7 @@ from review_agent.github import (
     GitHubAppClient,
     derive_review_identity,
 )
+from review_agent.live import require_fresh_live_review
 from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
 from review_agent.publishing import (
     PublicationDisposition,
@@ -328,6 +329,13 @@ def _wait_for_check_run(
     pytest.fail("timed out waiting for the expected Review Agent Check Run state")
 
 
+def _fresh_review_request(github: GitHubAppClient, *, pr_number: int) -> ReviewRequest:
+    installation_id = github.repository_installation_id()
+    request = github.review_request(pr_number=pr_number, installation_id=installation_id)
+    require_fresh_live_review(request=request, github=github)
+    return request
+
+
 def _record_resources(
     path: Path,
     request: ReviewRequest,
@@ -376,11 +384,11 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
         app_id=int(_required_environment("GITHUB_APP_ID")),
         private_key_path=Path(_required_environment("GITHUB_PRIVATE_KEY_PATH")),
     )
-    installation_id = github.repository_installation_id()
-    request = github.review_request(
+    request = _fresh_review_request(
+        github,
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
-        installation_id=installation_id,
     )
+    installation_id = request.installation_id
     repository_root = tmp_path / "state"
     repository_root.mkdir(mode=0o700)
     launcher = _ControlledLauncher(github)

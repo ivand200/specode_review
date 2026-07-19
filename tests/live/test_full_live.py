@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
 from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
+from review_agent.live import require_fresh_live_review
 from review_agent.models import ReviewRequest
 from review_agent.production import create_production_app
 from review_agent.sandbox import DockerSandboxClient
@@ -220,12 +221,13 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
         private_key_path=attempt.private_key_path,
     )
     installation_id = github.repository_installation_id()
-    installation_token = github.installation_token(
-        repository=repository,
-        installation_id=installation_id,
-    )
     request = github.review_request(
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
+        installation_id=installation_id,
+    )
+    require_fresh_live_review(request=request, github=github)
+    installation_token = github.installation_token(
+        repository=repository,
         installation_id=installation_id,
     )
     sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
