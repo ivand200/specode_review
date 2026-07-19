@@ -53,6 +53,8 @@ def test_production_settings_accept_the_complete_bounded_configuration(
     tmp_path: Path,
 ) -> None:
     environment = _valid_environment(tmp_path)
+    environment["RECONCILIATION_INTERVAL_SECONDS"] = "2.5"
+    environment["SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS"] = "45"
 
     settings = ProductionSettings.from_environment(environment)
 
@@ -75,6 +77,32 @@ def test_production_settings_accept_the_complete_bounded_configuration(
     assert settings.attempt.runtime.sandbox_operation.cleanup_timeout_seconds == 30
     assert settings.attempt.runtime.sandbox_operation.deny_network is True
     assert settings.attempt.runtime.sandbox_name_prefix == "review-agent-"
+    assert settings.reconciliation.periodic_interval_seconds == 2.5
+    assert settings.reconciliation.shutdown_timeout_seconds == 45
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RECONCILIATION_INTERVAL_SECONDS", ""),
+        ("RECONCILIATION_INTERVAL_SECONDS", "not-a-number"),
+        ("RECONCILIATION_INTERVAL_SECONDS", "0"),
+        ("SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS", "-1"),
+    ],
+)
+def test_production_settings_reject_invalid_reconciliation_timing(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    environment = _valid_environment(tmp_path)
+    environment[name] = value
+
+    with pytest.raises(ConfigurationError, match=name) as failure:
+        ProductionSettings.from_environment(environment)
+
+    if value:
+        assert value not in str(failure.value)
 
 
 def test_production_settings_expose_immutable_webhook_and_attempt_views(
@@ -516,13 +544,18 @@ class RejectingReadiness:
         raise StartupReadinessError(stage)
 
 
-def test_production_factory_fails_closed_before_constructing_runtime_dependencies(
+def test_production_lifespan_fails_closed_before_constructing_runtime_dependencies(
     tmp_path: Path,
 ) -> None:
     settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    app = create_production_app(settings=settings, readiness=RejectingReadiness())
+
+    async def enter_lifespan() -> None:
+        async with app.router.lifespan_context(app):
+            pytest.fail("rejected readiness entered the production lifespan")
 
     with pytest.raises(StartupReadinessError, match="sandbox_host_capability"):
-        create_production_app(settings=settings, readiness=RejectingReadiness())
+        asyncio.run(enter_lifespan())
 
 
 def test_example_environment_does_not_claim_unsupported_model_or_tool_limits() -> None:

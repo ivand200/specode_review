@@ -9,6 +9,8 @@ from typing import NoReturn
 DEFAULT_SANDBOX_NAME_PREFIX = "review-agent-"
 DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_RECONCILIATION_INTERVAL_SECONDS = 1.0
+DEFAULT_SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS = 30.0
 CANDIDATE_OUTPUT_MAX_BYTES = 65_536
 PROCESS_OUTPUT_MAX_BYTES = 1_048_576
 PINNED_SBX_VERSION = "0.35.0"
@@ -214,6 +216,12 @@ class WebhookSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ReconciliationSettings:
+    periodic_interval_seconds: float
+    shutdown_timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class PersistentStateSettings:
     root: Path
     repository_root: Path
@@ -362,6 +370,7 @@ class ProductionSettings:
     webhook: WebhookSettings
     attempt: AttemptSettings
     state: PersistentStateSettings
+    reconciliation: ReconciliationSettings
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "ProductionSettings":
@@ -400,5 +409,17 @@ class ProductionSettings:
             state=PersistentStateSettings.for_repository(
                 root=state_root,
                 repository=repository,
+            ),
+            reconciliation=ReconciliationSettings(
+                periodic_interval_seconds=_positive_float(
+                    environment,
+                    "RECONCILIATION_INTERVAL_SECONDS",
+                    default=DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
+                ),
+                shutdown_timeout_seconds=_positive_float(
+                    environment,
+                    "SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS",
+                    default=DEFAULT_SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS,
+                ),
             ),
         )
