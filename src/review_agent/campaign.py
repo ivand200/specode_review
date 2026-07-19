@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from review_agent.configuration import PROCESS_OUTPUT_MAX_BYTES
 from review_agent.fixtures import (
+    CampaignFixture,
     CampaignFixtures,
     CreatedFixtureReference,
     FixtureOperations,
@@ -24,6 +25,7 @@ from review_agent.fixtures import (
     prepare_campaign_fixtures,
     subprocess_fixture_operations,
 )
+from review_agent.models import Sha
 from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
 
 _CAMPAIGN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,31}$")
@@ -118,6 +120,8 @@ class _ProfileResource(BaseModel):
     kind: str
     repository: str
     pr_number: int = Field(gt=0)
+    base_sha: Sha
+    head_sha: Sha
     check_run_id: int = Field(gt=0)
     comment_id: int = Field(gt=0)
 
@@ -139,14 +143,16 @@ def _profile_environment(
     base: Mapping[str, str],
     *,
     repository: str,
-    fixture_number: int,
+    fixture: CampaignFixture,
     resources_path: Path,
 ) -> dict[str, str]:
     environment = dict(base)
     environment.update(
         {
             "E2E_GITHUB_REPOSITORY": repository,
-            "E2E_GITHUB_PR_NUMBER": str(fixture_number),
+            "E2E_GITHUB_PR_NUMBER": str(fixture.number),
+            "E2E_EXPECTED_BASE_SHA": fixture.base_sha,
+            "E2E_EXPECTED_HEAD_SHA": fixture.head_sha,
             "E2E_CREATED_RESOURCES_PATH": str(resources_path),
         }
     )
@@ -158,7 +164,7 @@ def _verified_profile_resource(
     *,
     expected_kind: str,
     repository: str,
-    pr_number: int,
+    fixture: CampaignFixture,
 ) -> CampaignVerifiedResource:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -173,12 +179,41 @@ def _verified_profile_resource(
     if (
         resource.kind != expected_kind
         or resource.repository.casefold() != repository.casefold()
-        or resource.pr_number != pr_number
+        or resource.pr_number != fixture.number
+        or resource.base_sha.casefold() != fixture.base_sha.casefold()
+        or resource.head_sha.casefold() != fixture.head_sha.casefold()
     ):
         raise CampaignEvidenceError
     return CampaignVerifiedResource(
         check_run_id=resource.check_run_id,
         comment_id=resource.comment_id,
+    )
+
+
+def _run_verified_live_profile(  # noqa: PLR0913
+    *,
+    stage: CampaignStage,
+    fixture: CampaignFixture,
+    expected_kind: str,
+    repository: str,
+    base_environment: Mapping[str, str],
+    profile_environment: Mapping[str, str],
+    evidence_directory: Path,
+    operations: CampaignOperations,
+) -> CampaignVerifiedResource:
+    resources_path = evidence_directory / f"{stage.value.replace('_', '-')}-resources.jsonl"
+    environment = _profile_environment(
+        {**base_environment, **profile_environment},
+        repository=repository,
+        fixture=fixture,
+        resources_path=resources_path,
+    )
+    operations.run_stage(stage, environment)
+    return _verified_profile_resource(
+        resources_path,
+        expected_kind=expected_kind,
+        repository=repository,
+        fixture=fixture,
     )
 
 
@@ -384,74 +419,58 @@ def run_truthful_real_e2e_campaign(  # noqa: PLR0913
         CampaignStageOutcome(stage=CampaignStage.FIXTURE_PREPARATION, passed=True)
     )
 
-    checkpoint_b_path = evidence_directory / "checkpoint-b-resources.jsonl"
-    checkpoint_b_environment = _profile_environment(
-        base_environment,
-        repository=resolved_repository,
-        fixture_number=fixtures.checkpoint_b.number,
-        resources_path=checkpoint_b_path,
+    profiles = (
+        (
+            CampaignStage.CHECKPOINT_B,
+            fixtures.checkpoint_b,
+            "github_check_run_and_pull_request_comment",
+            {"RUN_LIVE_GITHUB_E2E": "1"},
+        ),
+        (
+            CampaignStage.CHECKPOINT_C,
+            fixtures.checkpoint_c,
+            "full_live_github_resources",
+            {
+                "RUN_FULL_LIVE_E2E": "1",
+                "ACKNOWLEDGE_MODEL_COST": "1",
+                "E2E_EXPECTED_FINDING": fixtures.expected_finding,
+                "E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT": fixtures.instruction_marker,
+                "E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT": fixtures.configuration_marker,
+                "CODEX_MODEL": resolved_model,
+                "STATE_ROOT": str(state_root),
+                "WORKSPACE_ROOT": str(workspace_root),
+                "SANDBOX_NAME_PREFIX": _sandbox_prefix(resolved_campaign_id),
+            },
+        ),
     )
-    checkpoint_b_environment["RUN_LIVE_GITHUB_E2E"] = "1"
-    try:
-        operations.run_stage(CampaignStage.CHECKPOINT_B, checkpoint_b_environment)
-        checkpoint_b = _verified_profile_resource(
-            checkpoint_b_path,
-            expected_kind="github_check_run_and_pull_request_comment",
-            repository=resolved_repository,
-            pr_number=fixtures.checkpoint_b.number,
-        )
-    except Exception:  # noqa: BLE001 - no unverified profile detail enters the summary.
-        return _failed_summary(
-            repository=resolved_repository,
-            campaign_id=resolved_campaign_id,
-            model=resolved_model,
-            evidence_directory=evidence_directory,
-            stages=stages,
-            failed_stage=CampaignStage.CHECKPOINT_B,
-            fixtures=fixtures,
-        )
-    stages.append(CampaignStageOutcome(stage=CampaignStage.CHECKPOINT_B, passed=True))
+    verified_profiles: dict[CampaignStage, CampaignVerifiedResource] = {}
+    for stage, fixture, expected_kind, profile_environment in profiles:
+        try:
+            verified_profiles[stage] = _run_verified_live_profile(
+                stage=stage,
+                fixture=fixture,
+                expected_kind=expected_kind,
+                repository=resolved_repository,
+                base_environment=base_environment,
+                profile_environment=profile_environment,
+                evidence_directory=evidence_directory,
+                operations=operations,
+            )
+        except Exception:  # noqa: BLE001 - no unverified profile detail enters the summary.
+            return _failed_summary(
+                repository=resolved_repository,
+                campaign_id=resolved_campaign_id,
+                model=resolved_model,
+                evidence_directory=evidence_directory,
+                stages=stages,
+                failed_stage=stage,
+                fixtures=fixtures,
+                checkpoint_b=verified_profiles.get(CampaignStage.CHECKPOINT_B),
+            )
+        stages.append(CampaignStageOutcome(stage=stage, passed=True))
 
-    checkpoint_c_path = evidence_directory / "checkpoint-c-resources.jsonl"
-    checkpoint_c_environment = _profile_environment(
-        base_environment,
-        repository=resolved_repository,
-        fixture_number=fixtures.checkpoint_c.number,
-        resources_path=checkpoint_c_path,
-    )
-    checkpoint_c_environment.update(
-        {
-            "RUN_FULL_LIVE_E2E": "1",
-            "ACKNOWLEDGE_MODEL_COST": "1",
-            "E2E_EXPECTED_FINDING": fixtures.expected_finding,
-            "E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT": fixtures.instruction_marker,
-            "E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT": fixtures.configuration_marker,
-            "CODEX_MODEL": resolved_model,
-            "STATE_ROOT": str(state_root),
-            "WORKSPACE_ROOT": str(workspace_root),
-            "SANDBOX_NAME_PREFIX": _sandbox_prefix(resolved_campaign_id),
-        }
-    )
-    try:
-        operations.run_stage(CampaignStage.CHECKPOINT_C, checkpoint_c_environment)
-        checkpoint_c = _verified_profile_resource(
-            checkpoint_c_path,
-            expected_kind="full_live_github_resources",
-            repository=resolved_repository,
-            pr_number=fixtures.checkpoint_c.number,
-        )
-    except Exception:  # noqa: BLE001 - no unverified profile detail enters the summary.
-        return _failed_summary(
-            repository=resolved_repository,
-            campaign_id=resolved_campaign_id,
-            model=resolved_model,
-            evidence_directory=evidence_directory,
-            stages=stages,
-            failed_stage=CampaignStage.CHECKPOINT_C,
-            fixtures=fixtures,
-            checkpoint_b=checkpoint_b,
-        )
-    stages.append(CampaignStageOutcome(stage=CampaignStage.CHECKPOINT_C, passed=True))
+    checkpoint_b = verified_profiles[CampaignStage.CHECKPOINT_B]
+    checkpoint_c = verified_profiles[CampaignStage.CHECKPOINT_C]
 
     summary = CampaignSummary(
         succeeded=True,

@@ -59,6 +59,7 @@ def _fixtures() -> CampaignFixtures:
 class ControlledCampaign:
     effects: list[tuple[object, ...]] = field(default_factory=list)
     fail_stage: CampaignStage | None = None
+    mismatched_evidence_stage: CampaignStage | None = None
 
     def run_stage(
         self,
@@ -77,6 +78,12 @@ class ControlledCampaign:
                         "kind": "github_check_run_and_pull_request_comment",
                         "repository": REPOSITORY,
                         "pr_number": 101,
+                        "base_sha": BASE_SHA,
+                        "head_sha": (
+                            "d" * 40
+                            if self.mismatched_evidence_stage is CampaignStage.CHECKPOINT_B
+                            else B_HEAD_SHA
+                        ),
                         "check_run_id": 501,
                         "comment_id": 601,
                     }
@@ -91,6 +98,12 @@ class ControlledCampaign:
                         "kind": "full_live_github_resources",
                         "repository": REPOSITORY,
                         "pr_number": 102,
+                        "base_sha": BASE_SHA,
+                        "head_sha": (
+                            "d" * 40
+                            if self.mismatched_evidence_stage is CampaignStage.CHECKPOINT_C
+                            else C_HEAD_SHA
+                        ),
                         "check_run_id": 502,
                         "comment_id": 602,
                     }
@@ -195,8 +208,18 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
         if effect[0] == "stage"
     }
     assert stage_environments[CampaignStage.CHECKPOINT_B]["E2E_GITHUB_PR_NUMBER"] == "101"
+    assert (
+        stage_environments[CampaignStage.CHECKPOINT_B]["E2E_EXPECTED_BASE_SHA"]
+        == BASE_SHA
+    )
+    assert (
+        stage_environments[CampaignStage.CHECKPOINT_B]["E2E_EXPECTED_HEAD_SHA"]
+        == B_HEAD_SHA
+    )
     checkpoint_c_environment = stage_environments[CampaignStage.CHECKPOINT_C]
     assert checkpoint_c_environment["E2E_GITHUB_PR_NUMBER"] == "102"
+    assert checkpoint_c_environment["E2E_EXPECTED_BASE_SHA"] == BASE_SHA
+    assert checkpoint_c_environment["E2E_EXPECTED_HEAD_SHA"] == C_HEAD_SHA
     assert checkpoint_c_environment["CODEX_MODEL"] == "configured-model"
     assert checkpoint_c_environment["ACKNOWLEDGE_MODEL_COST"] == "1"
     assert Path(checkpoint_c_environment["STATE_ROOT"]).is_relative_to(
@@ -271,6 +294,38 @@ def test_campaign_stops_at_first_failure_without_promoting_unverified_evidence(
     assert "sensitive" not in persisted
     assert "subprocess" not in persisted
     assert "model output" not in persisted
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [CampaignStage.CHECKPOINT_B, CampaignStage.CHECKPOINT_C],
+)
+def test_campaign_rejects_profile_evidence_for_a_different_revision(
+    tmp_path: Path,
+    stage: CampaignStage,
+) -> None:
+    controlled = ControlledCampaign(mismatched_evidence_stage=stage)
+
+    summary = run_truthful_real_e2e_campaign(
+        repository=REPOSITORY,
+        model=None,
+        evidence_root=tmp_path / stage.value,
+        campaign_id=CAMPAIGN_ID,
+        environment={
+            "GITHUB_REPOSITORY": REPOSITORY,
+            "CODEX_MODEL": "configured-model",
+        },
+        project_root=Path.cwd(),
+        operations=CampaignOperations(
+            run_stage=controlled.run_stage,
+            prepare_fixtures=controlled.prepare,
+        ),
+    )
+
+    assert not summary.succeeded
+    assert summary.failed_stage is stage
+    assert (summary.checkpoint_b is not None) == (stage is CampaignStage.CHECKPOINT_C)
+    assert summary.checkpoint_c is None
 
 
 def test_explicit_model_override_is_scoped_to_checkpoint_c(tmp_path: Path) -> None:

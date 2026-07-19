@@ -27,7 +27,14 @@ from review_agent.github import (
     derive_review_identity,
 )
 from review_agent.live import require_fresh_live_review
-from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
+from review_agent.models import (
+    AcceptedRevision,
+    DiffRange,
+    Finding,
+    Location,
+    ReviewRequest,
+    ReviewResult,
+)
 from review_agent.publishing import (
     PublicationDisposition,
     PublicationReceipt,
@@ -340,10 +347,26 @@ def _wait_for_check_run(
     pytest.fail("timed out waiting for the expected Review Agent Check Run state")
 
 
-def _fresh_review_request(github: GitHubAppClient, *, pr_number: int) -> ReviewRequest:
+def _fresh_review_request(
+    github: GitHubAppClient,
+    *,
+    repository: str,
+    pr_number: int,
+    expected_base_sha: str,
+    expected_head_sha: str,
+) -> ReviewRequest:
     installation_id = github.repository_installation_id()
     request = github.review_request(pr_number=pr_number, installation_id=installation_id)
-    require_fresh_live_review(request=request, github=github)
+    require_fresh_live_review(
+        request=request,
+        github=github,
+        expected=AcceptedRevision(
+            repository=repository,
+            pr_number=pr_number,
+            base_sha=expected_base_sha,
+            head_sha=expected_head_sha,
+        ),
+    )
     return request
 
 
@@ -362,6 +385,8 @@ def _record_resources(
                     "kind": "github_check_run_and_pull_request_comment",
                     "repository": request.repository,
                     "pr_number": request.pr_number,
+                    "base_sha": request.base_sha,
+                    "head_sha": request.head_sha,
                     "check_run_id": check_run.id,
                     "comment_id": comment_id,
                     "cleanup": (
@@ -397,7 +422,10 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     )
     request = _fresh_review_request(
         github,
+        repository=repository,
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
+        expected_base_sha=_required_environment("E2E_EXPECTED_BASE_SHA"),
+        expected_head_sha=_required_environment("E2E_EXPECTED_HEAD_SHA"),
     )
     installation_id = request.installation_id
     repository_root = tmp_path / "state"

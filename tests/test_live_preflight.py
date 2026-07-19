@@ -10,7 +10,7 @@ from review_agent.github import (
     derive_review_identity,
 )
 from review_agent.live import LiveProfilePreconditionError, require_fresh_live_review
-from review_agent.models import ReviewRequest
+from review_agent.models import AcceptedRevision, ReviewRequest
 
 
 def _request() -> ReviewRequest:
@@ -22,6 +22,15 @@ def _request() -> ReviewRequest:
         head_sha="b" * 40,
         title="Fresh live fixture",
         description="",
+    )
+
+
+def _expected_identity(request: ReviewRequest) -> AcceptedRevision:
+    return AcceptedRevision(
+        repository=request.repository,
+        pr_number=request.pr_number,
+        base_sha=request.base_sha,
+        head_sha=request.head_sha,
     )
 
 
@@ -99,7 +108,11 @@ def test_existing_owned_check_run_rejects_live_fixture_before_comment_scan() -> 
         LiveProfilePreconditionError,
         match="manually prepare a fresh accepted base/head revision",
     ):
-        require_fresh_live_review(request=request, github=gateway)
+        require_fresh_live_review(
+            request=request,
+            github=gateway,
+            expected=_expected_identity(request),
+        )
 
     assert gateway.calls == ["list_check_runs", "is_owned_check_run"]
 
@@ -121,7 +134,11 @@ def test_existing_exact_marker_app_comment_rejects_live_fixture() -> None:
         LiveProfilePreconditionError,
         match="manually prepare a fresh accepted base/head revision",
     ):
-        require_fresh_live_review(request=request, github=gateway)
+        require_fresh_live_review(
+            request=request,
+            github=gateway,
+            expected=_expected_identity(request),
+        )
 
     assert gateway.calls == ["list_check_runs", "list_review_comments"]
 
@@ -150,6 +167,36 @@ def test_foreign_and_unrelated_comments_do_not_pollute_live_fixture() -> None:
         )
     )
 
-    require_fresh_live_review(request=request, github=gateway)
+    require_fresh_live_review(
+        request=request,
+        github=gateway,
+        expected=_expected_identity(request),
+    )
 
     assert gateway.calls == ["list_check_runs", "list_review_comments"]
+
+
+@pytest.mark.parametrize(
+    ("field", "unexpected"),
+    [
+        ("repository", "octo-org/other"),
+        ("pr_number", 18),
+        ("base_sha", "c" * 40),
+        ("head_sha", "d" * 40),
+    ],
+)
+def test_moved_or_substituted_fixture_is_rejected_before_freshness_reads(
+    field: str,
+    unexpected: object,
+) -> None:
+    request = _request()
+    gateway = FreshnessGateway()
+    expected = _expected_identity(request).model_copy(update={field: unexpected})
+
+    with pytest.raises(
+        LiveProfilePreconditionError,
+        match="does not match the prepared accepted revision",
+    ):
+        require_fresh_live_review(request=request, github=gateway, expected=expected)
+
+    assert gateway.calls == []

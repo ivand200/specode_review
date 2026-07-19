@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from review_agent.configuration import ProductionSettings
 from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
 from review_agent.live import require_fresh_live_review, verify_live_review_evidence
-from review_agent.models import ReviewRequest
+from review_agent.models import AcceptedRevision, ReviewRequest
 from review_agent.production import create_production_app
 from review_agent.sandbox import DockerSandboxClient
 
@@ -126,9 +126,8 @@ def _wait_for_check_run(
 
 def _record_resources(
     path: Path,
+    request: ReviewRequest,
     *,
-    repository: str,
-    pr_number: int,
     check_run_id: int,
     comment_id: int,
 ) -> None:
@@ -138,8 +137,10 @@ def _record_resources(
             json.dumps(
                 {
                     "kind": "full_live_github_resources",
-                    "repository": repository,
-                    "pr_number": pr_number,
+                    "repository": request.repository,
+                    "pr_number": request.pr_number,
+                    "base_sha": request.base_sha,
+                    "head_sha": request.head_sha,
                     "check_run_id": check_run_id,
                     "comment_id": comment_id,
                     "cleanup": (
@@ -176,8 +177,7 @@ def _finish_checkpoint_c(  # noqa: PLR0913
     assert not any(name.startswith(sandbox_name_prefix) for name in sandbox_client.list_names())
     _record_resources(
         resources_path,
-        repository=request.repository,
-        pr_number=request.pr_number,
+        request,
         check_run_id=evidence.check_run_id,
         comment_id=evidence.comment_id,
     )
@@ -215,7 +215,16 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
-    require_fresh_live_review(request=request, github=github)
+    require_fresh_live_review(
+        request=request,
+        github=github,
+        expected=AcceptedRevision(
+            repository=repository,
+            pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
+            base_sha=_required_environment("E2E_EXPECTED_BASE_SHA"),
+            head_sha=_required_environment("E2E_EXPECTED_HEAD_SHA"),
+        ),
+    )
     sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
     app = create_production_app(
         settings=settings,

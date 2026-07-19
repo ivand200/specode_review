@@ -77,18 +77,22 @@ set +a
 RUN_LIVE_GITHUB_E2E=1 \
 E2E_GITHUB_REPOSITORY=ivand200/test_repo \
 E2E_GITHUB_PR_NUMBER=<number> \
+E2E_EXPECTED_BASE_SHA=<prepared-base-sha> \
+E2E_EXPECTED_HEAD_SHA=<prepared-head-sha> \
 E2E_CREATED_RESOURCES_PATH=/tmp/review-agent-live-resources.jsonl \
 uv run pytest tests/live/test_github_live.py -q -s
 ```
 
-Use a manually prepared fresh accepted SHA for this invocation. The preflight runs before the HTTP
-service and controlled launcher exist, so polluted evidence fails without a Check Run/comment
-write or resource-record append.
+Use the exact base and head SHAs returned when manually preparing the fresh accepted revision. The
+preflight rereads the pull request and requires that immutable identity before checking freshness.
+It runs before the HTTP service and controlled launcher exist, so a moved or polluted fixture fails
+without a Check Run/comment write or resource-record append.
 
-The resource file records the Check Run ID, final comment ID, PR number, and cleanup instruction.
-Delete the recorded automated review comment manually. GitHub Check Runs cannot be deleted through
-this profile; retain it as rollout evidence. After interruption, inspect both the PR and its checks
-because GitHub writes can succeed before the local cleanup record is appended.
+The resource file records the accepted base/head SHAs, Check Run ID, final comment ID, PR number,
+and cleanup instruction. Delete the recorded automated review comment manually. GitHub Check Runs
+cannot be deleted through this profile; retain it as rollout evidence. After interruption, inspect
+both the PR and its checks because GitHub writes can succeed before the local cleanup record is
+appended.
 
 The live harness cannot safely and deterministically make GitHub accept a comment mutation while
 hiding only its response. Ambiguous create/update reconciliation is therefore covered by the
@@ -145,6 +149,8 @@ RUN_FULL_LIVE_E2E=1 \
 ACKNOWLEDGE_MODEL_COST=1 \
 E2E_GITHUB_REPOSITORY=ivand200/test_repo \
 E2E_GITHUB_PR_NUMBER=<number> \
+E2E_EXPECTED_BASE_SHA=<prepared-base-sha> \
+E2E_EXPECTED_HEAD_SHA=<prepared-head-sha> \
 E2E_EXPECTED_FINDING=<stable-defect-fragment> \
 E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT=<malicious-output-marker> \
 E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT=<malicious-config-marker> \
