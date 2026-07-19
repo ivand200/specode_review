@@ -9,9 +9,12 @@ run return `already_reviewed`.
 
 This profile starts the HTTP service on a real socket and sends signed webhooks through the public
 interface. A controlled child first fails, allowing the test to verify a real neutral Check Run
-and its `Retry review` action. It then sends a signed `check_run.requested_action`, verifies queued
+with the exact `Review incomplete — technical failure` title. The retry button remains part of the
+write presentation; the subsequent read is intentionally actionless, matching GitHub's response
+contract. The profile then sends a real-shaped signed `check_run.requested_action`, verifies queued
 and running states, and a fresh attempt ID on the same Check Run. The successful controlled retry
-then exercises the public publication interface against GitHub:
+requires the exact `Review complete — no important findings` title, then exercises the public
+publication interface against GitHub:
 
 1. create the exact-revision clean comment;
 2. replace that complete comment with a findings result while retaining its comment ID;

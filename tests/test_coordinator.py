@@ -56,7 +56,7 @@ def _check_run(
     check_run_id: int = 101,
     status: CheckRunStatus = CheckRunStatus.QUEUED,
     conclusion: CheckRunConclusion | None = None,
-    retryable: bool = False,
+    title: str | None = None,
 ) -> CheckRun:
     return CheckRun.model_validate(
         {
@@ -67,18 +67,10 @@ def _check_run(
             "status": status,
             "conclusion": conclusion,
             "app": {"id": 12345},
-            "output": {"title": "Review queued", "summary": "Queued."},
-            "actions": (
-                [
-                    {
-                        "label": "Retry review",
-                        "description": "Retry this incomplete advisory review.",
-                        "identifier": "retry_review",
-                    }
-                ]
-                if retryable
-                else []
-            ),
+            "output": {
+                "title": title or "Review queued",
+                "summary": "Queued.",
+            },
         }
     )
 
@@ -91,6 +83,7 @@ class _GitHub:
         self.create_error = False
         self.get_error = False
         self.get_calls = 0
+        self.read_check_run: CheckRun | None = None
         self.review_request_error = False
         self.updates: list[CheckRunPresentation] = []
         self.review_request_value = _request()
@@ -138,6 +131,8 @@ class _GitHub:
         self.get_calls += 1
         if self.get_error:
             raise GitHubError(GitHubOperation.CHECK_RUN_READ)
+        if self.read_check_run is not None:
+            return self.read_check_run
         return next(check_run for check_run in self.check_runs if check_run.id == check_run_id)
 
     def review_request(self, *, pr_number: int, installation_id: int) -> ReviewRequest:
@@ -872,7 +867,15 @@ def test_concurrent_duplicate_submissions_cross_lookup_create_boundary_once() ->
     asyncio.run(exercise())
 
 
-def test_retry_reuses_incomplete_check_run_with_fresh_attempt_id() -> None:
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Review incomplete — technical failure",
+        "Review incomplete — timeout",
+        "Review incomplete — publication unknown",
+    ],
+)
+def test_retry_reuses_incomplete_check_run_with_fresh_attempt_id(title: str) -> None:
     async def exercise() -> None:
         request = _request()
         identity = derive_review_identity(request)
@@ -880,7 +883,7 @@ def test_retry_reuses_incomplete_check_run_with_fresh_attempt_id() -> None:
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title=title,
         )
         github = _GitHub()
         github.check_runs = [incomplete]
@@ -930,7 +933,7 @@ def test_retry_replay_uses_current_check_run_state_to_prevent_duplicate_work() -
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         github = _GitHub()
         process = _Process(github, _Attempt(_outcome()))
@@ -947,17 +950,34 @@ def test_retry_replay_uses_current_check_run_state_to_prevent_duplicate_work() -
         )
 
         async with coordinator:
+            github.check_runs = [_check_run(identity)]
+            assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_RUNNING
+
             github.check_runs = [_check_run(identity, status=CheckRunStatus.IN_PROGRESS)]
             assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_RUNNING
 
-            github.check_runs = [
+            for reviewed in (
                 _check_run(
                     identity,
                     status=CheckRunStatus.COMPLETED,
                     conclusion=CheckRunConclusion.SUCCESS,
-                )
-            ]
-            assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_REVIEWED
+                    title="Review complete — no important findings",
+                ),
+                _check_run(
+                    identity,
+                    status=CheckRunStatus.COMPLETED,
+                    conclusion=CheckRunConclusion.NEUTRAL,
+                    title="Review complete — findings published",
+                ),
+                _check_run(
+                    identity,
+                    status=CheckRunStatus.COMPLETED,
+                    conclusion=CheckRunConclusion.NEUTRAL,
+                    title="Review incomplete — another application",
+                ),
+            ):
+                github.check_runs = [reviewed]
+                assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_REVIEWED
 
         assert process.launches == 0
 
@@ -972,7 +992,7 @@ def test_retry_rejects_unowned_event_and_stale_review_revision_without_launch() 
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         unowned = owned.model_copy(update={"name": "Another App"})
         github = _GitHub()
@@ -1008,6 +1028,31 @@ def test_retry_rejects_unowned_event_and_stale_review_revision_without_launch() 
             )
             assert github.get_calls == 0
 
+            github.read_check_run = owned.model_copy(update={"id": 102})
+            assert (
+                await coordinator.retry(
+                    RetryReviewRequest(
+                        installation_id=request.installation_id,
+                        identity=identity,
+                        check_run=owned,
+                    )
+                )
+                is SubmissionOutcome.ALREADY_REVIEWED
+            )
+            github.read_check_run = owned.model_copy(
+                update={"app": owned.app.model_copy(update={"id": 999})}
+            )
+            assert (
+                await coordinator.retry(
+                    RetryReviewRequest(
+                        installation_id=request.installation_id,
+                        identity=identity,
+                        check_run=owned,
+                    )
+                )
+                is SubmissionOutcome.ALREADY_REVIEWED
+            )
+            github.read_check_run = None
             github.review_request_value = _request(head_sha="c" * 40)
             assert (
                 await coordinator.retry(
@@ -1033,7 +1078,7 @@ def test_retry_unavailability_and_capacity_do_not_change_check_run() -> None:
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         github = _GitHub()
         github.check_runs = [incomplete]
@@ -1067,8 +1112,13 @@ def test_retry_unavailability_and_capacity_do_not_change_check_run() -> None:
                 is SubmissionOutcome.ACCEPTED
             )
             github.check_runs = [incomplete]
-            assert await coordinator.retry(retry) is SubmissionOutcome.AT_CAPACITY
+            github.review_request_value = _request(head_sha="c" * 40)
+            stale_outcome = await coordinator.retry(retry)
+            github.review_request_value = request
+            capacity_outcome = await coordinator.retry(retry)
             active.release.set()
+            assert stale_outcome is SubmissionOutcome.ALREADY_REVIEWED
+            assert capacity_outcome is SubmissionOutcome.AT_CAPACITY
 
         assert [state.output_kind.value for state in reconciler.desired] == [
             "running",
@@ -1086,7 +1136,7 @@ def test_retry_launch_failure_restores_retryable_terminal_state_and_capacity() -
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         failed = _outcome(
             attempt_id="4" * 32,
@@ -1148,7 +1198,7 @@ def test_retry_queued_state_failure_does_not_launch_and_releases_capacity() -> N
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         github = _GitHub()
         github.check_runs = [incomplete]
@@ -1189,7 +1239,7 @@ def test_retry_active_state_failure_does_not_launch_and_releases_capacity() -> N
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         github = _GitHub()
         github.check_runs = [incomplete]
@@ -1231,7 +1281,7 @@ def test_retry_running_state_failure_still_consumes_child_and_releases_capacity(
             identity,
             status=CheckRunStatus.COMPLETED,
             conclusion=CheckRunConclusion.NEUTRAL,
-            retryable=True,
+            title="Review incomplete — technical failure",
         )
         github = _GitHub()
         github.check_runs = [incomplete]
@@ -1290,7 +1340,7 @@ def test_single_use_lifecycle_rejects_admission_outside_active_context() -> None
                 identity,
                 status=CheckRunStatus.COMPLETED,
                 conclusion=CheckRunConclusion.NEUTRAL,
-                retryable=True,
+                title="Review incomplete — technical failure",
             ),
         )
         process = _Process(github, _Attempt(_outcome()))

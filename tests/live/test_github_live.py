@@ -431,7 +431,7 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
             request,
             lambda check: check.status is CheckRunStatus.COMPLETED
             and check.conclusion == "neutral"
-            and [action.identifier for action in check.actions] == ["retry_review"],
+            and check.output.title == "Review incomplete — technical failure",
         )
 
         retry_response = executor.submit(
@@ -464,7 +464,7 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
             request,
             lambda check: check.status is CheckRunStatus.COMPLETED
             and check.conclusion == "success"
-            and not check.actions,
+            and check.output.title == "Review complete — no important findings",
         )
         receipts = launcher.executions[1].publication_receipts
         marker = f"<!-- {derive_review_identity(request).external_id} -->"

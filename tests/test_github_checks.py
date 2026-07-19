@@ -86,14 +86,10 @@ def _check_run_document(**overrides: object) -> dict[str, object]:
         "status": "completed",
         "conclusion": "neutral",
         "app": {"id": 12345},
-        "output": {"title": "Review incomplete", "summary": "Retry is available."},
-        "actions": [
-            {
-                "label": "Retry review",
-                "description": "Retry this incomplete advisory review.",
-                "identifier": "retry_review",
-            }
-        ],
+        "output": {
+            "title": "Review incomplete — technical failure",
+            "summary": "Retry is available.",
+        },
     }
     values.update(overrides)
     return values
@@ -132,7 +128,7 @@ def test_review_identity_rejects_invalid_external_id() -> None:
         )
 
 
-def test_list_check_runs_uses_bounded_filters_and_parses_requested_actions(
+def test_list_check_runs_uses_bounded_filters_and_parses_actionless_reads(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []
@@ -160,7 +156,7 @@ def test_list_check_runs_uses_bounded_filters_and_parses_requested_actions(
     check_runs = github.list_check_runs(identity=_identity(), installation_id=23)
 
     assert len(requests) == 1
-    assert check_runs[0].actions[0].identifier == "retry_review"
+    assert not hasattr(check_runs[0], "actions")
     assert github.is_owned_check_run(check_runs[0], identity=_identity()) is True
 
 
@@ -432,8 +428,7 @@ def test_oversized_check_run_response_is_rejected_before_json_validation(
     [
         _check_run_document(id="101"),
         _check_run_document(status="waiting"),
-        _check_run_document(actions=[{"identifier": "retry_review"}]),
-        _check_run_document(conclusion="success"),
+        _check_run_document(conclusion=None),
     ],
 )
 def test_check_run_response_rejects_malformed_trusted_fields(

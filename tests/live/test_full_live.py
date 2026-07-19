@@ -270,7 +270,6 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
     assert completed.head_sha == request.head_sha
     assert completed.external_id == derive_review_identity(request).external_id
     assert completed.conclusion == "neutral"
-    assert not completed.actions
     assert expected_finding.casefold() in comment_body.casefold()
     assert forbidden_instruction not in comment_body
     assert forbidden_config not in comment_body

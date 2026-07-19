@@ -282,7 +282,6 @@ class CheckRun(BaseModel):
     conclusion: CheckRunConclusion | None
     app: _CheckRunApp
     output: CheckRunOutput
-    actions: tuple[CheckRunAction, ...] = Field(default=(), max_length=1)
 
     @model_validator(mode="after")
     def status_matches_conclusion(self) -> "CheckRun":
@@ -291,9 +290,6 @@ class CheckRun(BaseModel):
             raise ValueError(message)
         if self.status is not CheckRunStatus.COMPLETED and self.conclusion is not None:
             message = "non-completed Check Runs cannot have a conclusion"
-            raise ValueError(message)
-        if self.actions and self.conclusion is not CheckRunConclusion.NEUTRAL:
-            message = "requested actions require an incomplete neutral conclusion"
             raise ValueError(message)
         return self
 

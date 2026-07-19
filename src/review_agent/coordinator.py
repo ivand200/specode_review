@@ -16,6 +16,7 @@ from review_agent.active_attempts import (
 from review_agent.attempt import AttemptOutcome, AttemptPublication, AttemptStatus
 from review_agent.github import (
     CheckRun,
+    CheckRunConclusion,
     CheckRunOutputKind,
     CheckRunStatus,
     GitHubError,
@@ -31,6 +32,13 @@ from review_agent.reconciliation import DesiredCheckRun, ReconciliationStateErro
 from review_agent.submission import SubmissionOutcome
 
 _MAX_CONCURRENT_REVIEWS = 10
+_RETRYABLE_TITLES = frozenset(
+    {
+        "Review incomplete — technical failure",
+        "Review incomplete — timeout",
+        "Review incomplete — publication unknown",
+    }
+)
 
 
 class RetryReviewRequest(BaseModel):
@@ -348,12 +356,7 @@ class ReviewAttemptCoordinator:
             current_or_outcome = await self._current_retry_check_run(request)
             if isinstance(current_or_outcome, SubmissionOutcome):
                 return current_or_outcome
-            if self._reserved >= self._max_concurrent_reviews:
-                return SubmissionOutcome.AT_CAPACITY
-
             current = current_or_outcome
-            self._reserved += 1
-            self._active_retry_check_runs.add(current.id)
             try:
                 review_request = await asyncio.to_thread(
                     self._github.review_request,
@@ -361,13 +364,14 @@ class ReviewAttemptCoordinator:
                     installation_id=request.installation_id,
                 )
             except GitHubError:
-                self._reserved -= 1
-                self._active_retry_check_runs.discard(current.id)
                 return SubmissionOutcome.UNAVAILABLE
             if derive_review_identity(review_request) != request.identity:
-                self._reserved -= 1
-                self._active_retry_check_runs.discard(current.id)
                 return SubmissionOutcome.ALREADY_REVIEWED
+            if self._reserved >= self._max_concurrent_reviews:
+                return SubmissionOutcome.AT_CAPACITY
+
+            self._reserved += 1
+            self._active_retry_check_runs.add(current.id)
 
             attempt_id = uuid.uuid4().hex
             try:
@@ -551,15 +555,8 @@ def _terminal_desired(
 
 
 def _is_retryable(check_run: CheckRun) -> bool:
-    if (
-        check_run.status is not CheckRunStatus.COMPLETED
-        or check_run.conclusion != "neutral"
-        or len(check_run.actions) != 1
-    ):
-        return False
-    action = check_run.actions[0]
     return (
-        action.label == "Retry review"
-        and action.description == "Retry this incomplete advisory review."
-        and action.identifier == "retry_review"
+        check_run.status is CheckRunStatus.COMPLETED
+        and check_run.conclusion is CheckRunConclusion.NEUTRAL
+        and check_run.output.title in _RETRYABLE_TITLES
     )

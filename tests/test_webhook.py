@@ -102,16 +102,9 @@ def retry_webhook_payload() -> dict[str, object]:
             "conclusion": "neutral",
             "app": {"id": 12345},
             "output": {
-                "title": "Review incomplete",
+                "title": "Review incomplete — technical failure",
                 "summary": "Use Retry review to start a new attempt.",
             },
-            "actions": [
-                {
-                    "label": "Retry review",
-                    "description": "Retry this incomplete advisory review.",
-                    "identifier": "retry_review",
-                }
-            ],
             "pull_requests": [
                 {
                     "number": 17,
@@ -672,19 +665,25 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
                 update = {
                     "status": CheckRunStatus.QUEUED,
                     "conclusion": None,
-                    "actions": (),
+                    "output": self.github.current.output.model_copy(
+                        update={"title": "Review queued"}
+                    ),
                 }
             elif desired.output_kind.value == "running":
                 update = {
                     "status": CheckRunStatus.IN_PROGRESS,
                     "conclusion": None,
-                    "actions": (),
+                    "output": self.github.current.output.model_copy(
+                        update={"title": "Review in progress"}
+                    ),
                 }
             else:
                 update = {
                     "status": CheckRunStatus.COMPLETED,
                     "conclusion": CheckRunConclusion.SUCCESS,
-                    "actions": (),
+                    "output": self.github.current.output.model_copy(
+                        update={"title": "Review complete — no important findings"}
+                    ),
                 }
             self.github.current = self.github.current.model_copy(update=update)
 
@@ -719,7 +718,9 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
             update={
                 "status": CheckRunStatus.COMPLETED,
                 "conclusion": CheckRunConclusion.SUCCESS,
-                "actions": (),
+                "output": current.output.model_copy(
+                    update={"title": "Review complete — no important findings"}
+                ),
             }
         )
         completed_clean = _post_signed_webhook(
@@ -732,7 +733,9 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
             update={
                 "status": CheckRunStatus.COMPLETED,
                 "conclusion": CheckRunConclusion.NEUTRAL,
-                "actions": (),
+                "output": current.output.model_copy(
+                    update={"title": "Review complete — findings published"}
+                ),
             }
         )
         completed_findings = _post_signed_webhook(
