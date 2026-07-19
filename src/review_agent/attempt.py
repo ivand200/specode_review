@@ -176,7 +176,7 @@ class AttemptServices(Protocol):
 
     def review(self, request: ReviewRequest) -> ReviewResult: ...
 
-    def publish(self, result: ReviewResult, *, installation_id: int) -> None: ...
+    def publish(self, request: ReviewRequest, result: ReviewResult) -> None: ...
 
     def close(self) -> None: ...
 
@@ -271,11 +271,11 @@ class _ProductionAttemptServices:
     def review(self, request: ReviewRequest) -> ReviewResult:
         return self._reviewer.review(request)
 
-    def publish(self, result: ReviewResult, *, installation_id: int) -> None:
+    def publish(self, request: ReviewRequest, result: ReviewResult) -> None:
         publish_review_result(
-            result,
-            self._github,
-            installation_id=installation_id,
+            request=request,
+            result=result,
+            gateway=self._github,
         )
 
     def close(self) -> None:
@@ -376,7 +376,7 @@ def _execute_configured_attempt(
             deadline.remaining(stage=stage)
             stage = "publication"
             deadline.remaining(stage=stage)
-            services.publish(result, installation_id=command.request.installation_id)
+            services.publish(command.request, result)
             publication = AttemptPublication.PUBLISHED
             deadline.remaining(stage=stage)
         except Exception as error:  # noqa: BLE001 - child attempt isolation boundary.

@@ -60,8 +60,8 @@ class FixtureServices:
             findings=findings,
         )
 
-    def publish(self, result: ReviewResult, *, installation_id: int) -> None:
-        del result, installation_id
+    def publish(self, request: ReviewRequest, result: ReviewResult) -> None:
+        del request, result
         assert remaining_review_time(stage="fixture_publication") is not None
         _record("publication")
         if self._mode == "publication_failure":

@@ -1,20 +1,34 @@
-from typing import Protocol
+from enum import StrEnum
 from unicodedata import category
 
-from review_agent.models import ReviewResult
+from pydantic import BaseModel, ConfigDict, Field
+
+from review_agent.github import (
+    ReviewComment,
+    ReviewCommentGateway,
+    derive_review_identity,
+)
+from review_agent.models import ReviewRequest, ReviewResult
 
 GITHUB_COMMENT_MAX_BYTES = 65_536
 
 
-class ReviewPublisher(Protocol):
-    def publish(
-        self,
-        *,
-        repository: str,
-        pr_number: int,
-        installation_id: int,
-        body: str,
-    ) -> None: ...
+class PublicationDisposition(StrEnum):
+    CREATED = "created"
+    UPDATED = "updated"
+    ALREADY_CURRENT = "already_current"
+    RECONCILED = "reconciled"
+
+
+class PublicationReceipt(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    comment_id: int = Field(gt=0, strict=True)
+    disposition: PublicationDisposition
+
+
+class PublicationConsistencyError(Exception):
+    """GitHub comment state cannot be resolved without operator intervention."""
 
 
 def _longest_backtick_run(value: str) -> int:
@@ -116,15 +130,112 @@ def render_review_comment(result: ReviewResult) -> str:
     return comment
 
 
-def publish_review_result(
-    result: ReviewResult,
-    publisher: ReviewPublisher,
+def _review_marker(request: ReviewRequest) -> str:
+    identity = derive_review_identity(request)
+    return f"<!-- {identity.external_id} -->"
+
+
+def _expected_review_comment(request: ReviewRequest, result: ReviewResult) -> str:
+    body = f"{render_review_comment(result)}\n{_review_marker(request)}\n"
+    if len(body.encode("utf-8")) >= GITHUB_COMMENT_MAX_BYTES:
+        msg = "valid review rendered above the GitHub comment limit"
+        raise ValueError(msg)
+    return body
+
+
+def _validate_publication_input(request: ReviewRequest, result: ReviewResult) -> None:
+    if (
+        request.repository.lower() != result.repository.lower()
+        or request.pr_number != result.pr_number
+        or request.head_sha.lower() != result.diff_range.end_sha.lower()
+    ):
+        message = "review request and result identities do not match"
+        raise ValueError(message)
+
+
+def _is_owned_marker_comment(
+    comment: ReviewComment,
     *,
-    installation_id: int,
-) -> None:
-    publisher.publish(
-        repository=result.repository,
-        pr_number=result.pr_number,
-        installation_id=installation_id,
-        body=render_review_comment(result),
+    marker: str,
+    app_id: int,
+) -> bool:
+    marker_line = f"\n{marker}\n"
+    return (
+        comment.body.endswith(marker_line)
+        and comment.performed_via_github_app is not None
+        and comment.performed_via_github_app.id == app_id
+    )
+
+
+def _confirmed_receipt(
+    comment: ReviewComment,
+    *,
+    expected_body: str,
+    app_id: int,
+    disposition: PublicationDisposition,
+) -> PublicationReceipt:
+    marker = expected_body.splitlines()[-1]
+    if (
+        comment.body != expected_body
+        or not _is_owned_marker_comment(comment, marker=marker, app_id=app_id)
+    ):
+        message = "GitHub did not confirm the expected application-owned review comment"
+        raise PublicationConsistencyError(message)
+    return PublicationReceipt(comment_id=comment.id, disposition=disposition)
+
+
+def publish_review_result(
+    *,
+    request: ReviewRequest,
+    result: ReviewResult,
+    gateway: ReviewCommentGateway,
+) -> PublicationReceipt:
+    _validate_publication_input(request, result)
+    expected_body = _expected_review_comment(request, result)
+    marker = _review_marker(request)
+    matches = tuple(
+        comment
+        for comment in gateway.list_review_comments(
+            repository=request.repository,
+            pr_number=request.pr_number,
+            installation_id=request.installation_id,
+        )
+        if _is_owned_marker_comment(
+            comment,
+            marker=marker,
+            app_id=gateway.app_id,
+        )
+    )
+    if len(matches) == 1 and matches[0].body == expected_body:
+        return PublicationReceipt(
+            comment_id=matches[0].id,
+            disposition=PublicationDisposition.ALREADY_CURRENT,
+        )
+    if len(matches) > 1:
+        message = "multiple application-owned comments match the review revision"
+        raise PublicationConsistencyError(message)
+    if matches:
+        updated = gateway.update_review_comment(
+            repository=request.repository,
+            comment_id=matches[0].id,
+            installation_id=request.installation_id,
+            body=expected_body,
+        )
+        return _confirmed_receipt(
+            updated,
+            expected_body=expected_body,
+            app_id=gateway.app_id,
+            disposition=PublicationDisposition.UPDATED,
+        )
+    created = gateway.create_review_comment(
+        repository=request.repository,
+        pr_number=request.pr_number,
+        installation_id=request.installation_id,
+        body=expected_body,
+    )
+    return _confirmed_receipt(
+        created,
+        expected_body=expected_body,
+        app_id=gateway.app_id,
+        disposition=PublicationDisposition.CREATED,
     )

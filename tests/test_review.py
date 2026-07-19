@@ -25,6 +25,7 @@ from review_agent import (
 )
 from review_agent.configuration import CANDIDATE_OUTPUT_MAX_BYTES
 from review_agent.core import CandidateContract
+from review_agent.github import ReviewComment, ReviewCommentApp
 from review_agent.resources import AttemptResources
 
 
@@ -248,16 +249,47 @@ class CapturingPublisher:
     def __init__(self) -> None:
         self.comments: list[tuple[str, int, str]] = []
 
-    def publish(
+    @property
+    def app_id(self) -> int:
+        return 12345
+
+    def list_review_comments(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        del repository, pr_number, installation_id
+        return ()
+
+    def create_review_comment(
         self,
         *,
         repository: str,
         pr_number: int,
         installation_id: int,
         body: str,
-    ) -> None:
+    ) -> ReviewComment:
         del installation_id
         self.comments.append((repository, pr_number, body))
+        return ReviewComment(
+            id=len(self.comments),
+            body=body,
+            performed_via_github_app=ReviewCommentApp(id=self.app_id),
+        )
+
+    def update_review_comment(
+        self,
+        *,
+        repository: str,
+        comment_id: int,
+        installation_id: int,
+        body: str,
+    ) -> ReviewComment:
+        del repository, comment_id, installation_id, body
+        message = "unexpected update"
+        raise AssertionError(message)
 
 
 def _finding() -> Finding:
@@ -1160,12 +1192,25 @@ def test_publish_review_result_creates_exactly_one_comment_for_each_success() ->
         update={"status": "issues_found", "findings": (_finding(),)},
     )
 
-    publish_review_result(clean_result, publisher, installation_id=23)
-    assert publisher.comments == [("octo-org/example", 17, render_review_comment(clean_result))]
+    request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="Add feature",
+    )
+
+    publish_review_result(request=request, result=clean_result, gateway=publisher)
+    assert len(publisher.comments) == 1
+    assert publisher.comments[0][:2] == ("octo-org/example", 17)
+    assert publisher.comments[0][2].startswith(render_review_comment(clean_result))
 
     publisher.comments.clear()
-    publish_review_result(findings_result, publisher, installation_id=23)
-    assert publisher.comments == [("octo-org/example", 17, render_review_comment(findings_result))]
+    publish_review_result(request=request, result=findings_result, gateway=publisher)
+    assert len(publisher.comments) == 1
+    assert publisher.comments[0][:2] == ("octo-org/example", 17)
+    assert publisher.comments[0][2].startswith(render_review_comment(findings_result))
 
 
 def test_equivalent_candidate_bytes_preserve_the_published_review(
@@ -1196,7 +1241,7 @@ def test_equivalent_candidate_bytes_preserve_the_published_review(
     publisher = CapturingPublisher()
 
     result = reviewer.review(request)
-    publish_review_result(result, publisher, installation_id=request.installation_id)
+    publish_review_result(request=request, result=result, gateway=publisher)
 
     assert result == ReviewResult(
         repository=request.repository,
@@ -1222,9 +1267,9 @@ def test_equivalent_candidate_bytes_preserve_the_published_review(
         "- Impact: ` A user can lose saved data. `\n"
         "- Suggested fix: ` Preserve and merge the existing data. `\n"
     )
-    assert publisher.comments == [
-        (request.repository, request.pr_number, expected_comment),
-    ]
+    assert len(publisher.comments) == 1
+    assert publisher.comments[0][:2] == (request.repository, request.pr_number)
+    assert publisher.comments[0][2].startswith(expected_comment)
 
 
 def test_a_failed_review_produces_no_publishable_comment(tmp_path: Path) -> None:

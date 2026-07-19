@@ -56,7 +56,6 @@ class GitHubOperation(StrEnum):
     INSTALLATION_READ = "installation_read"
     INSTALLATION_TOKEN = "installation_token"  # noqa: S105 - normalized operation name.
     PULL_REQUEST_READ = "pull_request_read"
-    PUBLICATION = "publication"
     REVIEW_COMMENT_CREATE = "review_comment_create"
     REVIEW_COMMENT_LIST = "review_comment_list"
     REVIEW_COMMENT_UPDATE = "review_comment_update"
@@ -715,31 +714,6 @@ class GitHubAppClient:
         if not isinstance(payload, _WebhookConfigurationResponse):
             raise GitHubError(operation)
         return payload.url
-
-    def publish(
-        self,
-        *,
-        repository: str,
-        pr_number: int,
-        installation_id: int,
-        body: str,
-    ) -> None:
-        token = self.installation_token(
-            repository=repository,
-            installation_id=installation_id,
-        )
-        operation = GitHubOperation.PUBLICATION
-        owner, repository_name = repository.split("/", maxsplit=1)
-        self._request(
-            _Request(
-                operation=operation,
-                method="POST",
-                path=f"/repos/{owner}/{repository_name}/issues/{pr_number}/comments",
-                bearer=token,
-                expected_status=httpx.codes.CREATED,
-                json_body={"body": body},
-            )
-        )
 
     def list_review_comments(
         self,

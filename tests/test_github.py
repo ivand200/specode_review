@@ -8,7 +8,13 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from review_agent import DiffRange, ReviewResult, publish_review_result, render_review_comment
+from review_agent import (
+    DiffRange,
+    ReviewRequest,
+    ReviewResult,
+    publish_review_result,
+    render_review_comment,
+)
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient, GitHubError, GitHubMutationError
@@ -92,16 +98,36 @@ def test_successful_result_creates_one_top_level_pull_request_comment(tmp_path: 
         status="no_important_issues",
         findings=(),
     )
+    review_request = ReviewRequest(
+        repository="octo-org/example",
+        pr_number=17,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="Add feature",
+    )
 
     def github_api(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/app/installations/23/access_tokens":
             return httpx.Response(201, json={"token": "ghs_installation_token"})
         comment_requests.append(request)
+        if request.method == "GET":
+            assert request.url.path == "/repos/octo-org/example/issues/17/comments"
+            return httpx.Response(200, json=[])
         assert request.method == "POST"
         assert request.url.path == "/repos/octo-org/example/issues/17/comments"
         assert request.headers["Authorization"] == "Bearer ghs_installation_token"
-        assert json.loads(request.content) == {"body": render_review_comment(result)}
-        return httpx.Response(201, json={"id": 101})
+        body = json.loads(request.content)["body"]
+        assert body.startswith(render_review_comment(result))
+        assert "<!-- review-agent:v1:" in body
+        return httpx.Response(
+            201,
+            json={
+                "id": 101,
+                "body": body,
+                "performed_via_github_app": {"id": 12345},
+            },
+        )
 
     github = GitHubAppClient(
         repository="octo-org/example",
@@ -113,9 +139,9 @@ def test_successful_result_creates_one_top_level_pull_request_comment(tmp_path: 
         ),
     )
 
-    publish_review_result(result, github, installation_id=23)
+    publish_review_result(request=review_request, result=result, gateway=github)
 
-    assert len(comment_requests) == 1
+    assert len(comment_requests) == 2
 
 
 def test_review_comments_follow_github_continuation_links_with_maximum_page_size(
@@ -694,14 +720,14 @@ def test_publication_permission_failure_is_normalized_and_redacted(tmp_path: Pat
     )
 
     with pytest.raises(GitHubError) as failure:
-        github.publish(
+        github.create_review_comment(
             repository="octo-org/example",
             pr_number=17,
             installation_id=23,
             body="review body",
         )
 
-    assert failure.value.operation == "publication"
+    assert failure.value.operation == "review_comment_create"
     assert failure.value.status_code == 403
     assert installation_token not in str(failure.value)
     assert response_secret not in str(failure.value)

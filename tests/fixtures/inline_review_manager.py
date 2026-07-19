@@ -2,8 +2,9 @@ from types import TracebackType
 from typing import Protocol, Self
 
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
+from review_agent.github import ReviewCommentGateway
 from review_agent.models import ReviewRequest, ReviewResult
-from review_agent.publishing import ReviewPublisher, publish_review_result
+from review_agent.publishing import publish_review_result
 from review_agent.submission import SubmissionOutcome
 
 
@@ -18,7 +19,7 @@ class InlineReviewManager:
         self,
         *,
         reviewer: ReviewService,
-        publisher: ReviewPublisher,
+        publisher: ReviewCommentGateway,
         review_timeout_seconds: float,
     ) -> None:
         self._reviewer = reviewer
@@ -46,8 +47,8 @@ class InlineReviewManager:
         with review_deadline_scope(deadline):
             result = self._reviewer.review(request)
             publish_review_result(
-                result,
-                self._publisher,
-                installation_id=request.installation_id,
+                request=request,
+                result=result,
+                gateway=self._publisher,
             )
         return SubmissionOutcome.ACCEPTED

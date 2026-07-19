@@ -17,7 +17,9 @@ from review_agent.models import (
     ReviewResult,
 )
 from review_agent.publishing import (
-    ReviewPublisher,
+    PublicationConsistencyError,
+    PublicationDisposition,
+    PublicationReceipt,
     publish_review_result,
     render_review_comment,
 )
@@ -35,10 +37,12 @@ __all__ = [
     "GitHubError",
     "GitHubRepository",
     "Location",
+    "PublicationConsistencyError",
+    "PublicationDisposition",
+    "PublicationReceipt",
     "ReviewContext",
     "ReviewError",
     "ReviewLimits",
-    "ReviewPublisher",
     "ReviewRequest",
     "ReviewResourceManager",
     "ReviewResult",
