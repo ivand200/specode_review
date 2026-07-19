@@ -10,6 +10,32 @@ from fastapi.responses import JSONResponse
 from review_agent.models import ReviewRequest, bound_description
 from review_agent.process_manager import ReviewExecutionManager, SubmissionOutcome
 
+_MAX_WEBHOOK_BODY_BYTES = 256 * 1024
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    content_length = request.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = 0
+        if declared_length > _MAX_WEBHOOK_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="webhook body is too large",
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_WEBHOOK_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="webhook body is too large",
+            )
+        body.extend(chunk)
+    return bytes(body)
+
 
 def _review_request_from_payload(payload: object) -> ReviewRequest:
     if not isinstance(payload, dict):
@@ -70,7 +96,7 @@ async def _accept_github_webhook(
     webhook_secret: str,
     manager: ReviewExecutionManager,
 ) -> JSONResponse:
-    body = await request.body()
+    body = await _read_bounded_body(request)
     expected = (
         "sha256="
         + hmac.new(
@@ -109,6 +135,8 @@ async def _accept_github_webhook(
     outcome = await manager.start(review_request)
     if outcome is SubmissionOutcome.ALREADY_RUNNING:
         return JSONResponse({"status": "already_running"})
+    if outcome is SubmissionOutcome.ALREADY_REVIEWED:
+        return JSONResponse({"status": "already_reviewed"})
     if outcome is SubmissionOutcome.AT_CAPACITY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -135,14 +163,21 @@ def create_app(
     startup_check: Callable[[], None] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
+    is_ready = False
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        nonlocal is_ready
         del app
         if startup_check is not None:
             startup_check()
         try:
             async with manager:
-                yield
+                is_ready = True
+                try:
+                    yield
+                finally:
+                    is_ready = False
         finally:
             if shutdown_callback is not None:
                 shutdown_callback()
@@ -156,6 +191,19 @@ def create_app(
             repository=repository,
             webhook_secret=webhook_secret,
             manager=manager,
+        )
+
+    @app.get("/health/live")
+    async def liveness() -> JSONResponse:
+        return JSONResponse({"status": "alive"})
+
+    @app.get("/health/ready")
+    async def readiness() -> JSONResponse:
+        if is_ready:
+            return JSONResponse({"status": "ready"})
+        return JSONResponse(
+            {"status": "not_ready"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     return app

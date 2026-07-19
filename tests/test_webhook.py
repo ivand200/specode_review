@@ -155,6 +155,86 @@ def test_invalid_signature_is_rejected_before_payload_parsing(
     assert scripted_manager.submissions == []
 
 
+def test_oversized_webhook_is_rejected_despite_an_undersized_content_length(
+    webhook_client: TestClient,
+    scripted_manager: ScriptedManager,
+) -> None:
+    body = b"x" * (256 * 1024 + 1)
+
+    response = webhook_client.post(
+        "/webhooks/github",
+        content=body,
+        headers={
+            "Content-Length": "1",
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": _signature("correct horse battery staple", body),
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.text == '{"detail":"webhook body is too large"}'
+    assert scripted_manager.submissions == []
+
+
+def test_oversized_webhook_is_rejected_from_a_chunked_stream_without_content_length(
+    webhook_client: TestClient,
+    scripted_manager: ScriptedManager,
+) -> None:
+    body = b"x" * (256 * 1024 + 1)
+
+    response = webhook_client.post(
+        "/webhooks/github",
+        content=(body[offset : offset + 4096] for offset in range(0, len(body), 4096)),
+        headers={
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": _signature("correct horse battery staple", body),
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.text == '{"detail":"webhook body is too large"}'
+    assert scripted_manager.submissions == []
+
+
+def test_honest_oversized_content_length_is_rejected_before_reading_or_verification(
+    webhook_client: TestClient,
+    scripted_manager: ScriptedManager,
+) -> None:
+    response = webhook_client.post(
+        "/webhooks/github",
+        content=b"not a signed document",
+        headers={
+            "Content-Length": str(256 * 1024 + 1),
+            "X-GitHub-Event": "pull_request",
+            "X-Hub-Signature-256": "invalid",
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.text == '{"detail":"webhook body is too large"}'
+    assert scripted_manager.submissions == []
+
+
+def test_exact_limit_chunked_body_is_verified_over_all_received_bytes(
+    webhook_client: TestClient,
+    scripted_manager: ScriptedManager,
+) -> None:
+    body = b"x" * (256 * 1024)
+
+    response = webhook_client.post(
+        "/webhooks/github",
+        content=(body[offset : offset + 4096] for offset in range(0, len(body), 4096)),
+        headers={
+            "X-GitHub-Event": "push",
+            "X-Hub-Signature-256": _signature("correct horse battery staple", body),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text == '{"status":"ignored"}'
+    assert scripted_manager.submissions == []
+
+
 def test_signed_non_pull_request_event_is_a_successful_no_op(
     webhook_client: TestClient,
     webhook_payload: dict[str, object],
@@ -264,6 +344,12 @@ def test_eligible_webhook_visibly_bounds_the_pull_request_description(
             id="already-running",
         ),
         pytest.param(
+            SubmissionOutcome.ALREADY_REVIEWED,
+            200,
+            '{"status":"already_reviewed"}',
+            id="already-reviewed",
+        ),
+        pytest.param(
             SubmissionOutcome.AT_CAPACITY,
             503,
             '{"detail":"review execution capacity is full"}',
@@ -301,3 +387,25 @@ def test_submission_outcome_maps_to_exact_webhook_response_once(
     assert response.status_code == expected_status
     assert response.text == expected_body
     assert len(manager.submissions) == 1
+
+
+def test_liveness_and_readiness_follow_the_application_lifecycle() -> None:
+    client = TestClient(_manager_app(ScriptedManager()))
+
+    assert client.get("/health/live").status_code == 200
+    before_startup = client.get("/health/ready")
+    assert before_startup.status_code == 503
+    assert before_startup.text == '{"status":"not_ready"}'
+
+    with client:
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+
+        assert live.status_code == 200
+        assert live.text == '{"status":"alive"}'
+        assert ready.status_code == 200
+        assert ready.text == '{"status":"ready"}'
+
+    after_shutdown = client.get("/health/ready")
+    assert after_shutdown.status_code == 503
+    assert after_shutdown.text == '{"status":"not_ready"}'
