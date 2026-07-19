@@ -11,9 +11,10 @@ from review_agent import (
     ReviewError,
     ReviewRequest,
 )
-from review_agent.configuration import SandboxOperationPolicy
+from review_agent.configuration import SandboxOperationPolicy, SandboxResourceLimits
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.resources import AttemptResources, ReviewResourceManager
+from review_agent.sandbox import DockerSandboxClient
 
 from .no_model_sandbox_probe import NoModelDockerSandboxProbe
 
@@ -79,6 +80,64 @@ def _reviewer(
             max_bytes=65_536,
         ),
     )
+
+
+def test_codex_sandbox_credential_can_write_responses_without_generation(
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / "auth-workspaces"
+    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "review-agent-it-")
+    client = DockerSandboxClient(
+        config=SandboxOperationPolicy(
+            process_output_max_bytes=65_536,
+            cleanup_timeout_seconds=30,
+        )
+    )
+    resources = ReviewResourceManager(
+        workspace_root=workspace_root,
+        sandbox_prefix=prefix,
+        sandbox_client=client,
+    ).for_attempt("f" * 32)
+    control = tmp_path / "auth-control"
+    checkout = tmp_path / "auth-checkout"
+    control.mkdir()
+    checkout.mkdir()
+    limits = SandboxResourceLimits()
+    created = False
+
+    try:
+        client.create_codex(
+            name=resources.sandbox_name,
+            control=control,
+            checkout=checkout,
+            kit=Path("review-kit").resolve(),
+            resources=limits,
+        )
+        created = True
+        response_status = client.execute(
+            name=resources.sandbox_name,
+            command=(
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                "{}",
+                "https://api.openai.com/v1/responses",
+            ),
+            workdir=None,
+            process_limit=limits.pids,
+        )
+        assert response_status == b"400"
+    finally:
+        if created:
+            client.remove(resources.sandbox_name)
 
 
 def test_test_only_no_model_probe_is_fresh_bounded_and_swept(  # noqa: PLR0915

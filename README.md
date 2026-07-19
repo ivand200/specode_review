@@ -104,7 +104,9 @@ npm install --global @openai/codex@0.144.6
 ```
 
 Startup requires `sbx 0.35.0` and `Codex CLI 0.144.6`. Configure the OpenAI credential in the
-Docker Sandboxes host-managed credential proxy; OAuth is preferred:
+Docker Sandboxes host-managed credential proxy. Review Agent uses the public Responses API through
+that proxy, so the credential must authorize `api.responses.write`. OAuth may be used when the
+proxy-issued credential has that scope:
 
 ```bash
 sbx secret set -g openai --oauth
@@ -117,6 +119,11 @@ environment:
 sbx secret import openai --force
 unset OPENAI_API_KEY
 ```
+
+If the non-generative Docker preflight reports a missing Responses scope, replace the host-managed
+`openai` secret with an appropriately scoped API key. Switching credentials does not require an
+application provider setting. Review Agent never forwards `OPENAI_API_KEY` from its environment
+into the child process or review sandbox.
 
 ## GitHub App setup
 
@@ -276,7 +283,7 @@ uv run pytest
 Then follow [the opt-in live profile](tests/live/README.md). Production rollout requires:
 
 1. Passing network-free tests.
-2. Passing the no-model Docker Sandbox lifecycle profile.
+2. Passing the no-model Docker Sandbox lifecycle and Codex authentication preflight.
 3. Passing the live GitHub controlled failure/new-Check-Run retry profile.
 4. Passing the cost-bearing full production lifecycle profile.
 5. Confirming state backups, host ownership, health probes, graceful shutdown, and a process

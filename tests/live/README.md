@@ -37,8 +37,9 @@ override only Checkpoint C. `--campaign-id` is optional; generated identifiers a
 bounded.
 
 The campaign runs Ruff, strict mypy, the complete network-free pytest suite, the no-model Docker
-Sandbox profile, fixture preparation, Checkpoint B, and Checkpoint C in that order. It stops at
-the first failure and exits nonzero. Its JSON summary and
+Sandbox profile with a non-generative Codex authentication preflight, fixture preparation,
+Checkpoint B, and Checkpoint C in that order. It stops at the first failure and exits nonzero. Its
+JSON summary and
 `<evidence-root>/<campaign-id>/campaign-summary.json` contain only bounded stage results, fixture
 URLs and accepted SHAs, and resource IDs verified by successful profiles. A failed or interrupted
 profile may have completed external writes before returning, so inspect every fixture URL and
@@ -113,7 +114,8 @@ RUN_DOCKER_SANDBOX_E2E=1 \
 uv run pytest tests/integration/test_no_model_sandbox_probe.py -q -s
 ```
 
-It needs a working, signed-in Docker Sandboxes runtime but no OpenAI credential or model budget.
+It needs a working, signed-in Docker Sandboxes runtime and a host-managed OpenAI credential. Its
+Codex authentication check is non-generative, so this profile needs no model budget.
 
 ## Checkpoint C: full production lifecycle
 
