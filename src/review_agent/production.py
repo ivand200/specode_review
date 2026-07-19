@@ -113,7 +113,6 @@ class _ProductionCoordinator:
                 resource_manager=resource_manager,
                 parent_environment=self._environment,
                 child_arguments=self._child_arguments,
-                max_concurrent_reviews=self._settings.webhook.max_concurrent_reviews,
             )
             self._coordinator = ReviewAttemptCoordinator(
                 github=github,

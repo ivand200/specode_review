@@ -1,9 +1,7 @@
 import asyncio
 import logging
 import os
-import re
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -11,9 +9,8 @@ import pytest
 from review_agent.attempt import AttemptCommand, AttemptPublication, AttemptStatus
 from review_agent.configuration import AttemptSettings
 from review_agent.models import ReviewRequest
-from review_agent.process_manager import ReviewProcessManager
+from review_agent.process_manager import AttemptLaunchError, ReviewProcessManager
 from review_agent.resources import WORKSPACE_PREFIX, ReviewResourceManager
-from review_agent.submission import SubmissionOutcome
 
 
 class RecordingSandboxResources:
@@ -26,19 +23,6 @@ class RecordingSandboxResources:
 
     def remove(self, name: str) -> None:
         raise AssertionError(name)
-
-
-class BlockingSandboxResources(RecordingSandboxResources):
-    def __init__(self) -> None:
-        super().__init__()
-        self.cleanup_started = threading.Event()
-        self.release_cleanup = threading.Event()
-
-    def list_names(self) -> tuple[str, ...]:
-        self.list_calls += 1
-        self.cleanup_started.set()
-        self.release_cleanup.wait()
-        return ()
 
 
 class FailingSandboxResources(RecordingSandboxResources):
@@ -142,7 +126,6 @@ def _manager(  # noqa: PLR0913 - compact fixture construction seam.
     *child_arguments: str,
     sandbox_resources: RecordingSandboxResources | None = None,
     child_executable: str = sys.executable,
-    max_concurrent_reviews: int = 1,
     review_timeout_seconds: float = 900,
     cleanup_timeout_seconds: float = 30,
 ) -> ReviewProcessManager:
@@ -160,7 +143,6 @@ def _manager(  # noqa: PLR0913 - compact fixture construction seam.
             sandbox_client=resolved_sandbox_resources,
         ),
         parent_environment=os.environ,
-        max_concurrent_reviews=max_concurrent_reviews,
         child_arguments=(
             child_executable,
             str(Path(__file__).parent / "fixtures" / "process_manager_child.py"),
@@ -170,37 +152,14 @@ def _manager(  # noqa: PLR0913 - compact fixture construction seam.
     )
 
 
-def _started_attempt_count(started: Path) -> int:
-    if not started.exists():
-        return 0
-    return len(tuple(started.iterdir()))
+def test_manager_exposes_only_the_attempt_launch_interface(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, tmp_path / "attempt-command.json")
 
-
-async def _wait_for_started_attempts(started: Path, expected: int) -> None:
-    for _ in range(500):
-        if await asyncio.to_thread(_started_attempt_count, started) == expected:
-            return
-        await asyncio.sleep(0.01)
-    pytest.fail(f"expected {expected} child attempts to start")
-
-
-def test_manager_accepts_only_after_delivering_one_complete_attempt(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    manager = _manager(tmp_path, receipt)
-
-    async def exercise() -> SubmissionOutcome:
-        async with manager:
-            return await manager.start(_request())
-
-    outcome = asyncio.run(exercise())
-    command = AttemptCommand.from_json_bytes(receipt.read_bytes())
-    assert outcome is SubmissionOutcome.ACCEPTED
-    assert command.request == _request()
-    assert len(command.attempt_id) == 32
-    workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
-    assert not workspace.exists()
+    assert callable(manager.launch)
+    assert not hasattr(manager, "start")
+    assert not hasattr(manager, "execute")
+    assert not hasattr(manager, "__aenter__")
+    assert not hasattr(manager, "__aexit__")
 
 
 def test_manager_returns_the_validated_outcome_from_a_real_child(
@@ -210,8 +169,8 @@ def test_manager_returns_the_validated_outcome_from_a_real_child(
     manager = _manager(tmp_path, receipt)
 
     async def exercise() -> object:
-        async with manager:
-            return await manager.execute(_request(), check_run_id=101)
+        execution = await manager.launch(_request(), check_run_id=101)
+        return await execution.wait()
 
     outcome = asyncio.run(exercise())
     command = AttemptCommand.from_json_bytes(receipt.read_bytes())
@@ -234,19 +193,30 @@ def test_manager_uses_parent_assigned_attempt_id_for_retry_launch(
     retry_attempt_id = "f" * 32
 
     async def exercise() -> object:
-        async with manager:
-            execution = await manager.launch(
-                _request(),
-                check_run_id=101,
-                attempt_id=retry_attempt_id,
-            )
-            return await execution.wait()
+        execution = await manager.launch(
+            _request(),
+            check_run_id=101,
+            attempt_id=retry_attempt_id,
+        )
+        return await execution.wait()
 
     outcome = asyncio.run(exercise())
     command = AttemptCommand.from_json_bytes(receipt.read_bytes())
 
     assert command.attempt_id == retry_attempt_id
     assert outcome.attempt_id == retry_attempt_id
+
+
+def test_attempt_result_can_only_be_consumed_once(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, tmp_path / "attempt-command.json")
+
+    async def exercise() -> None:
+        execution = await manager.launch(_request(), check_run_id=101)
+        await execution.wait()
+        with pytest.raises(RuntimeError, match="only be consumed once"):
+            await execution.wait()
+
+    asyncio.run(exercise())
 
 
 def test_manager_preserves_published_review_when_parent_cleanup_fails(
@@ -260,8 +230,8 @@ def test_manager_preserves_published_review_when_parent_cleanup_fails(
     )
 
     async def exercise() -> object:
-        async with manager:
-            return await manager.execute(_request(), check_run_id=101)
+        execution = await manager.launch(_request(), check_run_id=101)
+        return await execution.wait()
 
     outcome = asyncio.run(exercise())
 
@@ -293,8 +263,8 @@ def test_manager_normalizes_every_untrusted_or_absent_child_outcome(
     manager = _manager(tmp_path, receipt, mode)
 
     async def exercise() -> object:
-        async with manager:
-            return await manager.execute(_request(), check_run_id=101)
+        execution = await manager.launch(_request(), check_run_id=101)
+        return await execution.wait()
 
     outcome = asyncio.run(exercise())
 
@@ -324,8 +294,8 @@ def test_manager_uses_unknown_publication_after_hard_termination(tmp_path: Path)
     )
 
     async def exercise() -> object:
-        async with manager:
-            return await manager.execute(_request(), check_run_id=101)
+        execution = await manager.launch(_request(), check_run_id=101)
+        return await execution.wait()
 
     outcome = asyncio.run(exercise())
 
@@ -345,11 +315,13 @@ def test_manager_returns_not_attempted_when_child_launch_fails(tmp_path: Path) -
         child_executable=str(tmp_path / "missing-python"),
     )
 
-    async def exercise() -> object:
-        async with manager:
-            return await manager.execute(_request(), check_run_id=101)
+    async def exercise() -> AttemptLaunchError:
+        with pytest.raises(AttemptLaunchError) as failure:
+            await manager.launch(_request(), check_run_id=101)
+        return failure.value
 
-    outcome = asyncio.run(exercise())
+    error = asyncio.run(exercise())
+    outcome = error.outcome
 
     assert outcome.status is AttemptStatus.FAILED
     assert outcome.review_status is None
@@ -372,13 +344,18 @@ def test_command_delivery_is_bounded_by_the_attempt_hard_deadline(
     )
     _install_nonconsuming_process(monkeypatch, process)
 
-    async def exercise() -> SubmissionOutcome:
-        async with manager:
-            return await asyncio.wait_for(manager.start(_request()), timeout=0.2)
+    async def exercise() -> AttemptLaunchError:
+        with pytest.raises(AttemptLaunchError) as failure:
+            await asyncio.wait_for(
+                manager.launch(_request(), check_run_id=101),
+                timeout=0.2,
+            )
+        return failure.value
 
-    outcome = asyncio.run(exercise())
+    error = asyncio.run(exercise())
 
-    assert outcome is SubmissionOutcome.UNAVAILABLE
+    assert error.outcome.failure_stage == "launch"
+    assert error.outcome.publication is AttemptPublication.NOT_ATTEMPTED
     assert process.stdin.closed
     assert process.returncode is not None
 
@@ -393,12 +370,11 @@ def test_cancelled_command_delivery_terminates_the_child(
     _install_nonconsuming_process(monkeypatch, process)
 
     async def exercise() -> None:
-        async with manager:
-            delivery = asyncio.create_task(manager.start(_request()))
-            await process.stdin.drain_started.wait()
-            delivery.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await delivery
+        delivery = asyncio.create_task(manager.launch(_request(), check_run_id=101))
+        await process.stdin.drain_started.wait()
+        delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
 
     asyncio.run(exercise())
 
@@ -406,331 +382,23 @@ def test_cancelled_command_delivery_terminates_the_child(
     assert process.returncode is not None
 
 
-def test_configured_capacity_permits_three_complete_attempts(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(
-        tmp_path,
-        receipt,
-        "record-start",
-        str(started),
-        str(release),
-        max_concurrent_reviews=3,
-    )
-
-    async def exercise() -> tuple[SubmissionOutcome, ...]:
-        async with manager:
-            try:
-                outcomes = await asyncio.gather(
-                    manager.start(_request().model_copy(update={"pr_number": 17})),
-                    manager.start(_request().model_copy(update={"pr_number": 18})),
-                    manager.start(_request().model_copy(update={"pr_number": 19})),
-                )
-                await _wait_for_started_attempts(started, 3)
-                return tuple(outcomes)
-            finally:
-                release.touch()
-
-    outcomes = asyncio.run(exercise())
-    assert outcomes == (SubmissionOutcome.ACCEPTED,) * 3
-    assert len(tuple(started.iterdir())) == 3
-
-
-def test_exact_active_duplicate_precedes_capacity_and_starts_no_child(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(
-        tmp_path,
-        receipt,
-        "record-start",
-        str(started),
-        str(release),
-    )
-
-    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
-        async with manager:
-            accepted = await manager.start(_request())
-            await _wait_for_started_attempts(started, 1)
-            duplicate = await manager.start(_request())
-            release.touch()
-            return accepted, duplicate
-
-    accepted, duplicate = asyncio.run(exercise())
-    assert accepted is SubmissionOutcome.ACCEPTED
-    assert duplicate is SubmissionOutcome.ALREADY_RUNNING
-    assert len(tuple(started.iterdir())) == 1
-
-
-@pytest.mark.parametrize(
-    "changed_request",
-    [
-        pytest.param(
-            _request().model_copy(update={"repository": "octo-org/other"}),
-            id="repository",
-        ),
-        pytest.param(
-            _request().model_copy(update={"pr_number": 18}),
-            id="pull-request",
-        ),
-        pytest.param(
-            _request().model_copy(update={"base_sha": "c" * 40}),
-            id="base-sha",
-        ),
-        pytest.param(
-            _request().model_copy(update={"head_sha": "d" * 40}),
-            id="head-sha",
-        ),
-    ],
-)
-def test_each_active_identity_field_distinguishes_an_attempt(
-    tmp_path: Path,
-    changed_request: ReviewRequest,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(
-        tmp_path,
-        receipt,
-        "record-start",
-        str(started),
-        str(release),
-        max_concurrent_reviews=2,
-    )
-
-    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
-        async with manager:
-            try:
-                outcomes = await asyncio.gather(
-                    manager.start(_request()),
-                    manager.start(changed_request),
-                )
-                await _wait_for_started_attempts(started, 2)
-                return outcomes[0], outcomes[1]
-            finally:
-                release.touch()
-
-    outcomes = asyncio.run(exercise())
-    assert outcomes == (SubmissionOutcome.ACCEPTED,) * 2
-    assert len(tuple(started.iterdir())) == 2
-
-
-def test_full_capacity_retains_no_distinct_request_and_reuses_slot_after_cleanup(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(
-        tmp_path,
-        receipt,
-        "record-start",
-        str(started),
-        str(release),
-    )
-    distinct_request = _request().model_copy(update={"pr_number": 18})
-
-    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
-        async with manager:
-            try:
-                accepted = await manager.start(_request())
-                await _wait_for_started_attempts(started, 1)
-                at_capacity = await manager.start(distinct_request)
-                assert await asyncio.to_thread(_started_attempt_count, started) == 1
-                release.touch()
-                for _ in range(500):
-                    retried = await manager.start(distinct_request)
-                    if retried is SubmissionOutcome.ACCEPTED:
-                        await _wait_for_started_attempts(started, 2)
-                        return accepted, at_capacity
-                    assert retried is SubmissionOutcome.AT_CAPACITY
-                    await asyncio.sleep(0.01)
-                pytest.fail("capacity slot was not released after cleanup")
-            finally:
-                release.touch()
-
-    accepted, at_capacity = asyncio.run(exercise())
-    assert accepted is SubmissionOutcome.ACCEPTED
-    assert at_capacity is SubmissionOutcome.AT_CAPACITY
-    assert len(tuple(started.iterdir())) == 2
-
-
-def test_parent_cleanup_releases_admission_when_its_budget_expires(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    sandbox_resources = BlockingSandboxResources()
-    manager = _manager(
-        tmp_path,
-        receipt,
-        sandbox_resources=sandbox_resources,
-        cleanup_timeout_seconds=0.02,
-    )
-    distinct_request = _request().model_copy(update={"pr_number": 18})
-
-    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
-        async with manager:
-            try:
-                accepted = await manager.start(_request())
-                cleanup_started = await asyncio.to_thread(
-                    sandbox_resources.cleanup_started.wait,
-                    1,
-                )
-                assert cleanup_started
-                for _ in range(100):
-                    retried = await manager.start(distinct_request)
-                    if retried is SubmissionOutcome.ACCEPTED:
-                        return accepted, retried
-                    assert retried is SubmissionOutcome.AT_CAPACITY
-                    await asyncio.sleep(0.01)
-                pytest.fail("cleanup timeout did not release admission")
-            finally:
-                sandbox_resources.release_cleanup.set()
-
-    accepted, retried = asyncio.run(exercise())
-
-    assert accepted is SubmissionOutcome.ACCEPTED
-    assert retried is SubmissionOutcome.ACCEPTED
-
-
-def test_exact_request_can_restart_with_a_new_attempt_after_cleanup(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(
-        tmp_path,
-        receipt,
-        "record-start",
-        str(started),
-        str(release),
-    )
-
-    async def exercise() -> None:
-        async with manager:
-            try:
-                assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
-                await _wait_for_started_attempts(started, 1)
-                release.touch()
-                for _ in range(500):
-                    retried = await manager.start(_request())
-                    if retried is SubmissionOutcome.ACCEPTED:
-                        await _wait_for_started_attempts(started, 2)
-                        return
-                    assert retried is SubmissionOutcome.ALREADY_RUNNING
-                    await asyncio.sleep(0.01)
-                pytest.fail("active key was not released after cleanup")
-            finally:
-                release.touch()
-
-    asyncio.run(exercise())
-    attempt_ids = tuple(path.name for path in started.iterdir())
-    assert len(attempt_ids) == 2
-    assert attempt_ids[0] != attempt_ids[1]
-
-
-def test_manager_stops_admission_during_shutdown_and_cannot_restart(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    started = tmp_path / "started"
-    release = tmp_path / "release"
-    manager = _manager(tmp_path, receipt, str(started), str(release))
-
-    async def exercise() -> None:
-        assert await manager.start(_request()) is SubmissionOutcome.STOPPING
-        await manager.__aenter__()
-        assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
-        for _ in range(500):
-            if started.exists():
-                break
-            await asyncio.sleep(0.01)
-        assert started.exists()
-
-        shutdown = asyncio.create_task(manager.__aexit__(None, None, None))
-        await asyncio.sleep(0)
-        assert not shutdown.done()
-        assert await manager.start(_request()) is SubmissionOutcome.STOPPING
-        release.touch()
-        await shutdown
-        assert await manager.start(_request()) is SubmissionOutcome.STOPPING
-        with pytest.raises(RuntimeError, match="cannot be restarted"):
-            await manager.__aenter__()
-
-    asyncio.run(exercise())
-
-
-def test_spawn_failure_is_cleaned_and_a_later_retry_can_start(
-    tmp_path: Path,
-) -> None:
-    receipt = tmp_path / "attempt-command.json"
-    child_executable = tmp_path / "python"
-    sandbox_resources = RecordingSandboxResources()
-    manager = _manager(
-        tmp_path,
-        receipt,
-        sandbox_resources=sandbox_resources,
-        child_executable=str(child_executable),
-    )
-
-    async def exercise() -> tuple[SubmissionOutcome, SubmissionOutcome]:
-        async with manager:
-            failed = await manager.start(_request())
-            child_executable.write_text(
-                f'#!/bin/sh\nexec {sys.executable} "$@"\n',
-                encoding="utf-8",
-            )
-            child_executable.chmod(0o700)
-            retried = await manager.start(_request())
-            return failed, retried
-
-    failed, retried = asyncio.run(exercise())
-    assert failed is SubmissionOutcome.UNAVAILABLE
-    assert retried is SubmissionOutcome.ACCEPTED
-    assert AttemptCommand.from_json_bytes(receipt.read_bytes()).request == _request()
-    assert sandbox_resources.list_calls == 2
-
-
-def test_child_streams_and_safe_correlated_lifecycle_records_are_inherited(
+def test_child_streams_are_inherited(
     tmp_path: Path,
     capfd: pytest.CaptureFixture[str],
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     receipt = tmp_path / "attempt-command.json"
     manager = _manager(tmp_path, receipt, "emit-output")
-    caplog.set_level(logging.INFO, logger="review_agent.process_manager")
 
-    async def exercise() -> None:
-        async with manager:
-            assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
+    async def exercise() -> object:
+        execution = await manager.launch(_request(), check_run_id=101)
+        return await execution.wait()
 
-    asyncio.run(exercise())
+    outcome = asyncio.run(exercise())
 
     captured = capfd.readouterr()
     assert captured.out == "child stdout is inherited\n"
     assert captured.err == "child stderr is inherited\n"
-    messages = [record.getMessage() for record in caplog.records]
-    assert len(messages) == 2
-    matches = [re.search(r"attempt_id=([0-9a-f]{32})", message) for message in messages]
-    assert all(match is not None for match in matches)
-    attempt_ids = [match.group(1) for match in matches if match is not None]
-    assert attempt_ids[0] == attempt_ids[1]
-    assert "pid=" in messages[0]
-    assert "outcome=success" in messages[1]
-    for message in messages:
-        assert "repository=octo-org/example" in message
-        assert "pr_number=17" in message
-        assert f"base_sha={'a' * 40}" in message
-        assert f"head_sha={'b' * 40}" in message
-        assert "untrusted title" not in message
-        assert "untrusted description" not in message
+    assert outcome.status is AttemptStatus.REVIEWED
 
 
 def test_overlong_attempt_gets_sigterm_after_review_and_cleanup_budget(
@@ -751,23 +419,18 @@ def test_overlong_attempt_gets_sigterm_after_review_and_cleanup_budget(
     )
     caplog.set_level(logging.INFO, logger="review_agent.process_manager")
 
-    async def exercise() -> float:
+    async def exercise() -> tuple[float, object]:
         loop = asyncio.get_running_loop()
         began = loop.time()
-        async with manager:
-            assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
-            for _ in range(100):
-                if started.exists():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("child did not start")
-        return loop.time() - began
+        execution = await manager.launch(_request(), check_run_id=101)
+        outcome = await execution.wait()
+        return loop.time() - began, outcome
 
-    elapsed = asyncio.run(exercise())
+    elapsed, outcome = asyncio.run(exercise())
 
     assert terminated.exists()
     assert elapsed >= 0.24
+    assert outcome.status is AttemptStatus.TIMED_OUT
     assert not any("signal=SIGKILL" in record.getMessage() for record in caplog.records)
 
 
@@ -787,24 +450,19 @@ def test_sigterm_ignoring_attempt_and_descendant_are_hard_stopped(
     )
     caplog.set_level(logging.INFO, logger="review_agent.process_manager")
 
-    async def exercise() -> float:
+    async def exercise() -> tuple[float, object]:
         loop = asyncio.get_running_loop()
         began = loop.time()
-        async with manager:
-            assert await manager.start(_request()) is SubmissionOutcome.ACCEPTED
-            for _ in range(100):
-                if started.exists():
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("process group did not start")
-        return loop.time() - began
+        execution = await manager.launch(_request(), check_run_id=101)
+        outcome = await execution.wait()
+        return loop.time() - began, outcome
 
-    elapsed = asyncio.run(exercise())
+    elapsed, outcome = asyncio.run(exercise())
     direct_pid, descendant_pid = (int(value) for value in started.read_text().split())
     command = AttemptCommand.from_json_bytes(receipt.read_bytes())
 
     assert elapsed < 0.9
+    assert outcome.status is AttemptStatus.TIMED_OUT
     workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
     assert not workspace.exists()
     for pid in (direct_pid, descendant_pid):
@@ -813,18 +471,12 @@ def test_sigterm_ignoring_attempt_and_descendant_are_hard_stopped(
     messages = [record.getMessage() for record in caplog.records]
     assert any("signal=SIGTERM" in message for message in messages)
     assert any("signal=SIGKILL" in message for message in messages)
-    assert any("stage=timeout" in message for message in messages)
-    assert any("outcome=hard_timeout child_status=signal_9" in message for message in messages)
-    assert any("stage=cleanup outcome=success" in message for message in messages)
     correlated = [
         message
         for message in messages
-        if "hard timeout" in message
-        or "signal sent" in message
-        or "process exited" in message
-        or "cleanup completed" in message
+        if "signal sent" in message
     ]
-    assert len(correlated) == 5
+    assert len(correlated) == 2
     assert all(f"attempt_id={command.attempt_id}" in message for message in correlated)
     assert all("untrusted title" not in message for message in correlated)
     assert all("untrusted description" not in message for message in correlated)
