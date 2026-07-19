@@ -22,10 +22,10 @@ signed pull_request/opened webhook
 -> one child process and disposable Docker Sandbox
 -> exact accepted commit materialization and bounded merge-base diff
 -> schema-constrained candidate acceptance and filesystem grounding
+-> required sandbox and workspace cleanup
 -> validated pull-request comment publication
 -> bounded child outcome returned to the parent
 -> durable terminal Check Run reconciliation
--> sandbox and workspace cleanup
 ```
 
 The review identity includes the normalized repository, pull-request number, accepted base SHA,

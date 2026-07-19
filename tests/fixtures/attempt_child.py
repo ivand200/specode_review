@@ -16,6 +16,7 @@ def _record(event: str) -> None:
 class FixtureServices:
     def __init__(self, mode: str) -> None:
         self._mode = mode
+        self._review_cleanup_attempted = False
 
     def review(self, request: ReviewRequest) -> ReviewResult:
         assert remaining_review_time(stage="fixture_review") is not None
@@ -61,6 +62,14 @@ class FixtureServices:
             findings=findings,
         )
 
+    def prepare_publication(self) -> None:
+        self._review_cleanup_attempted = True
+        assert remaining_review_time(stage="fixture_cleanup") is not None
+        _record("cleanup")
+        if self._mode == "cleanup_failure":
+            message = "secret cleanup exception with subprocess output"
+            raise RuntimeError(message)
+
     def publish(self, request: ReviewRequest, result: ReviewResult) -> None:
         del request, result
         assert remaining_review_time(stage="fixture_publication") is not None
@@ -72,10 +81,11 @@ class FixtureServices:
             raise PublicationUnknownError
 
     def close(self) -> None:
-        assert remaining_review_time(stage="fixture_cleanup") is not None
-        _record("cleanup")
-        if self._mode == "cleanup_failure":
-            message = "secret cleanup exception with subprocess output"
+        if not self._review_cleanup_attempted:
+            assert remaining_review_time(stage="fixture_cleanup") is not None
+            _record("cleanup")
+        if self._mode == "close_failure":
+            message = "secret transport close exception"
             raise RuntimeError(message)
 
 

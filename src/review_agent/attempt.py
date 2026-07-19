@@ -176,6 +176,10 @@ class AttemptServices(Protocol):
 
     def review(self, request: ReviewRequest) -> ReviewResult: ...
 
+    def prepare_publication(self) -> None:
+        """Release required review resources before any GitHub comment mutation."""
+        ...
+
     def publish(self, request: ReviewRequest, result: ReviewResult) -> None: ...
 
     def close(self) -> None: ...
@@ -267,9 +271,14 @@ class _ProductionAttemptServices:
         self._resource_manager = resource_manager
         self._github = github
         self._reviewer = reviewer
+        self._review_cleanup_attempted = False
 
     def review(self, request: ReviewRequest) -> ReviewResult:
         return self._reviewer.review(request)
+
+    def prepare_publication(self) -> None:
+        self._review_cleanup_attempted = True
+        self._resource_manager.cleanup(self._attempt_id)
 
     def publish(self, request: ReviewRequest, result: ReviewResult) -> None:
         publish_review_result(
@@ -279,6 +288,9 @@ class _ProductionAttemptServices:
         )
 
     def close(self) -> None:
+        if self._review_cleanup_attempted:
+            self._github.close()
+            return
         _close_attempt_resources(
             resource_manager=self._resource_manager,
             attempt_id=self._attempt_id,
@@ -374,6 +386,10 @@ def _execute_configured_attempt(
             result = services.review(command.request)
             review_status = result.status
             deadline.remaining(stage=stage)
+            stage = "cleanup"
+            deadline.remaining(stage=stage)
+            services.prepare_publication()
+            deadline.remaining(stage=stage)
             stage = "publication"
             deadline.remaining(stage=stage)
             services.publish(command.request, result)
@@ -390,6 +406,7 @@ def _execute_configured_attempt(
                     deadline=deadline,
                     attempt_id=command.attempt_id,
                     existing_failure=failure,
+                    publication=publication,
                 )
 
     if failure is not None:
@@ -423,13 +440,17 @@ def _close_services(
     deadline: ReviewDeadline,
     attempt_id: str,
     existing_failure: tuple[str, FailureCategory] | None,
+    publication: AttemptPublication,
 ) -> tuple[str, FailureCategory] | None:
     try:
         services.close()
         deadline.remaining(stage="cleanup")
     except Exception as error:  # noqa: BLE001 - child cleanup boundary.
         cleanup_failure = _failure_details(error, stage="cleanup")
-        if existing_failure is None:
+        if (
+            existing_failure is None
+            and publication is not AttemptPublication.PUBLISHED
+        ):
             return cleanup_failure
         _log_failure(
             attempt_id=attempt_id,

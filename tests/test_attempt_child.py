@@ -119,7 +119,7 @@ def test_child_exits_zero_only_after_review_publication_and_cleanup(tmp_path: Pa
     completed = _run_child(tmp_path)
 
     assert completed.returncode == 0
-    assert completed.stdout.decode().splitlines() == ["review", "publication", "cleanup"]
+    assert completed.stdout.decode().splitlines() == ["review", "cleanup", "publication"]
     assert completed.stderr == b""
 
 
@@ -129,7 +129,7 @@ def test_child_returns_one_trusted_outcome_after_publication_and_cleanup(
     completed, outcome = _run_child_with_outcome(tmp_path)
 
     assert completed.returncode == 0
-    assert completed.stdout.decode().splitlines() == ["review", "publication", "cleanup"]
+    assert completed.stdout.decode().splitlines() == ["review", "cleanup", "publication"]
     assert outcome == AttemptOutcome(
         attempt_id=_command().attempt_id,
         status=AttemptStatus.REVIEWED,
@@ -186,14 +186,6 @@ def test_child_returns_trusted_findings_status_without_finding_text(tmp_path: Pa
             "publication",
             "review_failure",
         ),
-        (
-            "cleanup_failure",
-            AttemptStatus.FAILED,
-            AttemptPublication.PUBLISHED,
-            "no_important_issues",
-            "cleanup",
-            "review_failure",
-        ),
     ],
 )
 def test_child_returns_normalized_failure_without_losing_publication_state(  # noqa: PLR0913
@@ -218,6 +210,35 @@ def test_child_returns_normalized_failure_without_losing_publication_state(  # n
     assert b"model text" not in outcome.to_json_bytes()
     assert b"subprocess output" not in outcome.to_json_bytes()
     assert outcome.to_json_bytes() not in unsafe_process_text
+
+
+def test_child_does_not_publish_when_required_cleanup_fails(tmp_path: Path) -> None:
+    completed, outcome = _run_child_with_outcome(tmp_path, mode="cleanup_failure")
+
+    assert completed.returncode != 0
+    assert completed.stdout.decode().splitlines() == ["review", "cleanup"]
+    assert outcome.status is AttemptStatus.FAILED
+    assert outcome.publication is AttemptPublication.NOT_ATTEMPTED
+    assert outcome.review_status is None
+    assert outcome.failure_stage == "cleanup"
+    assert outcome.failure_category == "review_failure"
+
+
+def test_confirmed_publication_survives_final_transport_close_failure(
+    tmp_path: Path,
+) -> None:
+    completed, outcome = _run_child_with_outcome(tmp_path, mode="close_failure")
+
+    assert completed.returncode == 0
+    assert completed.stdout.decode().splitlines() == ["review", "cleanup", "publication"]
+    assert outcome.status is AttemptStatus.REVIEWED
+    assert outcome.publication is AttemptPublication.PUBLISHED
+    assert outcome.review_status == "no_important_issues"
+    assert completed.stderr.decode().strip().endswith(
+        "review attempt failed "
+        "attempt_id=0123456789abcdef0123456789abcdef "
+        "stage=cleanup category=review_failure"
+    )
 
 
 def test_child_preserves_normalized_review_failure_and_still_cleans_up(
@@ -324,13 +345,13 @@ def test_production_child_rejects_every_command_line_payload(tmp_path: Path) -> 
         ),
         (
             "publication_failure",
-            ["review", "publication", "cleanup"],
+            ["review", "cleanup", "publication"],
             "publication",
             "review_failure",
         ),
         (
             "cleanup_failure",
-            ["review", "publication", "cleanup"],
+            ["review", "cleanup"],
             "cleanup",
             "review_failure",
         ),
