@@ -6,12 +6,21 @@ import sys
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from enum import Enum, auto
 from types import TracebackType
-from typing import Protocol, Self
+from typing import Literal, Protocol, Self
 
-from review_agent.attempt import AttemptCommand
+from review_agent.attempt import (
+    ATTEMPT_OUTCOME_MAX_BYTES,
+    AttemptCommand,
+    AttemptOutcome,
+    AttemptOutcomeError,
+    AttemptPublication,
+    AttemptStatus,
+)
 from review_agent.configuration import AttemptSettings
+from review_agent.errors import FailureCategory
 from review_agent.models import ReviewRequest
 from review_agent.resources import ReviewResourceManager
 
@@ -47,6 +56,13 @@ class _Lifecycle(Enum):
     ACCEPTING = auto()
     STOPPING = auto()
     STOPPED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class _RunningOutcomeAttempt:
+    process: asyncio.subprocess.Process
+    reader: asyncio.Task[bytes]
+    hard_deadline: float
 
 
 class ReviewProcessManager:
@@ -191,6 +207,173 @@ class ReviewProcessManager:
             self._monitor_tasks.add(monitor_task)
             return SubmissionOutcome.ACCEPTED
 
+    async def execute(
+        self,
+        request: ReviewRequest,
+        *,
+        check_run_id: int,
+    ) -> AttemptOutcome:
+        """Execute one Check Run attempt and return only its normalized result."""
+        attempt_id = uuid.uuid4().hex
+        hard_deadline = (
+            asyncio.get_running_loop().time()
+            + self._attempt_settings.runtime.review_timeout_seconds
+            + self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+        )
+        running = await self._launch_outcome_attempt(
+            request,
+            attempt_id=attempt_id,
+            check_run_id=check_run_id,
+            hard_deadline=hard_deadline,
+        )
+        if running is None:
+            return _normalized_incomplete_outcome(
+                attempt_id,
+                stage="launch",
+                category=FailureCategory.REVIEW_FAILURE,
+                publication=AttemptPublication.NOT_ATTEMPTED,
+            )
+        outcome = await self._consume_outcome_attempt(running, attempt_id=attempt_id)
+        cleanup_succeeded = await self._cleanup(attempt_id)
+        if not cleanup_succeeded and outcome.status is AttemptStatus.REVIEWED:
+            return _normalized_incomplete_outcome(
+                attempt_id,
+                stage="cleanup",
+                category=FailureCategory.REVIEW_FAILURE,
+                publication=AttemptPublication.PUBLISHED,
+                review_status=outcome.review_status,
+            )
+        return outcome
+
+    async def _launch_outcome_attempt(
+        self,
+        request: ReviewRequest,
+        *,
+        attempt_id: str,
+        check_run_id: int,
+        hard_deadline: float,
+    ) -> _RunningOutcomeAttempt | None:
+        process: asyncio.subprocess.Process | None = None
+        read_fd = -1
+        write_fd = -1
+        reader: asyncio.Task[bytes] | None = None
+        try:
+            read_fd, write_fd = os.pipe()
+            command = AttemptCommand(
+                attempt_id=attempt_id,
+                check_run_id=check_run_id,
+                outcome_fd=write_fd,
+                request=request,
+            )
+            process = await asyncio.create_subprocess_exec(
+                *self._child_arguments,
+                stdin=asyncio.subprocess.PIPE,
+                env=self._executor_environment,
+                start_new_session=True,
+                pass_fds=(write_fd,),
+            )
+            os.close(write_fd)
+            write_fd = -1
+            reader = asyncio.create_task(asyncio.to_thread(_read_bounded_outcome, read_fd))
+            read_fd = -1
+            if process.stdin is None:
+                message = "review child stdin was not created"
+                raise BrokenPipeError(message)
+            async with asyncio.timeout_at(hard_deadline):
+                process.stdin.write(command.to_json_bytes())
+                await process.stdin.drain()
+                process.stdin.close()
+                await process.stdin.wait_closed()
+        except asyncio.CancelledError:
+            await self._stop_outcome_process(process, attempt_id=attempt_id)
+            if reader is not None:
+                await reader
+            raise
+        except (OSError, TimeoutError):
+            await self._stop_outcome_process(process, attempt_id=attempt_id)
+            if reader is not None:
+                await reader
+            await self._cleanup(attempt_id)
+            return None
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            if read_fd >= 0:
+                os.close(read_fd)
+        if reader is None or process is None:
+            message = "outcome process launch invariant violated"
+            raise RuntimeError(message)
+        return _RunningOutcomeAttempt(
+            process=process,
+            reader=reader,
+            hard_deadline=hard_deadline,
+        )
+
+    async def _stop_outcome_process(
+        self,
+        process: asyncio.subprocess.Process | None,
+        *,
+        attempt_id: str,
+    ) -> None:
+        if process is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.returncode is not None:
+            await process.wait()
+            return
+        await _terminate_process_group(
+            process,
+            attempt_id=attempt_id,
+            grace_seconds=(
+                self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+            ),
+        )
+
+    async def _consume_outcome_attempt(
+        self,
+        running: _RunningOutcomeAttempt,
+        *,
+        attempt_id: str,
+    ) -> AttemptOutcome:
+        remaining = max(
+            0.0,
+            running.hard_deadline - asyncio.get_running_loop().time(),
+        )
+        hard_timed_out = False
+        try:
+            await asyncio.wait_for(running.process.wait(), timeout=remaining)
+        except TimeoutError:
+            hard_timed_out = True
+            await _terminate_process_group(
+                running.process,
+                attempt_id=attempt_id,
+                grace_seconds=(
+                    self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+                ),
+            )
+
+        document = await running.reader
+        if hard_timed_out:
+            return _normalized_incomplete_outcome(
+                attempt_id,
+                stage="timeout",
+                category=FailureCategory.TIMEOUT,
+                publication=AttemptPublication.UNKNOWN,
+            )
+        try:
+            return AttemptOutcome.from_json_bytes(
+                document,
+                expected_attempt_id=attempt_id,
+            )
+        except AttemptOutcomeError:
+            return _normalized_incomplete_outcome(
+                attempt_id,
+                stage="child_outcome",
+                category=FailureCategory.REVIEW_FAILURE,
+                publication=AttemptPublication.UNKNOWN,
+            )
+
     async def _rollback_failed_launch(
         self,
         process: asyncio.subprocess.Process | None,
@@ -299,6 +482,44 @@ class ReviewProcessManager:
             )
             return False
         return True
+
+
+def _read_bounded_outcome(read_fd: int) -> bytes:
+    document = bytearray()
+    try:
+        while len(document) <= ATTEMPT_OUTCOME_MAX_BYTES:
+            chunk = os.read(
+                read_fd,
+                min(1_024, ATTEMPT_OUTCOME_MAX_BYTES + 1 - len(document)),
+            )
+            if not chunk:
+                break
+            document.extend(chunk)
+    finally:
+        os.close(read_fd)
+    return bytes(document)
+
+
+def _normalized_incomplete_outcome(
+    attempt_id: str,
+    *,
+    stage: str,
+    category: FailureCategory,
+    publication: AttemptPublication,
+    review_status: Literal["no_important_issues", "issues_found"] | None = None,
+) -> AttemptOutcome:
+    return AttemptOutcome(
+        attempt_id=attempt_id,
+        status=(
+            AttemptStatus.TIMED_OUT
+            if category is FailureCategory.TIMEOUT
+            else AttemptStatus.FAILED
+        ),
+        review_status=review_status,
+        publication=publication,
+        failure_stage=stage,
+        failure_category=category,
+    )
 
 
 async def _wait_for_process_group_exit(

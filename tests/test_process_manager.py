@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from review_agent.attempt import AttemptCommand
+from review_agent.attempt import AttemptCommand, AttemptPublication, AttemptStatus
 from review_agent.configuration import AttemptSettings
 from review_agent.models import ReviewRequest
 from review_agent.process_manager import ReviewProcessManager, SubmissionOutcome
@@ -38,6 +38,12 @@ class BlockingSandboxResources(RecordingSandboxResources):
         self.cleanup_started.set()
         self.release_cleanup.wait()
         return ()
+
+
+class FailingSandboxResources(RecordingSandboxResources):
+    def list_names(self) -> tuple[str, ...]:
+        message = "secret cleanup subprocess output"
+        raise RuntimeError(message)
 
 
 class _NeverDrainsStdin:
@@ -194,6 +200,138 @@ def test_manager_accepts_only_after_delivering_one_complete_attempt(
     assert len(command.attempt_id) == 32
     workspace = tmp_path / "workspaces" / f"{WORKSPACE_PREFIX}{command.attempt_id}"
     assert not workspace.exists()
+
+
+def test_manager_returns_the_validated_outcome_from_a_real_child(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    manager = _manager(tmp_path, receipt)
+
+    async def exercise() -> object:
+        async with manager:
+            return await manager.execute(_request(), check_run_id=101)
+
+    outcome = asyncio.run(exercise())
+    command = AttemptCommand.from_json_bytes(receipt.read_bytes())
+
+    assert outcome.attempt_id == command.attempt_id
+    assert command.check_run_id == 101
+    assert command.outcome_fd is not None
+    assert outcome.status is AttemptStatus.REVIEWED
+    assert outcome.review_status == "no_important_issues"
+    assert outcome.publication is AttemptPublication.PUBLISHED
+    assert outcome.failure_stage is None
+    assert outcome.failure_category is None
+
+
+def test_manager_preserves_published_review_when_parent_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        sandbox_resources=FailingSandboxResources(),
+    )
+
+    async def exercise() -> object:
+        async with manager:
+            return await manager.execute(_request(), check_run_id=101)
+
+    outcome = asyncio.run(exercise())
+
+    assert outcome.status is AttemptStatus.FAILED
+    assert outcome.review_status == "no_important_issues"
+    assert outcome.publication is AttemptPublication.PUBLISHED
+    assert outcome.failure_stage == "cleanup"
+    assert outcome.failure_category == "review_failure"
+    assert b"secret" not in outcome.to_json_bytes()
+    assert b"subprocess output" not in outcome.to_json_bytes()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "missing-outcome",
+        "invalid-outcome",
+        "oversized-outcome",
+        "duplicated-outcome",
+        "mismatched-outcome",
+        "crash",
+    ],
+)
+def test_manager_normalizes_every_untrusted_or_absent_child_outcome(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    manager = _manager(tmp_path, receipt, mode)
+
+    async def exercise() -> object:
+        async with manager:
+            return await manager.execute(_request(), check_run_id=101)
+
+    outcome = asyncio.run(exercise())
+
+    assert outcome.status is AttemptStatus.FAILED
+    assert outcome.review_status is None
+    assert outcome.publication is AttemptPublication.UNKNOWN
+    assert outcome.failure_stage == "child_outcome"
+    assert outcome.failure_category == "review_failure"
+    document = outcome.to_json_bytes()
+    assert b"secret" not in document
+    assert b"model text" not in document
+    assert b"subprocess output" not in document
+
+
+def test_manager_uses_unknown_publication_after_hard_termination(tmp_path: Path) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    started = tmp_path / "started"
+    terminated = tmp_path / "terminated"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        "exit-on-term",
+        str(started),
+        str(terminated),
+        review_timeout_seconds=0.15,
+        cleanup_timeout_seconds=0.1,
+    )
+
+    async def exercise() -> object:
+        async with manager:
+            return await manager.execute(_request(), check_run_id=101)
+
+    outcome = asyncio.run(exercise())
+
+    assert terminated.exists()
+    assert outcome.status is AttemptStatus.TIMED_OUT
+    assert outcome.review_status is None
+    assert outcome.publication is AttemptPublication.UNKNOWN
+    assert outcome.failure_stage == "timeout"
+    assert outcome.failure_category == "timeout"
+
+
+def test_manager_returns_not_attempted_when_child_launch_fails(tmp_path: Path) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    manager = _manager(
+        tmp_path,
+        receipt,
+        child_executable=str(tmp_path / "missing-python"),
+    )
+
+    async def exercise() -> object:
+        async with manager:
+            return await manager.execute(_request(), check_run_id=101)
+
+    outcome = asyncio.run(exercise())
+
+    assert outcome.status is AttemptStatus.FAILED
+    assert outcome.review_status is None
+    assert outcome.publication is AttemptPublication.NOT_ATTEMPTED
+    assert outcome.failure_stage == "launch"
+    assert outcome.failure_category == "review_failure"
 
 
 def test_command_delivery_is_bounded_by_the_attempt_hard_deadline(

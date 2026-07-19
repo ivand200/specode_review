@@ -4,7 +4,7 @@ from review_agent.attempt import AttemptCommand, AttemptServices, run_attempt_ch
 from review_agent.configuration import AttemptSettings
 from review_agent.deadline import remaining_review_time
 from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import DiffRange, ReviewRequest, ReviewResult
+from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
 
 
 def _record(event: str) -> None:
@@ -32,6 +32,23 @@ class FixtureServices:
         if self._mode == "timeout":
             message = "secret timeout with model text and subprocess output"
             raise TimeoutError(message)
+        finding = (
+            Finding(
+                severity="important",
+                title="Bounded fixture finding",
+                locations=(
+                    Location(
+                        path="src/example.py",
+                        line=7,
+                        description="Validated fixture location",
+                    ),
+                ),
+                evidence="Validated fixture evidence",
+                impact="Validated fixture impact",
+                suggested_fix="Validated fixture suggestion",
+            ),
+        )
+        findings = finding if self._mode == "issues_found" else ()
         return ReviewResult(
             repository=request.repository,
             pr_number=request.pr_number,
@@ -39,8 +56,8 @@ class FixtureServices:
                 start_sha=request.base_sha,
                 end_sha=request.head_sha,
             ),
-            status="no_important_issues",
-            findings=(),
+            status="issues_found" if findings else "no_important_issues",
+            findings=findings,
         )
 
     def publish(self, result: ReviewResult, *, installation_id: int) -> None:

@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from review_agent.attempt import ATTEMPT_COMMAND_MAX_BYTES, AttemptCommand
+from review_agent.attempt import (
+    ATTEMPT_COMMAND_MAX_BYTES,
+    AttemptCommand,
+    AttemptOutcome,
+    AttemptPublication,
+    AttemptStatus,
+)
 from review_agent.models import ReviewRequest
 
 
@@ -25,9 +31,11 @@ def _executor_environment(tmp_path: Path) -> dict[str, str]:
     }
 
 
-def _command() -> AttemptCommand:
+def _command(*, outcome_fd: int | None = None) -> AttemptCommand:
     return AttemptCommand(
         attempt_id="0123456789abcdef0123456789abcdef",
+        check_run_id=101 if outcome_fd is not None else None,
+        outcome_fd=outcome_fd,
         request=ReviewRequest(
             repository="octo-org/review-fixture",
             pr_number=17,
@@ -60,6 +68,37 @@ def _run_child(
     )
 
 
+def _run_child_with_outcome(
+    tmp_path: Path,
+    *,
+    mode: str = "success",
+) -> tuple[subprocess.CompletedProcess[bytes], AttemptOutcome]:
+    read_fd, write_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(Path(__file__).parent / "fixtures" / "attempt_child.py"),
+                mode,
+            ),
+            input=_command(outcome_fd=write_fd).to_json_bytes(),
+            capture_output=True,
+            env=_executor_environment(tmp_path),
+            pass_fds=(write_fd,),
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+    try:
+        document = os.read(read_fd, 8_192)
+    finally:
+        os.close(read_fd)
+    return completed, AttemptOutcome.from_json_bytes(
+        document,
+        expected_attempt_id=_command().attempt_id,
+    )
+
+
 def _run_production_child(
     tmp_path: Path,
     *,
@@ -82,6 +121,95 @@ def test_child_exits_zero_only_after_review_publication_and_cleanup(tmp_path: Pa
     assert completed.returncode == 0
     assert completed.stdout.decode().splitlines() == ["review", "publication", "cleanup"]
     assert completed.stderr == b""
+
+
+def test_child_returns_one_trusted_outcome_after_publication_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    completed, outcome = _run_child_with_outcome(tmp_path)
+
+    assert completed.returncode == 0
+    assert completed.stdout.decode().splitlines() == ["review", "publication", "cleanup"]
+    assert outcome == AttemptOutcome(
+        attempt_id=_command().attempt_id,
+        status=AttemptStatus.REVIEWED,
+        review_status="no_important_issues",
+        publication=AttemptPublication.PUBLISHED,
+        failure_stage=None,
+        failure_category=None,
+    )
+
+
+def test_child_returns_trusted_findings_status_without_finding_text(tmp_path: Path) -> None:
+    completed, outcome = _run_child_with_outcome(tmp_path, mode="issues_found")
+
+    assert completed.returncode == 0
+    assert outcome.status is AttemptStatus.REVIEWED
+    assert outcome.review_status == "issues_found"
+    assert outcome.publication is AttemptPublication.PUBLISHED
+    assert b"Bounded fixture finding" not in outcome.to_json_bytes()
+    assert b"Validated fixture evidence" not in outcome.to_json_bytes()
+
+
+@pytest.mark.parametrize(
+    ("mode", "status", "publication", "review_status", "stage", "category"),
+    [
+        (
+            "review_failure",
+            AttemptStatus.FAILED,
+            AttemptPublication.NOT_ATTEMPTED,
+            None,
+            "review_size",
+            "review_too_large",
+        ),
+        (
+            "timeout",
+            AttemptStatus.TIMED_OUT,
+            AttemptPublication.NOT_ATTEMPTED,
+            None,
+            "review",
+            "timeout",
+        ),
+        (
+            "publication_failure",
+            AttemptStatus.FAILED,
+            AttemptPublication.NOT_ATTEMPTED,
+            None,
+            "publication",
+            "review_failure",
+        ),
+        (
+            "cleanup_failure",
+            AttemptStatus.FAILED,
+            AttemptPublication.PUBLISHED,
+            "no_important_issues",
+            "cleanup",
+            "review_failure",
+        ),
+    ],
+)
+def test_child_returns_normalized_failure_without_losing_publication_state(  # noqa: PLR0913
+    tmp_path: Path,
+    mode: str,
+    status: AttemptStatus,
+    publication: AttemptPublication,
+    review_status: str | None,
+    stage: str,
+    category: str,
+) -> None:
+    completed, outcome = _run_child_with_outcome(tmp_path, mode=mode)
+
+    assert completed.returncode != 0
+    assert outcome.status is status
+    assert outcome.publication is publication
+    assert outcome.review_status == review_status
+    assert outcome.failure_stage == stage
+    assert outcome.failure_category == category
+    unsafe_process_text = completed.stdout + completed.stderr
+    assert b"secret" not in outcome.to_json_bytes()
+    assert b"model text" not in outcome.to_json_bytes()
+    assert b"subprocess output" not in outcome.to_json_bytes()
+    assert outcome.to_json_bytes() not in unsafe_process_text
 
 
 def test_child_preserves_normalized_review_failure_and_still_cleans_up(
