@@ -323,6 +323,17 @@ def _wait_for_check_run(
             )
             if github.is_owned_check_run(check_run, identity=identity)
         )
+        for check_run in owned:
+            active_shape = {
+                "Review queued": CheckRunStatus.QUEUED,
+                "Review in progress": CheckRunStatus.IN_PROGRESS,
+            }.get(check_run.output.title)
+            if active_shape is not None and (
+                check_run.status is not active_shape or check_run.conclusion is not None
+            ):
+                pytest.fail(
+                    "checkpoint B observed an active Check Run title with a terminal state"
+                )
         if len(owned) == 1 and callable(predicate) and predicate(owned[0]):
             return owned[0]
         time.sleep(0.2)
@@ -422,14 +433,18 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
         queued = _wait_for_check_run(
             github,
             request,
-            lambda check: check.status is CheckRunStatus.QUEUED,
+            lambda check: check.status is CheckRunStatus.QUEUED
+            and check.conclusion is None
+            and check.output.title == "Review queued",
         )
         launcher.allow_launch[0].set()
         assert initial_response.result() == (202, '{"status":"accepted"}')
         running = _wait_for_check_run(
             github,
             request,
-            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
+            lambda check: check.status is CheckRunStatus.IN_PROGRESS
+            and check.conclusion is None
+            and check.output.title == "Review in progress",
         )
         assert running.id == queued.id
 
@@ -453,7 +468,9 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
         retry_queued = _wait_for_check_run(
             github,
             request,
-            lambda check: check.status is CheckRunStatus.QUEUED,
+            lambda check: check.status is CheckRunStatus.QUEUED
+            and check.conclusion is None
+            and check.output.title == "Review queued",
         )
         assert retry_queued.id == queued.id
         launcher.allow_launch[1].set()
@@ -461,7 +478,9 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
         retry_running = _wait_for_check_run(
             github,
             request,
-            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
+            lambda check: check.status is CheckRunStatus.IN_PROGRESS
+            and check.conclusion is None
+            and check.output.title == "Review in progress",
         )
         assert retry_running.id == queued.id
         assert launcher.executions[1].attempt_id != launcher.executions[0].attempt_id
@@ -487,13 +506,6 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
             and comment.performed_via_github_app is not None
             and comment.performed_via_github_app.id == github.app_id
         )
-        _record_resources(
-            resources_path,
-            request,
-            completed,
-            comment_id=receipts[3].comment_id,
-        )
-
     assert completed.id == queued.id
     assert completed.head_sha == request.head_sha
     assert completed.external_id == derive_review_identity(request).external_id
@@ -507,3 +519,9 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     assert receipts[0].comment_id == receipts[1].comment_id == receipts[2].comment_id
     assert receipts[3].comment_id != receipts[2].comment_id
     assert [comment.id for comment in owned_revision_comments] == [receipts[3].comment_id]
+    _record_resources(
+        resources_path,
+        request,
+        completed,
+        comment_id=receipts[3].comment_id,
+    )

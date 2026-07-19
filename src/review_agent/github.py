@@ -1002,11 +1002,14 @@ class GitHubAppClient:
         owner, repository_name = self._repository.split("/", maxsplit=1)
         body: dict[str, Any] = {
             "status": presentation.status.value,
+            "conclusion": (
+                presentation.conclusion.value
+                if presentation.conclusion is not None
+                else None
+            ),
             "output": presentation.output.model_dump(mode="json"),
             "actions": [action.model_dump(mode="json") for action in presentation.actions],
         }
-        if presentation.conclusion is not None:
-            body["conclusion"] = presentation.conclusion.value
         response = self._request(
             _Request(
                 operation=operation,

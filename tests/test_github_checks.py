@@ -354,6 +354,51 @@ def test_create_get_and_update_check_run_use_strict_payloads(tmp_path: Path) -> 
     ]
 
 
+def test_check_run_updates_always_send_the_validated_conclusion(tmp_path: Path) -> None:
+    identity = _identity()
+    update_bodies: list[dict[str, object]] = []
+
+    def github_api(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/app/installations/23/access_tokens":
+            return httpx.Response(201, json={"token": "ghs_installation_token"})
+        assert request.method == "PATCH"
+        body = json.loads(request.content)
+        update_bodies.append(body)
+        return httpx.Response(
+            200,
+            json=_check_run_document(
+                status=body["status"],
+                conclusion=body["conclusion"],
+                output=body["output"],
+            ),
+        )
+
+    github = _github(tmp_path, httpx.MockTransport(github_api))
+
+    for output_kind in (
+        CheckRunOutputKind.QUEUED,
+        CheckRunOutputKind.RUNNING,
+        CheckRunOutputKind.CLEAN,
+    ):
+        github.update_check_run(
+            check_run_id=101,
+            installation_id=23,
+            presentation=render_check_run_presentation(
+                output_kind,
+                identity=identity,
+                finding_count=0,
+            ),
+        )
+
+    assert [
+        (body["status"], body["conclusion"]) for body in update_bodies
+    ] == [
+        ("queued", None),
+        ("in_progress", None),
+        ("completed", "success"),
+    ]
+
+
 def test_malformed_check_run_response_is_normalized_without_body(tmp_path: Path) -> None:
     response_secret = "raw_response_must_not_escape"
 
