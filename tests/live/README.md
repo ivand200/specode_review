@@ -3,8 +3,10 @@
 All live profiles are opt-in and must target a disposable, open, non-draft pull request in a
 dedicated repository whose name contains `test`. Normal `pytest` runs skip them. Use a fresh
 accepted base/head revision: durable Check Run identity intentionally makes a repeated completed
-run return `already_reviewed`. Before either profile starts its service or creates any external
-resource, it derives that deterministic review identity and requires both:
+run return `already_reviewed`. Install and verify the production prerequisites from the root
+operator guide before rollout; the profiles require `sbx 0.35.0` and `Codex CLI 0.144.6`.
+Before either profile starts its service or creates any external resource, it derives that
+deterministic review identity and requires both:
 
 - zero application-owned Check Runs for the accepted revision; and
 - zero exact-marker review comments performed by the configured numeric GitHub App ID.

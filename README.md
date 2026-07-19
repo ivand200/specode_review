@@ -98,10 +98,10 @@ silicon, macOS Sonoma or later, and the pinned CLI:
 brew trust docker/tap
 brew install docker/tap/sbx
 sbx login
-npm install --global @openai/codex@0.144.5
+npm install --global @openai/codex@0.144.6
 ```
 
-Startup requires `sbx 0.35.0` and `Codex CLI 0.144.5`. Configure the OpenAI credential in the
+Startup requires `sbx 0.35.0` and `Codex CLI 0.144.6`. Configure the OpenAI credential in the
 Docker Sandboxes host-managed credential proxy; OAuth is preferred:
 
 ```bash

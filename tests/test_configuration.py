@@ -371,7 +371,7 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     runner = RecordingReadinessProcessRunner(
         {
             (sbx, "version"): b"sbx version: v0.35.0 build\n",
-            (codex, "--version"): b"codex-cli 0.144.5\n",
+            (codex, "--version"): b"codex-cli 0.144.6\n",
             (git, "--version"): b"git version 2.50.1\n",
             (sbx, "diagnose"): b"Docker Sandboxes is ready\n",
             (sbx, "kit", "validate", str(settings.attempt.review_kit_path)): b"valid\n",
@@ -417,6 +417,84 @@ def test_readiness_rejects_an_incompatible_version_without_exposing_output(
     assert "99.0.0" not in str(failure.value)
 
 
+@pytest.mark.parametrize(
+    "version_output",
+    [
+        pytest.param(b"codex-cli 0.144.5 token=old-secret\n", id="earlier"),
+        pytest.param(b"codex-cli 0.144.7 token=new-secret\n", id="later"),
+        pytest.param(b"unexpected token=malformed-secret\n", id="malformed"),
+    ],
+)
+def test_readiness_rejects_incompatible_codex_versions_without_exposing_output(
+    tmp_path: Path,
+    version_output: bytes,
+) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    sbx = "/bin/sbx"
+    codex = "/bin/codex"
+    runner = RecordingReadinessProcessRunner(
+        {
+            (sbx, "version"): b"sbx version: v0.35.0\n",
+            (codex, "--version"): version_output,
+        }
+    )
+    readiness = ProductionReadiness(
+        process_runner=runner,
+        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
+    )
+
+    with pytest.raises(StartupReadinessError) as failure:
+        readiness.check(settings)
+
+    assert failure.value.stage == "codex_version"
+    assert str(failure.value) == "production startup readiness failed: codex_version"
+    assert "secret" not in str(failure.value)
+
+
+def test_readiness_normalizes_failed_codex_version_checks(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    sbx = "/bin/sbx"
+    codex = "/bin/codex"
+
+    def fail_codex_version(
+        arguments: tuple[str, ...],
+        output_max_bytes: int,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del output_max_bytes
+        if arguments == (sbx, "version"):
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=b"sbx version: v0.35.0\n",
+                stderr=b"",
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            1,
+            stdout=b"codex-cli token=stdout-secret\n",
+            stderr=b"token=stderr-secret\n",
+        )
+
+    readiness = ProductionReadiness(
+        process_runner=fail_codex_version,
+        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
+    )
+    caplog.set_level(logging.ERROR, logger="review_agent.readiness")
+
+    with pytest.raises(StartupReadinessError) as failure:
+        readiness.check(settings)
+
+    assert failure.value.stage == "codex_version"
+    observable = (
+        str(failure.value) + "\n" + "\n".join(record.getMessage() for record in caplog.records)
+    )
+    assert "stdout-secret" not in observable
+    assert "stderr-secret" not in observable
+
+
 def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -427,7 +505,7 @@ def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     git = "/bin/git"
     successful = {
         (sbx, "version"): b"sbx version: v0.35.0\n",
-        (codex, "--version"): b"codex-cli 0.144.5\n",
+        (codex, "--version"): b"codex-cli 0.144.6\n",
         (git, "--version"): b"git version 2.50.1\n",
         (sbx, "diagnose"): b"ready\n",
     }
@@ -591,7 +669,8 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
     ):
         assert setting in example
     assert "sbx 0.35.0" in operator_guide
-    assert "Codex CLI 0.144.5" in operator_guide
+    assert "Codex CLI 0.144.6" in operator_guide
+    assert "Codex CLI 0.144.6" in live_guide
     assert "host-managed credential proxy" in operator_guide
     assert "one process" in operator_guide
     assert "RUN_FULL_LIVE_E2E=1" in live_guide
