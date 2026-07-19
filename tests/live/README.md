@@ -10,8 +10,15 @@ run return `already_reviewed`.
 This profile starts the HTTP service on a real socket and sends signed webhooks through the public
 interface. A controlled child first fails, allowing the test to verify a real neutral Check Run
 and its `Retry review` action. It then sends a signed `check_run.requested_action`, verifies queued
-and running states, a fresh attempt ID on the same Check Run, publishes a deterministic rendered
-clean comment, and verifies `completed/success`.
+and running states, and a fresh attempt ID on the same Check Run. The successful controlled retry
+then exercises the public publication interface against GitHub:
+
+1. create the exact-revision clean comment;
+2. replace that complete comment with a findings result while retaining its comment ID;
+3. reuse the already-current findings comment without another write;
+4. delete the comment through GitHub as an external/manual action; and
+5. recreate one clean exact-revision comment with a new comment ID before verifying
+   `completed/success`.
 
 It uses real GitHub writes but no Docker Sandbox, OpenAI authentication, or model budget:
 
@@ -26,10 +33,16 @@ E2E_CREATED_RESOURCES_PATH=/tmp/review-agent-live-resources.jsonl \
 uv run pytest tests/live/test_github_live.py -q -s
 ```
 
-The resource file records the Check Run ID, PR number, and cleanup instruction. Delete the
-recorded automated review comment manually. GitHub Check Runs cannot be deleted through this
-profile; retain it as rollout evidence. After interruption, inspect both the PR and its checks
+The resource file records the Check Run ID, final comment ID, PR number, and cleanup instruction.
+Delete the recorded automated review comment manually. GitHub Check Runs cannot be deleted through
+this profile; retain it as rollout evidence. After interruption, inspect both the PR and its checks
 because GitHub writes can succeed before the local cleanup record is appended.
+
+The live harness cannot safely and deterministically make GitHub accept a comment mutation while
+hiding only its response. Ambiguous create/update reconciliation is therefore covered by the
+controlled, network-free publication tests, which inject a lost mutation result and verify bounded
+read recovery without issuing a second mutation. This limitation must remain in the rollout record
+rather than being represented as live evidence.
 
 ## No-model Docker Sandbox lifecycle
 
@@ -83,6 +96,13 @@ approval for GitHub writes, model cost, Docker Sandbox use, and the expected run
 For each checkpoint, retain the command, accepted base/head SHAs, result, Check Run URL/ID, comment
 ID, timestamp, and operator. Before production, also record:
 
+- initial creation, same-revision replacement, already-current reuse, and deletion/recreation
+  dispositions from Checkpoint B;
+- that ambiguous-publication reconciliation passed in the network-free suite but was not induced
+  against live GitHub;
+- no GitHub App permission beyond existing Checks write, Contents read, and Pull requests write;
+- no comment-reconciliation environment setting, persistent review artifact, publication-only
+  retry action, or retained model output;
 - `STATE_ROOT` backup and restore ownership verification;
 - one-process/one-host supervisor configuration;
 - liveness and readiness probe results;

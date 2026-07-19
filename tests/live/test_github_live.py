@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
+import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
@@ -19,13 +20,18 @@ from fastapi import FastAPI
 from review_agent.attempt import AttemptOutcome
 from review_agent.coordinator import ReviewAttemptCoordinator
 from review_agent.github import (
+    GITHUB_API_VERSION,
     CheckRun,
     CheckRunStatus,
     GitHubAppClient,
     derive_review_identity,
 )
-from review_agent.models import DiffRange, ReviewRequest, ReviewResult
-from review_agent.publishing import render_review_comment
+from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
+from review_agent.publishing import (
+    PublicationDisposition,
+    PublicationReceipt,
+    publish_review_result,
+)
 from review_agent.reconciliation import CheckRunReconciler
 from review_agent.web import create_app
 
@@ -88,6 +94,63 @@ def _send_signed_webhook(
         return response.status, response.read().decode()
 
 
+def _review_result(
+    request: ReviewRequest,
+    *,
+    findings: tuple[Finding, ...] = (),
+) -> ReviewResult:
+    return ReviewResult(
+        repository=request.repository,
+        pr_number=request.pr_number,
+        diff_range=DiffRange(
+            start_sha=request.base_sha,
+            end_sha=request.head_sha,
+        ),
+        status="issues_found" if findings else "no_important_issues",
+        findings=findings,
+    )
+
+
+def _live_finding() -> Finding:
+    return Finding(
+        severity="important",
+        title="Controlled live-profile finding",
+        locations=(
+            Location(
+                path="README.md",
+                line=1,
+                description="Controlled publication lifecycle evidence.",
+            ),
+        ),
+        evidence="The live profile intentionally changes the complete rendered review body.",
+        impact="This proves a successful same-revision publication replaces the prior comment.",
+        suggested_fix="Use the final clean result emitted by the controlled profile.",
+    )
+
+
+def _delete_review_comment(
+    github: GitHubAppClient,
+    request: ReviewRequest,
+    *,
+    comment_id: int,
+) -> None:
+    owner, repository_name = request.repository.split("/", maxsplit=1)
+    token = github.installation_token(
+        repository=request.repository,
+        installation_id=request.installation_id,
+    )
+    response = httpx.delete(
+        f"https://api.github.com/repos/{owner}/{repository_name}/issues/comments/{comment_id}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+        timeout=30,
+    )
+    assert response.status_code == httpx.codes.NO_CONTENT
+
+
 class _ControlledExecution:
     def __init__(
         self,
@@ -103,27 +166,52 @@ class _ControlledExecution:
         self._request = request
         self._github = github
         self._publish_clean_comment = publish_clean_comment
+        self.publication_receipts: tuple[PublicationReceipt, ...] = ()
         self.release = threading.Event()
 
     async def wait(self) -> AttemptOutcome:
         await asyncio.to_thread(self.release.wait)
         if self._publish_clean_comment:
-            result = ReviewResult(
-                repository=self._request.repository,
-                pr_number=self._request.pr_number,
-                diff_range=DiffRange(
-                    start_sha=self._request.base_sha,
-                    end_sha=self._request.head_sha,
-                ),
-                status="no_important_issues",
-                findings=(),
+            clean_result = _review_result(self._request)
+            findings_result = _review_result(
+                self._request,
+                findings=(_live_finding(),),
+            )
+            created = await asyncio.to_thread(
+                publish_review_result,
+                request=self._request,
+                result=clean_result,
+                gateway=self._github,
+            )
+            updated = await asyncio.to_thread(
+                publish_review_result,
+                request=self._request,
+                result=findings_result,
+                gateway=self._github,
+            )
+            already_current = await asyncio.to_thread(
+                publish_review_result,
+                request=self._request,
+                result=findings_result,
+                gateway=self._github,
             )
             await asyncio.to_thread(
-                self._github.publish,
-                repository=self._request.repository,
-                pr_number=self._request.pr_number,
-                installation_id=self._request.installation_id,
-                body=render_review_comment(result),
+                _delete_review_comment,
+                self._github,
+                self._request,
+                comment_id=already_current.comment_id,
+            )
+            recreated = await asyncio.to_thread(
+                publish_review_result,
+                request=self._request,
+                result=clean_result,
+                gateway=self._github,
+            )
+            self.publication_receipts = (
+                created,
+                updated,
+                already_current,
+                recreated,
             )
         return self._outcome
 
@@ -240,7 +328,13 @@ def _wait_for_check_run(
     pytest.fail("timed out waiting for the expected Review Agent Check Run state")
 
 
-def _record_resources(path: Path, request: ReviewRequest, check_run: CheckRun) -> None:
+def _record_resources(
+    path: Path,
+    request: ReviewRequest,
+    check_run: CheckRun,
+    *,
+    comment_id: int,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as resources:
         resources.write(
@@ -250,6 +344,7 @@ def _record_resources(path: Path, request: ReviewRequest, check_run: CheckRun) -
                     "repository": request.repository,
                     "pr_number": request.pr_number,
                     "check_run_id": check_run.id,
+                    "comment_id": comment_id,
                     "cleanup": (
                         "delete the checkpoint B automated review comment; "
                         "the Check Run remains as rollout evidence"
@@ -262,7 +357,7 @@ def _record_resources(path: Path, request: ReviewRequest, check_run: CheckRun) -
 
 
 @pytest.mark.live_github
-def test_real_check_run_failure_retries_same_check_and_publishes_clean_comment(
+def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     tmp_path: Path,
 ) -> None:
     if os.environ.get("RUN_LIVE_GITHUB_E2E") != "1":
@@ -371,9 +466,36 @@ def test_real_check_run_failure_retries_same_check_and_publishes_clean_comment(
             and check.conclusion == "success"
             and not check.actions,
         )
+        receipts = launcher.executions[1].publication_receipts
+        marker = f"<!-- {derive_review_identity(request).external_id} -->"
+        owned_revision_comments = tuple(
+            comment
+            for comment in github.list_review_comments(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                installation_id=request.installation_id,
+            )
+            if comment.body.endswith(f"{marker}\n")
+            and comment.performed_via_github_app is not None
+            and comment.performed_via_github_app.id == github.app_id
+        )
+        _record_resources(
+            resources_path,
+            request,
+            completed,
+            comment_id=receipts[3].comment_id,
+        )
 
     assert completed.id == queued.id
     assert completed.head_sha == request.head_sha
     assert completed.external_id == derive_review_identity(request).external_id
     assert completed.output.title == "Review complete — no important findings"
-    _record_resources(resources_path, request, completed)
+    assert [receipt.disposition for receipt in receipts] == [
+        PublicationDisposition.CREATED,
+        PublicationDisposition.UPDATED,
+        PublicationDisposition.ALREADY_CURRENT,
+        PublicationDisposition.CREATED,
+    ]
+    assert receipts[0].comment_id == receipts[1].comment_id == receipts[2].comment_id
+    assert receipts[3].comment_id != receipts[2].comment_id
+    assert [comment.id for comment in owned_revision_comments] == [receipts[3].comment_id]

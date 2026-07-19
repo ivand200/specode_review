@@ -33,6 +33,13 @@ and accepted head SHA. GitHub is the durable duplicate source, so redelivery aft
 application restart does not repeat the review. The service has no waiting queue: it starts up to
 `MAX_CONCURRENT_REVIEWS` attempts and rejects distinct work at capacity.
 
+Review Agent also owns at most one top-level summary comment for that exact identity. A successful
+complete retry replaces the full existing comment when the rendered result changed, or reuses it
+without a write when it is already current. A different accepted base or head SHA has a different
+identity and receives a distinct comment. A failed or incomplete retry does not mutate the last
+successfully published review, and manually deleting a revision comment allows a later successful
+complete retry to recreate it.
+
 The parent process owns Check Run creation and every later transition. It persists only the latest
 desired Check Run state before sending an update to GitHub, retries transient update failures with
 capped backoff, and replays pending state after restart. The child owns exact-revision
@@ -71,7 +78,10 @@ One `Review Agent` Check Run is attached to the accepted head:
 Incomplete states expose one `Retry review` action. The signed
 `check_run.requested_action` delivery revalidates current GitHub state, reuses the same Check Run,
 and launches a fresh attempt ID. Completed clean or findings-bearing reviews cannot be retried.
-When publication is unknown, the summary warns that retrying may duplicate a comment.
+When publication is unknown, Review Agent has exhausted its bounded read-after-mutation checks
+without confirming one final application-owned comment state. Inspect the pull request before
+retrying; a complete retry will reconcile, replace, or reuse the exact-revision comment instead of
+blindly creating another.
 
 No Check Run update is discarded merely because GitHub is temporarily unavailable. The
 application writes the latest desired projection under `STATE_ROOT`, retries it, and removes the
@@ -147,7 +157,8 @@ workspace roots, and sandbox-name prefixes.
 `RECONCILIATION_INTERVAL_SECONDS` controls periodic pending-update replay and
 `SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS` bounds the final pass. Defaults are normally suitable.
 There is no waiting queue, so size `MAX_CONCURRENT_REVIEWS` for available CPU, memory, and Sandbox
-capacity.
+capacity. Comment-mutation reconciliation has a fixed, deadline-aware policy and adds no
+environment setting or persistent review artifact.
 
 ## Run locally with ngrok
 
@@ -228,7 +239,9 @@ If a PR has no comment:
 
 Do not manually remove pending outbox files during an outage. Restore GitHub connectivity and let
 reconciliation converge. If an interrupted publication is reported as unknown, inspect the PR
-before retrying because the action may produce a duplicate comment.
+before retrying. If more than one application-owned comment for the same exact revision is present,
+do not delete or select one automatically; resolve the inconsistent external state explicitly,
+then use the complete `Retry review` action. There is no publication-only retry workflow.
 
 ## Deployment and rollout gates
 

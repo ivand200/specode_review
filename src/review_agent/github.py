@@ -442,8 +442,9 @@ def _render_incomplete_presentation(
     elif output_kind is CheckRunOutputKind.PUBLICATION_UNKNOWN:
         title = "Review incomplete — publication unknown"
         summary = (
-            f"The advisory review for accepted range {accepted_range} ended before publication "
-            "could be confirmed. Retrying may duplicate a previously published comment."
+            f"The advisory review for accepted range {accepted_range} ended before Review Agent "
+            "could confirm the final application-owned comment state. Inspect the pull request "
+            "before retrying."
         )
     elif output_kind is CheckRunOutputKind.TECHNICAL_FAILURE:
         if failure_stage is None or failure_category is None:
