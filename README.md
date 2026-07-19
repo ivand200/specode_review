@@ -194,6 +194,24 @@ curl --fail --silent --show-error http://127.0.0.1:8000/health/live
 curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
 ```
 
+For rollout verification, the single real-system campaign prepares two fresh disposable pull
+requests and runs the network-free checks, no-model Sandbox lifecycle, real GitHub retry
+lifecycle, and full production/model lifecycle in fail-fast order:
+
+```bash
+set -a
+source .env
+set +a
+uv run review-agent-real-e2e \
+  --repository <owner/test-repository> \
+  --evidence-root /tmp/review-agent-real-e2e
+```
+
+Invoking this command authorizes its documented Docker Sandbox, GitHub, and one-model-request
+effects; no additional model-cost flag is required. See
+[`tests/live/README.md`](tests/live/README.md#ordered-truthful-real-e2e-campaign) for prerequisites,
+model override, evidence interpretation, interruption handling, and manual cleanup.
+
 Liveness means the web process is alive. Readiness becomes successful only after persistent state,
 the repository lock, host readiness, stale-resource cleanup, GitHub installation lookup, and
 coordinator/reconciler startup all succeed. It becomes unavailable before shutdown stops

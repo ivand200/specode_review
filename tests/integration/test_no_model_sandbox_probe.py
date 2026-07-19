@@ -92,7 +92,7 @@ def test_test_only_no_model_probe_is_fresh_bounded_and_swept(  # noqa: PLR0915
             cleanup_timeout_seconds=30,
         )
     )
-    prefix = "review-agent-it-"
+    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "review-agent-it-")
     resource_manager = ReviewResourceManager(
         workspace_root=workspace_root,
         sandbox_prefix=prefix,

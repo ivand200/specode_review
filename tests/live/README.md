@@ -14,6 +14,42 @@ deterministic review identity and requires both:
 If either exists, stop and manually prepare a new accepted SHA on the disposable PR. The profiles
 do not create commits, move branches, delete old evidence, or repair a polluted fixture.
 
+## Ordered truthful real E2E campaign
+
+Run the complete rollout campaign from the repository root after installing the production
+prerequisites, signing in to `sbx`, authenticating the operator `gh` CLI for the dedicated test
+repository, and loading the normal production environment:
+
+```bash
+set -a
+source .env
+set +a
+uv run review-agent-real-e2e \
+  --repository ivand200/test_repo \
+  --evidence-root /tmp/review-agent-real-e2e
+```
+
+The command itself authorizes the documented Docker Sandbox use, two operator-authenticated
+fixture branches and pull requests, Checkpoint B and C GitHub writes, and one Checkpoint C model
+request. There is no separate cost-acknowledgement option. Omit `--repository` to use
+`GITHUB_REPOSITORY`, omit `--model` to use `CODEX_MODEL`, or supply `--model <approved-model>` to
+override only Checkpoint C. `--campaign-id` is optional; generated identifiers are unique and
+bounded.
+
+The campaign runs Ruff, strict mypy, the complete network-free pytest suite, the no-model Docker
+Sandbox profile, fixture preparation, Checkpoint B, and Checkpoint C in that order. It stops at
+the first failure and exits nonzero. Its JSON summary and
+`<evidence-root>/<campaign-id>/campaign-summary.json` contain only bounded stage results, fixture
+URLs and accepted SHAs, and resource IDs verified by successful profiles. A failed or interrupted
+profile may have completed external writes before returning, so inspect every fixture URL and
+GitHub check before retrying; never reuse the same campaign identifier or accepted revision.
+
+After a successful campaign, manually delete the recorded Checkpoint B and C comments. Retain the
+Check Runs as rollout evidence. Close the two disposable pull requests and delete their fixture
+branches only when the release owner no longer needs them. The campaign never performs those
+destructive actions automatically. Campaign state, workspace, server, and Sandbox cleanup remains
+owned by the existing profiles; a cleanup assertion failure is a campaign failure.
+
 ## Checkpoint B: real GitHub lifecycle without a model
 
 This profile starts the HTTP service on a real socket and sends signed webhooks through the public
