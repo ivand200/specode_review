@@ -9,7 +9,7 @@ from typing import Protocol
 from review_agent.deadline import remaining_review_time
 
 
-class _ProcessOutputLimitError(Exception):
+class ProcessOutputLimitError(Exception):
     pass
 
 
@@ -102,7 +102,7 @@ def _run_bounded_process(  # noqa: C901, PLR0912, PLR0915
         process.stderr.close()
 
     if exceeded:
-        raise _ProcessOutputLimitError
+        raise ProcessOutputLimitError
     completed = subprocess.CompletedProcess(
         arguments,
         return_code,

@@ -2,9 +2,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol, TypeVar, runtime_checkable
+
+from pydantic import ValidationError
 
 from review_agent.configuration import (
     CodexExecutionPolicy,
@@ -13,7 +16,13 @@ from review_agent.configuration import (
 )
 from review_agent.core import CandidateContract, ReviewContext
 from review_agent.errors import FailureCategory, ReviewError
-from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
+from review_agent.models import AgentReview
+from review_agent.process import (
+    ProcessOptions,
+    ProcessOutputLimitError,
+    ProcessRunner,
+    _run_bounded_process,
+)
 from review_agent.resources import AttemptResources
 
 _SANDBOX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")
@@ -426,6 +435,16 @@ class CodexSandboxAdapter:
             )
         except TimeoutError:
             raise
+        except ProcessOutputLimitError as error:
+            raise ReviewError(
+                FailureCategory.CODEX_OR_LIMIT,
+                stage="codex_output_limit",
+            ) from error
+        except subprocess.CalledProcessError as error:
+            raise ReviewError(
+                FailureCategory.CODEX_OR_LIMIT,
+                stage="codex_process_exit",
+            ) from error
         except Exception as error:
             raise ReviewError(
                 FailureCategory.CODEX_OR_LIMIT,
@@ -448,9 +467,16 @@ class CodexSandboxAdapter:
             ) from error
         if len(candidate) > max_bytes:
             raise ReviewError(
-                FailureCategory.CODEX_OR_LIMIT,
+                FailureCategory.INVALID_MODEL_OUTPUT,
                 stage="codex_candidate_output",
             )
+        try:
+            AgentReview.model_validate_json(candidate, strict=True)
+        except ValidationError as error:
+            raise ReviewError(
+                FailureCategory.INVALID_MODEL_OUTPUT,
+                stage="codex_candidate_output",
+            ) from error
         return candidate
 
     @staticmethod

@@ -21,6 +21,7 @@ from review_agent.configuration import (
     SandboxOperationPolicy,
 )
 from review_agent.core import CandidateContract
+from review_agent.process import ProcessOutputLimitError
 from review_agent.resources import AttemptResources
 from review_agent.sandbox import (
     CodexSandboxAdapter,
@@ -415,7 +416,24 @@ def test_codex_sandbox_runner_normalizes_codex_cli_failure(tmp_path: Path) -> No
         adapter.produce(context, _candidate_contract())
 
     assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
-    assert failure.value.stage == "codex_execution"
+    assert failure.value.stage == "codex_process_exit"
+    assert client.removed == [client.created[0][0]]
+
+
+def test_codex_sandbox_runner_normalizes_bounded_process_output_overflow(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        codex_error=ProcessOutputLimitError(),
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
+    assert failure.value.stage == "codex_output_limit"
     assert client.removed == [client.created[0][0]]
 
 
@@ -523,6 +541,23 @@ def test_codex_sandbox_runner_has_no_loose_text_fallback(tmp_path: Path) -> None
     assert client.removed == [client.created[0][0]]
 
 
+def test_codex_sandbox_adapter_rejects_a_malformed_candidate(
+    tmp_path: Path,
+) -> None:
+    context = _review_context(tmp_path)
+    client = RecordingCodexSandboxClient(
+        context.request.head_sha,
+        result_bytes=b'{"findings":"untrusted candidate text"}',
+    )
+
+    with pytest.raises(ReviewError) as failure:
+        _adapter(tmp_path, client).produce(context, _candidate_contract())
+
+    assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
+    assert failure.value.stage == "codex_candidate_output"
+    assert client.removed == [client.created[0][0]]
+
+
 def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
     tmp_path: Path,
 ) -> None:
@@ -563,7 +598,7 @@ def test_codex_sandbox_adapter_bounds_candidate_reading_with_the_contract(
             _candidate_contract(max_bytes=len(exact_candidate)),
         )
 
-    assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
+    assert failure.value.category is FailureCategory.INVALID_MODEL_OUTPUT
     assert failure.value.stage == "codex_candidate_output"
     assert oversized_client.removed == [oversized_client.created[0][0]]
 
@@ -599,7 +634,7 @@ def test_codex_sandbox_adapter_preserves_primary_failure_when_cleanup_also_fails
         _adapter(tmp_path, client).produce(context, _candidate_contract())
 
     assert failure.value.category is FailureCategory.CODEX_OR_LIMIT
-    assert failure.value.stage == "codex_execution"
+    assert failure.value.stage == "codex_process_exit"
     assert client.removed == [client.created[0][0]]
 
 
