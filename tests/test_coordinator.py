@@ -2,11 +2,12 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self
+from unittest.mock import patch
 
 import pytest
 
 from review_agent.attempt import AttemptOutcome, AttemptPublication, AttemptStatus
-from review_agent.coordinator import ReviewAttemptCoordinator
+from review_agent.coordinator import RetryReviewRequest, ReviewAttemptCoordinator
 from review_agent.errors import FailureCategory
 from review_agent.github import (
     CHECK_RUN_NAME,
@@ -48,6 +49,7 @@ def _check_run(
     check_run_id: int = 101,
     status: CheckRunStatus = CheckRunStatus.QUEUED,
     conclusion: CheckRunConclusion | None = None,
+    retryable: bool = False,
 ) -> CheckRun:
     return CheckRun.model_validate(
         {
@@ -59,7 +61,17 @@ def _check_run(
             "conclusion": conclusion,
             "app": {"id": 12345},
             "output": {"title": "Review queued", "summary": "Queued."},
-            "actions": [],
+            "actions": (
+                [
+                    {
+                        "label": "Retry review",
+                        "description": "Retry this incomplete advisory review.",
+                        "identifier": "retry_review",
+                    }
+                ]
+                if retryable
+                else []
+            ),
         }
     )
 
@@ -70,7 +82,11 @@ class _GitHub:
         self.events: list[str] = []
         self.list_error = False
         self.create_error = False
+        self.get_error = False
+        self.get_calls = 0
+        self.review_request_error = False
         self.updates: list[CheckRunPresentation] = []
+        self.review_request_value = _request()
 
     def list_check_runs(
         self,
@@ -110,6 +126,19 @@ class _GitHub:
             and check_run.external_id == identity.external_id
         )
 
+    def get_check_run(self, *, check_run_id: int, installation_id: int) -> CheckRun:
+        del installation_id
+        self.get_calls += 1
+        if self.get_error:
+            raise GitHubError(GitHubOperation.CHECK_RUN_READ)
+        return next(check_run for check_run in self.check_runs if check_run.id == check_run_id)
+
+    def review_request(self, *, pr_number: int, installation_id: int) -> ReviewRequest:
+        del pr_number, installation_id
+        if self.review_request_error:
+            raise GitHubError(GitHubOperation.PULL_REQUEST_READ)
+        return self.review_request_value
+
     def update_check_run(
         self,
         *,
@@ -138,15 +167,26 @@ class _Process:
         self._github = github
         self._attempt = attempt
         self.launches = 0
+        self.launch_attempt_ids: list[str | None] = []
+        self.launch_check_run_ids: list[int] = []
         self.launch_error: AttemptLaunchError | None = None
 
-    async def launch(self, request: ReviewRequest, *, check_run_id: int) -> _Attempt:
-        del request, check_run_id
-        assert self._github.events[-1] == "created"
+    async def launch(
+        self,
+        request: ReviewRequest,
+        *,
+        check_run_id: int,
+        attempt_id: str | None = None,
+    ) -> _Attempt:
+        del request
         self._github.events.append("launched")
         self.launches += 1
+        self.launch_attempt_ids.append(attempt_id)
+        self.launch_check_run_ids.append(check_run_id)
         if self.launch_error is not None:
             raise self.launch_error
+        if attempt_id is not None:
+            assert attempt_id == self._attempt.attempt_id
         return self._attempt
 
     def use_attempt(self, attempt: _Attempt) -> None:
@@ -198,6 +238,7 @@ def test_new_identity_creates_check_run_before_launch_and_returns_without_waitin
             github=github,
             process=process,
             reconciler=reconciler,
+            installation_id=23,
         )
 
         async with coordinator:
@@ -223,6 +264,7 @@ def test_durable_check_run_state_prevents_duplicate_execution() -> None:
             github=github,
             process=process,
             reconciler=_Reconciler(),
+            installation_id=23,
         )
 
         async with coordinator:
@@ -252,6 +294,7 @@ def test_capacity_is_reserved_before_creation_and_released_after_completion() ->
             github=github,
             process=process,
             reconciler=_Reconciler(),
+            installation_id=23,
             max_concurrent_reviews=1,
         )
 
@@ -342,6 +385,7 @@ def test_completed_attempts_map_to_advisory_terminal_states() -> None:
             github=github,
             process=process,
             reconciler=reconciler,
+            installation_id=23,
         )
         async with coordinator:
             assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
@@ -367,6 +411,7 @@ def test_github_unavailability_never_launches_invisible_work() -> None:
             github=github,
             process=process,
             reconciler=_Reconciler(),
+            installation_id=23,
         )
 
         async with coordinator:
@@ -398,6 +443,7 @@ def test_launch_failure_is_retryable_and_does_not_retain_capacity() -> None:
             github=github,
             process=process,
             reconciler=reconciler,
+            installation_id=23,
         )
 
         async with coordinator:
@@ -428,6 +474,7 @@ def test_concurrent_duplicate_submissions_cross_lookup_create_boundary_once() ->
             github=github,
             process=process,
             reconciler=_Reconciler(),
+            installation_id=23,
         )
 
         async with coordinator:
@@ -446,20 +493,303 @@ def test_concurrent_duplicate_submissions_cross_lookup_create_boundary_once() ->
     asyncio.run(exercise())
 
 
-def test_single_use_lifecycle_rejects_admission_outside_active_context() -> None:
+def test_retry_reuses_incomplete_check_run_with_fresh_attempt_id() -> None:
     async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        attempt = _Attempt(_outcome(attempt_id="2" * 32))
+        process = _Process(github, attempt)
+        reconciler = _Reconciler()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            installation_id=23,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        with patch("review_agent.coordinator.uuid.uuid4") as generate_attempt_id:
+            generate_attempt_id.return_value.hex = "2" * 32
+            async with coordinator:
+                try:
+                    assert await coordinator.retry(retry) is SubmissionOutcome.ACCEPTED
+                    assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_RUNNING
+                finally:
+                    attempt.release.set()
+
+        assert process.launches == 1
+        assert process.launch_check_run_ids == [incomplete.id]
+        assert process.launch_attempt_ids == ["2" * 32]
+        assert [state.check_run_id for state in reconciler.desired] == [incomplete.id] * 3
+        assert [state.output_kind.value for state in reconciler.desired] == [
+            "queued",
+            "running",
+            "clean",
+        ]
+        assert [state.attempt_id for state in reconciler.desired] == ["2" * 32] * 3
+
+    asyncio.run(exercise())
+
+
+def test_retry_replay_uses_current_check_run_state_to_prevent_duplicate_work() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        event_check_run = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
         github = _GitHub()
         process = _Process(github, _Attempt(_outcome()))
         coordinator = ReviewAttemptCoordinator(
             github=github,
             process=process,
             reconciler=_Reconciler(),
+            installation_id=23,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=event_check_run,
+        )
+
+        async with coordinator:
+            github.check_runs = [_check_run(identity, status=CheckRunStatus.IN_PROGRESS)]
+            assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_RUNNING
+
+            github.check_runs = [
+                _check_run(
+                    identity,
+                    status=CheckRunStatus.COMPLETED,
+                    conclusion=CheckRunConclusion.SUCCESS,
+                )
+            ]
+            assert await coordinator.retry(retry) is SubmissionOutcome.ALREADY_REVIEWED
+
+        assert process.launches == 0
+
+    asyncio.run(exercise())
+
+
+def test_retry_rejects_unowned_event_and_stale_review_revision_without_launch() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        owned = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        unowned = owned.model_copy(update={"name": "Another App"})
+        github = _GitHub()
+        github.check_runs = [owned]
+        process = _Process(github, _Attempt(_outcome()))
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=_Reconciler(),
+            installation_id=23,
+        )
+
+        async with coordinator:
+            assert (
+                await coordinator.retry(
+                    RetryReviewRequest(
+                        installation_id=999,
+                        identity=identity,
+                        check_run=owned,
+                    )
+                )
+                is SubmissionOutcome.ALREADY_REVIEWED
+            )
+            assert (
+                await coordinator.retry(
+                    RetryReviewRequest(
+                        installation_id=request.installation_id,
+                        identity=identity,
+                        check_run=unowned,
+                    )
+                )
+                is SubmissionOutcome.ALREADY_REVIEWED
+            )
+            assert github.get_calls == 0
+
+            github.review_request_value = _request(head_sha="c" * 40)
+            assert (
+                await coordinator.retry(
+                    RetryReviewRequest(
+                        installation_id=request.installation_id,
+                        identity=identity,
+                        check_run=owned,
+                    )
+                )
+                is SubmissionOutcome.ALREADY_REVIEWED
+            )
+
+        assert process.launches == 0
+
+    asyncio.run(exercise())
+
+
+def test_retry_unavailability_and_capacity_do_not_change_check_run() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        process = _Process(github, _Attempt(_outcome()))
+        reconciler = _Reconciler()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            installation_id=23,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        async with coordinator:
+            github.get_error = True
+            assert await coordinator.retry(retry) is SubmissionOutcome.UNAVAILABLE
+            github.get_error = False
+            github.review_request_error = True
+            assert await coordinator.retry(retry) is SubmissionOutcome.UNAVAILABLE
+            github.review_request_error = False
+
+            active = _Attempt(_outcome(attempt_id="3" * 32))
+            process.use_attempt(active)
+            github.check_runs.clear()
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            github.check_runs = [incomplete]
+            assert await coordinator.retry(retry) is SubmissionOutcome.AT_CAPACITY
+            active.release.set()
+
+        assert [state.output_kind.value for state in reconciler.desired] == [
+            "running",
+            "clean",
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_retry_launch_failure_restores_retryable_terminal_state_and_capacity() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        failed = _outcome(
+            attempt_id="4" * 32,
+            status=AttemptStatus.FAILED,
+            review_status=None,
+            publication=AttemptPublication.NOT_ATTEMPTED,
+            failure_stage="launch",
+            failure_category=FailureCategory.REVIEW_FAILURE,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        process = _Process(github, _Attempt(_outcome()))
+        process.launch_error = AttemptLaunchError(failed)
+        reconciler = _Reconciler()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            installation_id=23,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        with patch("review_agent.coordinator.uuid.uuid4") as generate_attempt_id:
+            generate_attempt_id.return_value.hex = "4" * 32
+            async with coordinator:
+                assert await coordinator.retry(retry) is SubmissionOutcome.UNAVAILABLE
+
+                process.launch_error = None
+                next_attempt = _Attempt(_outcome(attempt_id="5" * 32))
+                process.use_attempt(next_attempt)
+                github.check_runs.clear()
+                assert (
+                    await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                    is SubmissionOutcome.ACCEPTED
+                )
+                next_attempt.release.set()
+
+        assert [state.output_kind.value for state in reconciler.desired] == [
+            "queued",
+            "technical_failure",
+            "running",
+            "clean",
+        ]
+        assert reconciler.desired[0].attempt_id == "4" * 32
+        assert reconciler.desired[1].attempt_id == "4" * 32
+
+    asyncio.run(exercise())
+
+
+def test_single_use_lifecycle_rejects_admission_outside_active_context() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        request = _request()
+        identity = derive_review_identity(request)
+        retry = RetryReviewRequest(
+            installation_id=23,
+            identity=identity,
+            check_run=_check_run(
+                identity,
+                status=CheckRunStatus.COMPLETED,
+                conclusion=CheckRunConclusion.NEUTRAL,
+                retryable=True,
+            ),
+        )
+        process = _Process(github, _Attempt(_outcome()))
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=_Reconciler(),
+            installation_id=23,
         )
 
         assert await coordinator.start(_request()) is SubmissionOutcome.STOPPING
+        assert await coordinator.retry(retry) is SubmissionOutcome.STOPPING
         async with coordinator:
             pass
         assert await coordinator.start(_request()) is SubmissionOutcome.STOPPING
+        assert await coordinator.retry(retry) is SubmissionOutcome.STOPPING
 
         with pytest.raises(
             RuntimeError,
@@ -493,6 +823,7 @@ def test_coordinator_persists_real_latest_state_with_controlled_time(tmp_path: P
             github=github,
             process=_Process(github, attempt),
             reconciler=reconciler,
+            installation_id=23,
         )
 
         async with coordinator:

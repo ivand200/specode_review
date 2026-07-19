@@ -1,7 +1,10 @@
 import asyncio
+import uuid
 from enum import Enum, auto
 from types import TracebackType
 from typing import Protocol, Self
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from review_agent.attempt import AttemptOutcome, AttemptPublication, AttemptStatus
 from review_agent.github import (
@@ -23,6 +26,16 @@ from review_agent.reconciliation import DesiredCheckRun
 _MAX_CONCURRENT_REVIEWS = 10
 
 
+class RetryReviewRequest(BaseModel):
+    """Bounded identity and event state for one explicit Check Run retry."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    installation_id: int = Field(gt=0, strict=True)
+    identity: ReviewIdentity
+    check_run: CheckRun
+
+
 class CheckRunGateway(Protocol):
     def list_check_runs(
         self,
@@ -38,6 +51,10 @@ class CheckRunGateway(Protocol):
         installation_id: int,
     ) -> CheckRun: ...
 
+    def get_check_run(self, *, check_run_id: int, installation_id: int) -> CheckRun: ...
+
+    def review_request(self, *, pr_number: int, installation_id: int) -> ReviewRequest: ...
+
     def is_owned_check_run(
         self,
         check_run: CheckRun,
@@ -52,6 +69,7 @@ class AttemptLauncher(Protocol):
         request: ReviewRequest,
         *,
         check_run_id: int,
+        attempt_id: str | None = None,
     ) -> AttemptExecution: ...
 
 
@@ -84,8 +102,12 @@ class ReviewAttemptCoordinator:
         github: CheckRunGateway,
         process: AttemptLauncher,
         reconciler: DesiredStateReconciler,
+        installation_id: int,
         max_concurrent_reviews: int = 1,
     ) -> None:
+        if installation_id < 1:
+            message = "installation_id must be positive"
+            raise ValueError(message)
         if (
             isinstance(max_concurrent_reviews, bool)
             or not isinstance(max_concurrent_reviews, int)
@@ -96,10 +118,12 @@ class ReviewAttemptCoordinator:
         self._github = github
         self._process = process
         self._reconciler = reconciler
+        self._installation_id = installation_id
         self._max_concurrent_reviews = max_concurrent_reviews
         self._lifecycle = _Lifecycle.CREATED
         self._admission_lock = asyncio.Lock()
         self._reserved = 0
+        self._active_retry_check_runs: set[int] = set()
         self._attempt_tasks: set[asyncio.Task[None]] = set()
 
     async def __aenter__(self) -> Self:
@@ -203,6 +227,117 @@ class ReviewAttemptCoordinator:
             task.add_done_callback(self._attempt_tasks.discard)
             return SubmissionOutcome.ACCEPTED
 
+    async def retry(  # noqa: PLR0911
+        self,
+        request: RetryReviewRequest,
+    ) -> SubmissionOutcome:
+        async with self._admission_lock:
+            if self._lifecycle is not _Lifecycle.ACCEPTING:
+                return SubmissionOutcome.STOPPING
+            current_or_outcome = await self._current_retry_check_run(request)
+            if isinstance(current_or_outcome, SubmissionOutcome):
+                return current_or_outcome
+            if self._reserved >= self._max_concurrent_reviews:
+                return SubmissionOutcome.AT_CAPACITY
+
+            current = current_or_outcome
+            self._reserved += 1
+            self._active_retry_check_runs.add(current.id)
+            try:
+                review_request = await asyncio.to_thread(
+                    self._github.review_request,
+                    pr_number=request.identity.pr_number,
+                    installation_id=request.installation_id,
+                )
+            except GitHubError:
+                self._reserved -= 1
+                self._active_retry_check_runs.discard(current.id)
+                return SubmissionOutcome.UNAVAILABLE
+            if derive_review_identity(review_request) != request.identity:
+                self._reserved -= 1
+                self._active_retry_check_runs.discard(current.id)
+                return SubmissionOutcome.ALREADY_REVIEWED
+
+            attempt_id = uuid.uuid4().hex
+            await self._reconciler.set_desired(
+                DesiredCheckRun(
+                    check_run_id=current.id,
+                    identity=request.identity,
+                    attempt_id=attempt_id,
+                    output_kind=CheckRunOutputKind.QUEUED,
+                )
+            )
+            try:
+                execution = await self._process.launch(
+                    review_request,
+                    check_run_id=current.id,
+                    attempt_id=attempt_id,
+                )
+            except AttemptLaunchError as error:
+                try:
+                    await self._reconciler.set_desired(
+                        _terminal_desired(
+                            check_run_id=current.id,
+                            identity=request.identity,
+                            outcome=error.outcome,
+                        )
+                    )
+                finally:
+                    self._reserved -= 1
+                    self._active_retry_check_runs.discard(current.id)
+                return SubmissionOutcome.UNAVAILABLE
+
+            await self._reconciler.set_desired(
+                DesiredCheckRun(
+                    check_run_id=current.id,
+                    identity=request.identity,
+                    attempt_id=execution.attempt_id,
+                    output_kind=CheckRunOutputKind.RUNNING,
+                )
+            )
+            task = asyncio.create_task(
+                self._complete_attempt(
+                    execution,
+                    check_run_id=current.id,
+                    identity=request.identity,
+                )
+            )
+            self._attempt_tasks.add(task)
+            task.add_done_callback(self._attempt_tasks.discard)
+            return SubmissionOutcome.ACCEPTED
+
+    async def _current_retry_check_run(  # noqa: PLR0911
+        self,
+        request: RetryReviewRequest,
+    ) -> CheckRun | SubmissionOutcome:
+        if request.installation_id != self._installation_id:
+            return SubmissionOutcome.ALREADY_REVIEWED
+        if not self._github.is_owned_check_run(
+            request.check_run,
+            identity=request.identity,
+        ):
+            return SubmissionOutcome.ALREADY_REVIEWED
+        if request.check_run.id in self._active_retry_check_runs:
+            return SubmissionOutcome.ALREADY_RUNNING
+        try:
+            current = await asyncio.to_thread(
+                self._github.get_check_run,
+                check_run_id=request.check_run.id,
+                installation_id=request.installation_id,
+            )
+        except GitHubError:
+            return SubmissionOutcome.UNAVAILABLE
+        if current.id != request.check_run.id or not self._github.is_owned_check_run(
+            current,
+            identity=request.identity,
+        ):
+            return SubmissionOutcome.ALREADY_REVIEWED
+        if current.status is not CheckRunStatus.COMPLETED:
+            return SubmissionOutcome.ALREADY_RUNNING
+        if not _is_retryable(current):
+            return SubmissionOutcome.ALREADY_REVIEWED
+        return current
+
     async def _complete_attempt(
         self,
         execution: AttemptExecution,
@@ -222,6 +357,7 @@ class ReviewAttemptCoordinator:
         finally:
             async with self._admission_lock:
                 self._reserved -= 1
+                self._active_retry_check_runs.discard(check_run_id)
 
 
 def _terminal_desired(
@@ -265,4 +401,19 @@ def _terminal_desired(
             and outcome.failure_category is not None
             else None
         ),
+    )
+
+
+def _is_retryable(check_run: CheckRun) -> bool:
+    if (
+        check_run.status is not CheckRunStatus.COMPLETED
+        or check_run.conclusion != "neutral"
+        or len(check_run.actions) != 1
+    ):
+        return False
+    action = check_run.actions[0]
+    return (
+        action.label == "Retry review"
+        and action.description == "Retry this incomplete advisory review."
+        and action.identifier == "retry_review"
     )

@@ -256,6 +256,10 @@ def test_timeout_and_unknown_publication_are_incomplete_and_retryable(
     assert presentation.status is CheckRunStatus.COMPLETED
     assert presentation.conclusion is CheckRunConclusion.NEUTRAL
     assert [action.identifier for action in presentation.actions] == ["retry_review"]
+    if output_kind is CheckRunOutputKind.PUBLICATION_UNKNOWN:
+        assert "Retrying may duplicate a previously published comment." in (
+            presentation.output.summary
+        )
 
 
 def test_technical_failure_rejects_untrusted_output_details() -> None:

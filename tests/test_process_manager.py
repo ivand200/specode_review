@@ -225,6 +225,29 @@ def test_manager_returns_the_validated_outcome_from_a_real_child(
     assert outcome.failure_category is None
 
 
+def test_manager_uses_parent_assigned_attempt_id_for_retry_launch(
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "attempt-command.json"
+    manager = _manager(tmp_path, receipt)
+    retry_attempt_id = "f" * 32
+
+    async def exercise() -> object:
+        async with manager:
+            execution = await manager.launch(
+                _request(),
+                check_run_id=101,
+                attempt_id=retry_attempt_id,
+            )
+            return await execution.wait()
+
+    outcome = asyncio.run(exercise())
+    command = AttemptCommand.from_json_bytes(receipt.read_bytes())
+
+    assert command.attempt_id == retry_attempt_id
+    assert outcome.attempt_id == retry_attempt_id
+
+
 def test_manager_preserves_published_review_when_parent_cleanup_fails(
     tmp_path: Path,
 ) -> None:

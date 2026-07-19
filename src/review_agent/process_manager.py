@@ -268,9 +268,10 @@ class ReviewProcessManager:
         request: ReviewRequest,
         *,
         check_run_id: int,
+        attempt_id: str | None = None,
     ) -> AttemptExecution:
         """Launch one Check Run attempt, returning after its command is accepted."""
-        attempt_id = uuid.uuid4().hex
+        resolved_attempt_id = attempt_id or uuid.uuid4().hex
         hard_deadline = (
             asyncio.get_running_loop().time()
             + self._attempt_settings.runtime.review_timeout_seconds
@@ -278,21 +279,21 @@ class ReviewProcessManager:
         )
         running = await self._launch_outcome_attempt(
             request,
-            attempt_id=attempt_id,
+            attempt_id=resolved_attempt_id,
             check_run_id=check_run_id,
             hard_deadline=hard_deadline,
         )
         if running is None:
             raise AttemptLaunchError(
                 _normalized_incomplete_outcome(
-                    attempt_id,
+                    resolved_attempt_id,
                     stage="launch",
                     category=FailureCategory.REVIEW_FAILURE,
                     publication=AttemptPublication.NOT_ATTEMPTED,
                 )
             )
         return _ProcessAttemptExecution(
-            attempt_id=attempt_id,
+            attempt_id=resolved_attempt_id,
             running=running,
             manager=self,
         )

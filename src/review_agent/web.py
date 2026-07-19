@@ -3,14 +3,73 @@ import hmac
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Literal, Protocol, runtime_checkable
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from review_agent.coordinator import RetryReviewRequest
+from review_agent.github import CHECK_RUN_NAME, CheckRun, ReviewIdentity
 from review_agent.models import ReviewRequest, bound_description
 from review_agent.process_manager import ReviewExecutionManager, SubmissionOutcome
 
 _MAX_WEBHOOK_BODY_BYTES = 256 * 1024
+
+
+@runtime_checkable
+class _RetryManager(Protocol):
+    async def retry(self, request: RetryReviewRequest) -> SubmissionOutcome: ...
+
+
+class _RetryAction(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    identifier: Literal["retry_review"]
+
+
+class _CommitReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    sha: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
+
+
+class _PullRequestReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    number: int = Field(gt=0, strict=True)
+    base: _CommitReference
+    head: _CommitReference
+
+
+class _RetryCheckRun(CheckRun):
+    pull_requests: tuple[_PullRequestReference, ...] = Field(min_length=1, max_length=100)
+
+
+class _InstallationReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: int = Field(gt=0, strict=True)
+
+
+class _RepositoryReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    full_name: str = Field(
+        min_length=3,
+        max_length=201,
+        pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
+    )
+
+
+class _RetryWebhook(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    action: Literal["requested_action"]
+    requested_action: _RetryAction
+    installation: _InstallationReference
+    repository: _RepositoryReference
+    check_run: _RetryCheckRun
 
 
 async def _read_bounded_body(request: Request) -> bytes:
@@ -89,6 +148,65 @@ def _payload_is_eligible(payload: object, repository: str) -> bool:
     return not draft
 
 
+def _retry_request_from_payload(
+    payload: object,
+    repository: str,
+) -> RetryReviewRequest | None:
+    try:
+        event = _RetryWebhook.model_validate(payload)
+    except ValidationError:
+        return None
+    if event.repository.full_name.lower() != repository.lower():
+        return None
+    if event.check_run.name != CHECK_RUN_NAME:
+        return None
+    external_id = event.check_run.external_id
+    if external_id is None:
+        return None
+    for pull_request in event.check_run.pull_requests:
+        if pull_request.head.sha.lower() != event.check_run.head_sha.lower():
+            continue
+        try:
+            identity = ReviewIdentity(
+                repository=event.repository.full_name,
+                pr_number=pull_request.number,
+                base_sha=pull_request.base.sha,
+                head_sha=pull_request.head.sha,
+                external_id=external_id,
+            )
+        except ValidationError:
+            continue
+        return RetryReviewRequest(
+            installation_id=event.installation.id,
+            identity=identity,
+            check_run=event.check_run,
+        )
+    return None
+
+
+def _submission_response(outcome: SubmissionOutcome) -> JSONResponse:
+    if outcome is SubmissionOutcome.ALREADY_RUNNING:
+        return JSONResponse({"status": "already_running"})
+    if outcome is SubmissionOutcome.ALREADY_REVIEWED:
+        return JSONResponse({"status": "already_reviewed"})
+    if outcome is SubmissionOutcome.AT_CAPACITY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="review execution capacity is full",
+        )
+    if outcome is SubmissionOutcome.STOPPING:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="review service is shutting down",
+        )
+    if outcome is SubmissionOutcome.UNAVAILABLE:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="review execution is unavailable",
+        )
+    return JSONResponse({"status": "accepted"}, status_code=status.HTTP_202_ACCEPTED)
+
+
 async def _accept_github_webhook(
     request: Request,
     *,
@@ -111,11 +229,17 @@ async def _accept_github_webhook(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid webhook signature",
         )
-    if request.headers.get("X-GitHub-Event") != "pull_request":
+    event_name = request.headers.get("X-GitHub-Event")
+    if event_name not in {"pull_request", "check_run"}:
         return JSONResponse({"status": "ignored"})
 
     try:
         payload = json.loads(body)
+        if event_name == "check_run":
+            retry_request = _retry_request_from_payload(payload, repository)
+            if retry_request is None or not isinstance(manager, _RetryManager):
+                return JSONResponse({"status": "ignored"})
+            return _submission_response(await manager.retry(retry_request))
         if not _payload_is_eligible(payload, repository):
             return JSONResponse({"status": "ignored"})
         review_request = _review_request_from_payload(payload)
@@ -132,27 +256,7 @@ async def _accept_github_webhook(
             detail="malformed pull request webhook",
         ) from error
 
-    outcome = await manager.start(review_request)
-    if outcome is SubmissionOutcome.ALREADY_RUNNING:
-        return JSONResponse({"status": "already_running"})
-    if outcome is SubmissionOutcome.ALREADY_REVIEWED:
-        return JSONResponse({"status": "already_reviewed"})
-    if outcome is SubmissionOutcome.AT_CAPACITY:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="review execution capacity is full",
-        )
-    if outcome is SubmissionOutcome.STOPPING:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="review service is shutting down",
-        )
-    if outcome is SubmissionOutcome.UNAVAILABLE:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="review execution is unavailable",
-        )
-    return JSONResponse({"status": "accepted"}, status_code=status.HTTP_202_ACCEPTED)
+    return _submission_response(await manager.start(review_request))
 
 
 def create_app(
