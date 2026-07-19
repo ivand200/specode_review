@@ -7,8 +7,9 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
+from review_agent.ownership import RepositoryOwnership, RepositoryOwnershipError
 from review_agent.process_manager import ReviewProcessManager
-from review_agent.readiness import ProductionReadiness
+from review_agent.readiness import ProductionReadiness, StartupReadinessError
 from review_agent.resources import ReviewResourceManager, SandboxResourceClient
 from review_agent.sandbox import DockerSandboxClient
 from review_agent.web import create_app
@@ -41,7 +42,27 @@ def create_production_app(
         sandbox_prefix=runtime.sandbox_name_prefix,
         sandbox_client=resolved_sandbox_client,
     )
-    resource_manager.sweep_stale()
+    ownership: RepositoryOwnership | None = None
+
+    def claim_repository_and_sweep() -> None:
+        nonlocal ownership
+        try:
+            ownership = RepositoryOwnership.acquire(resolved_settings.state)
+            resource_manager.sweep_stale()
+        except RepositoryOwnershipError as error:
+            raise StartupReadinessError(error.stage) from None
+        except Exception:
+            if ownership is not None:
+                ownership.close()
+                ownership = None
+            raise
+
+    def release_repository() -> None:
+        nonlocal ownership
+        if ownership is not None:
+            ownership.close()
+            ownership = None
+
     manager = ReviewProcessManager(
         attempt_settings=attempt,
         resource_manager=resource_manager,
@@ -53,6 +74,8 @@ def create_production_app(
         repository=webhook.repository,
         webhook_secret=webhook.secret,
         manager=manager,
+        startup_check=claim_repository_and_sweep,
+        shutdown_callback=release_repository,
     )
 
 

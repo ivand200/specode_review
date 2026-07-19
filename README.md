@@ -149,8 +149,12 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env`. `GITHUB_PRIVATE_KEY_PATH`, `REVIEW_KIT_PATH`, and `WORKSPACE_ROOT` must be absolute
-host paths. `GITHUB_WEBHOOK_SECRET` is the literal GitHub App webhook secret, not a path. Leave
+Edit `.env`. `GITHUB_PRIVATE_KEY_PATH`, `REVIEW_KIT_PATH`, `STATE_ROOT`, and `WORKSPACE_ROOT` must
+be absolute host paths. `STATE_ROOT` is persistent private host storage and must be owned by the
+service account with mode `0700`; it must not overlap the disposable workspace root. The service
+holds one repository-scoped host lock there for its complete application lifespan. This lock only
+coordinates processes on one host; running the same repository on multiple hosts is unsupported.
+`GITHUB_WEBHOOK_SECRET` is the literal GitHub App webhook secret, not a path. Leave
 `NGROK_URL` empty on an ngrok free plan, or set it to a reserved HTTPS origin that belongs to your
 ngrok account. `MAX_CONCURRENT_REVIEWS` is optional, defaults to `1`, and accepts values from `1`
 through `10`. There is no waiting queue, so size this for the host's available CPU, memory, and

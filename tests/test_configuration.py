@@ -36,6 +36,7 @@ def _valid_environment(tmp_path: Path) -> dict[str, str]:
         "CODEX_MODEL": "gpt-5.4",
         "OPENAI_REASONING_EFFORT": "high",
         "REVIEW_KIT_PATH": str(kit),
+        "STATE_ROOT": str(tmp_path / "state"),
         "WORKSPACE_ROOT": str(workspace_parent / "workspaces"),
         "REVIEW_TIMEOUT_SECONDS": "900",
         "SANDBOX_CPUS": "2",
@@ -57,6 +58,9 @@ def test_production_settings_accept_the_complete_bounded_configuration(
 
     assert settings.webhook.repository == "octo-org/review-fixture"
     assert settings.attempt.app_id == 1234
+    assert settings.state.root == tmp_path / "state"
+    assert settings.state.repository_root.parent == tmp_path / "state" / "repositories"
+    assert "review-fixture" not in settings.state.repository_root.name
     assert settings.attempt.private_key_path == tmp_path / "github-app.pem"
     assert settings.webhook.secret == "a" * 32
     assert settings.attempt.runtime.codex_execution.model == "gpt-5.4"
@@ -301,6 +305,19 @@ def test_production_settings_require_a_dedicated_absolute_workspace_root(
         ProductionSettings.from_environment(environment)
 
 
+def test_production_settings_require_a_separate_absolute_state_root(tmp_path: Path) -> None:
+    environment = _valid_environment(tmp_path)
+    environment["STATE_ROOT"] = "relative/state"
+
+    with pytest.raises(ConfigurationError, match="STATE_ROOT"):
+        ProductionSettings.from_environment(environment)
+
+    environment["STATE_ROOT"] = environment["WORKSPACE_ROOT"]
+
+    with pytest.raises(ConfigurationError, match="STATE_ROOT"):
+        ProductionSettings.from_environment(environment)
+
+
 class RecordingReadinessProcessRunner:
     def __init__(self, responses: dict[tuple[str, ...], bytes]) -> None:
         self.responses = responses
@@ -530,6 +547,7 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
         "CODEX_MODEL",
         "OPENAI_REASONING_EFFORT",
         "REVIEW_KIT_PATH",
+        "STATE_ROOT",
         "SANDBOX_CPUS",
         "SANDBOX_MEMORY_MIB",
         "SANDBOX_PIDS",

@@ -1,3 +1,4 @@
+import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -213,6 +214,36 @@ class WebhookSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class PersistentStateSettings:
+    root: Path
+    repository_root: Path
+
+    def __post_init__(self) -> None:
+        expected_parent = self.root / "repositories"
+        repository_directory = re.fullmatch(
+            r"repository-v1-[0-9a-f]{64}",
+            self.repository_root.name,
+        )
+        if (
+            not self.root.is_absolute()
+            or self.root == Path(self.root.anchor)
+            or self.repository_root.parent != expected_parent
+            or repository_directory is None
+        ):
+            message = "persistent repository state path is invalid"
+            raise ValueError(message)
+
+    @classmethod
+    def for_repository(cls, *, root: Path, repository: str) -> "PersistentStateSettings":
+        normalized_repository = repository.casefold()
+        repository_digest = hashlib.sha256(normalized_repository.encode("utf-8")).hexdigest()
+        return cls(
+            root=root,
+            repository_root=root / "repositories" / f"repository-v1-{repository_digest}",
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AttemptSettings:
     app_id: int
     private_key_path: Path
@@ -330,6 +361,7 @@ class AttemptSettings:
 class ProductionSettings:
     webhook: WebhookSettings
     attempt: AttemptSettings
+    state: PersistentStateSettings
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "ProductionSettings":
@@ -349,11 +381,24 @@ class ProductionSettings:
         if max_concurrent_reviews > _MAX_CONCURRENT_REVIEWS:
             _invalid("MAX_CONCURRENT_REVIEWS")
 
+        attempt = AttemptSettings.from_environment(environment)
+        state_root = _absolute_path(environment, "STATE_ROOT")
+        if state_root == Path(state_root.anchor) or state_root.is_symlink():
+            _invalid("STATE_ROOT")
+        if state_root == attempt.workspace_root or state_root.is_relative_to(
+            attempt.workspace_root
+        ) or attempt.workspace_root.is_relative_to(state_root):
+            _invalid("STATE_ROOT")
+
         return cls(
             webhook=WebhookSettings(
                 repository=repository,
                 secret=webhook_secret,
                 max_concurrent_reviews=max_concurrent_reviews,
             ),
-            attempt=AttemptSettings.from_environment(environment),
+            attempt=attempt,
+            state=PersistentStateSettings.for_repository(
+                root=state_root,
+                repository=repository,
+            ),
         )
