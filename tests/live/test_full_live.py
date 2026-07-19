@@ -255,14 +255,22 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             + attempt.runtime.sandbox_operation.cleanup_timeout_seconds
             + 60,
         )
-    _finish_checkpoint_c(
-        github=github,
-        request=request,
-        running_check_run_id=running.id,
-        expected_finding=expected_finding,
-        forbidden_texts=(forbidden_instruction, forbidden_config),
-        workspace_root=attempt.workspace_root,
-        sandbox_client=sandbox_client,
-        sandbox_name_prefix=attempt.runtime.sandbox_name_prefix,
-        resources_path=resources_path,
+    verification_github = GitHubAppClient(
+        repository=repository,
+        app_id=attempt.app_id,
+        private_key_path=attempt.private_key_path,
     )
+    try:
+        _finish_checkpoint_c(
+            github=verification_github,
+            request=request,
+            running_check_run_id=running.id,
+            expected_finding=expected_finding,
+            forbidden_texts=(forbidden_instruction, forbidden_config),
+            workspace_root=attempt.workspace_root,
+            sandbox_client=sandbox_client,
+            sandbox_name_prefix=attempt.runtime.sandbox_name_prefix,
+            resources_path=resources_path,
+        )
+    finally:
+        verification_github.close()

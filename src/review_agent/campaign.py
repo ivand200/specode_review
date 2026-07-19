@@ -78,6 +78,7 @@ class CampaignVerifiedResource(BaseModel):
 
     check_run_id: int = Field(gt=0)
     comment_id: int = Field(gt=0)
+    previous_check_run_id: int | None = Field(default=None, gt=0)
 
 
 class CampaignCleanupItem(BaseModel):
@@ -124,6 +125,7 @@ class _ProfileResource(BaseModel):
     head_sha: Sha
     check_run_id: int = Field(gt=0)
     comment_id: int = Field(gt=0)
+    previous_check_run_id: int | None = Field(default=None, gt=0)
 
 
 def _generated_campaign_id() -> str:
@@ -187,6 +189,7 @@ def _verified_profile_resource(
     return CampaignVerifiedResource(
         check_run_id=resource.check_run_id,
         comment_id=resource.comment_id,
+        previous_check_run_id=resource.previous_check_run_id,
     )
 
 
@@ -270,18 +273,26 @@ def _manual_cleanup(
     for resource in (checkpoint_b, checkpoint_c):
         if resource is None:
             continue
-        items.extend(
-            (
-                CampaignCleanupItem(
-                    kind="comment",
-                    reference=str(resource.comment_id),
-                    action=CampaignCleanupAction.DELETE,
-                ),
+        items.append(
+            CampaignCleanupItem(
+                kind="comment",
+                reference=str(resource.comment_id),
+                action=CampaignCleanupAction.DELETE,
+            )
+        )
+        if resource.previous_check_run_id is not None:
+            items.append(
                 CampaignCleanupItem(
                     kind="check_run",
-                    reference=str(resource.check_run_id),
+                    reference=str(resource.previous_check_run_id),
                     action=CampaignCleanupAction.RETAIN,
-                ),
+                )
+            )
+        items.append(
+            CampaignCleanupItem(
+                kind="check_run",
+                reference=str(resource.check_run_id),
+                action=CampaignCleanupAction.RETAIN,
             )
         )
     return tuple(items)
@@ -340,10 +351,10 @@ def run_truthful_real_e2e_campaign(  # noqa: PLR0913
     resolved_evidence_root = (
         evidence_root
         or Path(tempfile.gettempdir()) / "review-agent-real-e2e-campaigns"
-    )
+    ).resolve()
     if (
         not resolved_evidence_root.is_absolute()
-        or resolved_evidence_root.resolve().is_relative_to(resolved_project_root)
+        or resolved_evidence_root.is_relative_to(resolved_project_root)
         or _CAMPAIGN_ID.fullmatch(resolved_campaign_id) is None
         or not resolved_model
         or resolved_model.strip() != resolved_model

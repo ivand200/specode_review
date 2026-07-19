@@ -197,10 +197,19 @@ class ReviewAttemptCoordinator:
                 if not owned:
                     self._active_attempts.finish(attempt_id=attempt.attempt_id)
                     continue
-                if len(owned) != 1:
+                candidates = (
+                    owned
+                    if len(owned) == 1
+                    else tuple(
+                        check_run
+                        for check_run in owned
+                        if check_run.status is not CheckRunStatus.COMPLETED
+                    )
+                )
+                if len(candidates) != 1:
                     message = "active attempt matches multiple Check Runs"
                     raise RuntimeError(message)
-                current = owned[0]
+                current = candidates[0]
                 self._active_attempts.bind(
                     attempt_id=attempt.attempt_id,
                     check_run_id=current.id,
@@ -379,7 +388,6 @@ class ReviewAttemptCoordinator:
                     ActiveAttempt(
                         identity=request.identity,
                         attempt_id=attempt_id,
-                        check_run_id=current.id,
                     )
                 )
             except ActiveAttemptStateError:
@@ -387,31 +395,50 @@ class ReviewAttemptCoordinator:
                 self._active_retry_check_runs.discard(current.id)
                 return SubmissionOutcome.UNAVAILABLE
             try:
-                await self._reconciler.set_desired(
-                    DesiredCheckRun(
-                        check_run_id=current.id,
-                        identity=request.identity,
-                        attempt_id=attempt_id,
-                        output_kind=CheckRunOutputKind.QUEUED,
-                    )
+                check_run = await asyncio.to_thread(
+                    self._github.create_check_run,
+                    identity=request.identity,
+                    installation_id=request.installation_id,
                 )
-            except ReconciliationStateError:
+            except GitHubError:
                 with suppress(ActiveAttemptStateError):
                     self._active_attempts.finish(attempt_id=attempt_id)
                 self._reserved -= 1
                 self._active_retry_check_runs.discard(current.id)
                 return SubmissionOutcome.UNAVAILABLE
             try:
+                self._active_attempts.bind(
+                    attempt_id=attempt_id,
+                    check_run_id=check_run.id,
+                )
+            except ActiveAttemptStateError:
+                try:
+                    await self._persist_terminal_and_finish(
+                        DesiredCheckRun(
+                            check_run_id=check_run.id,
+                            identity=request.identity,
+                            attempt_id=attempt_id,
+                            output_kind=CheckRunOutputKind.TECHNICAL_FAILURE,
+                            failure_stage="active_attempt_state",
+                            failure_category="review_failure",
+                        ),
+                        attempt_id=attempt_id,
+                    )
+                finally:
+                    self._reserved -= 1
+                    self._active_retry_check_runs.discard(current.id)
+                return SubmissionOutcome.UNAVAILABLE
+            try:
                 execution = await self._process.launch(
                     review_request,
-                    check_run_id=current.id,
+                    check_run_id=check_run.id,
                     attempt_id=attempt_id,
                 )
             except AttemptLaunchError as error:
                 try:
                     await self._persist_terminal_and_finish(
                         _terminal_desired(
-                            check_run_id=current.id,
+                            check_run_id=check_run.id,
                             identity=request.identity,
                             outcome=error.outcome,
                         ),
@@ -425,7 +452,7 @@ class ReviewAttemptCoordinator:
             with suppress(ReconciliationStateError):
                 await self._reconciler.set_desired(
                     DesiredCheckRun(
-                        check_run_id=current.id,
+                        check_run_id=check_run.id,
                         identity=request.identity,
                         attempt_id=execution.attempt_id,
                         output_kind=CheckRunOutputKind.RUNNING,
@@ -434,8 +461,9 @@ class ReviewAttemptCoordinator:
             task = asyncio.create_task(
                 self._complete_attempt(
                     execution,
-                    check_run_id=current.id,
+                    check_run_id=check_run.id,
                     identity=request.identity,
+                    retry_source_check_run_id=current.id,
                 )
             )
             self._attempt_tasks.add(task)
@@ -468,6 +496,22 @@ class ReviewAttemptCoordinator:
             identity=request.identity,
         ):
             return SubmissionOutcome.ALREADY_REVIEWED
+        try:
+            check_runs = await asyncio.to_thread(
+                self._github.list_check_runs,
+                identity=request.identity,
+                installation_id=request.installation_id,
+            )
+        except GitHubError:
+            return SubmissionOutcome.UNAVAILABLE
+        newer_outcome = _newer_attempt_outcome(
+            current=current,
+            check_runs=check_runs,
+            github=self._github,
+            identity=request.identity,
+        )
+        if newer_outcome is not None:
+            return newer_outcome
         if current.status is not CheckRunStatus.COMPLETED:
             return SubmissionOutcome.ALREADY_RUNNING
         if not _is_retryable(current):
@@ -480,6 +524,7 @@ class ReviewAttemptCoordinator:
         *,
         check_run_id: int,
         identity: ReviewIdentity,
+        retry_source_check_run_id: int | None = None,
     ) -> None:
         try:
             outcome = await execution.wait()
@@ -494,7 +539,9 @@ class ReviewAttemptCoordinator:
         finally:
             async with self._admission_lock:
                 self._reserved -= 1
-                self._active_retry_check_runs.discard(check_run_id)
+                self._active_retry_check_runs.discard(
+                    retry_source_check_run_id or check_run_id
+                )
 
     async def _persist_terminal_and_finish(
         self,
@@ -560,3 +607,26 @@ def _is_retryable(check_run: CheckRun) -> bool:
         and check_run.conclusion is CheckRunConclusion.NEUTRAL
         and check_run.output.title in _RETRYABLE_TITLES
     )
+
+
+def _newer_attempt_outcome(
+    *,
+    current: CheckRun,
+    check_runs: tuple[CheckRun, ...],
+    github: CheckRunGateway,
+    identity: ReviewIdentity,
+) -> SubmissionOutcome | None:
+    newer_owned = tuple(
+        check_run
+        for check_run in check_runs
+        if check_run.id > current.id
+        and github.is_owned_check_run(check_run, identity=identity)
+    )
+    if any(
+        check_run.status is not CheckRunStatus.COMPLETED
+        for check_run in newer_owned
+    ):
+        return SubmissionOutcome.ALREADY_RUNNING
+    if newer_owned:
+        return SubmissionOutcome.ALREADY_REVIEWED
+    return None

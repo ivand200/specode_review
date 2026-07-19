@@ -67,7 +67,7 @@ rules, or configuration. In addition:
 
 ## Check Run lifecycle
 
-One `Review Agent` Check Run is attached to the accepted head:
+Each attempt has one `Review Agent` Check Run attached to the accepted head:
 
 - `Review queued` is `queued`.
 - `Review in progress` is `in_progress`; detailed findings go to the PR comment.
@@ -76,12 +76,14 @@ One `Review Agent` Check Run is attached to the accepted head:
 - Technical failure, timeout, and publication-unknown states are `completed/neutral`.
 
 Incomplete states expose one `Retry review` action. The signed
-`check_run.requested_action` delivery revalidates current GitHub state, reuses the same Check Run,
-and launches a fresh attempt ID. Completed clean or findings-bearing reviews cannot be retried.
-When publication is unknown, Review Agent has exhausted its bounded read-after-mutation checks
-without confirming one final application-owned comment state. Inspect the pull request before
-retrying; a complete retry will reconcile, replace, or reuse the exact-revision comment instead of
-blindly creating another.
+`check_run.requested_action` delivery revalidates current GitHub state, retains the incomplete
+Check Run as terminal evidence, and creates a new queued Check Run with a fresh attempt ID for the
+same accepted revision. Replayed actions from an older run cannot create duplicate work after a
+newer owned run exists. Completed clean or findings-bearing reviews cannot be retried. When
+publication is unknown, Review Agent has exhausted its bounded read-after-mutation checks without
+confirming one final application-owned comment state. Inspect the pull request before retrying; a
+complete retry will reconcile, replace, or reuse the exact-revision comment instead of blindly
+creating another.
 
 No Check Run update is discarded merely because GitHub is temporarily unavailable. The
 application writes the latest desired projection under `STATE_ROOT`, retries it, and removes the
@@ -275,7 +277,7 @@ Then follow [the opt-in live profile](tests/live/README.md). Production rollout 
 
 1. Passing network-free tests.
 2. Passing the no-model Docker Sandbox lifecycle profile.
-3. Passing the live GitHub controlled failure/same-Check-Run retry profile.
+3. Passing the live GitHub controlled failure/new-Check-Run retry profile.
 4. Passing the cost-bearing full production lifecycle profile.
 5. Confirming state backups, host ownership, health probes, graceful shutdown, and a process
    supervisor are configured.

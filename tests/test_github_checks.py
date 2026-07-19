@@ -354,7 +354,7 @@ def test_create_get_and_update_check_run_use_strict_payloads(tmp_path: Path) -> 
     ]
 
 
-def test_check_run_updates_always_send_the_validated_conclusion(tmp_path: Path) -> None:
+def test_check_run_updates_omit_nonterminal_conclusions(tmp_path: Path) -> None:
     identity = _identity()
     update_bodies: list[dict[str, object]] = []
 
@@ -368,7 +368,7 @@ def test_check_run_updates_always_send_the_validated_conclusion(tmp_path: Path) 
             200,
             json=_check_run_document(
                 status=body["status"],
-                conclusion=body["conclusion"],
+                conclusion=body.get("conclusion"),
                 output=body["output"],
             ),
         )
@@ -391,11 +391,12 @@ def test_check_run_updates_always_send_the_validated_conclusion(tmp_path: Path) 
         )
 
     assert [
-        (body["status"], body["conclusion"]) for body in update_bodies
+        (body["status"], body.get("conclusion"), "conclusion" in body)
+        for body in update_bodies
     ] == [
-        ("queued", None),
-        ("in_progress", None),
-        ("completed", "success"),
+        ("queued", None, False),
+        ("in_progress", None, False),
+        ("completed", "success", True),
     ]
 
 

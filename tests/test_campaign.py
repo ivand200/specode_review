@@ -84,6 +84,7 @@ class ControlledCampaign:
                             if self.mismatched_evidence_stage is CampaignStage.CHECKPOINT_B
                             else B_HEAD_SHA
                         ),
+                        "previous_check_run_id": 500,
                         "check_run_id": 501,
                         "comment_id": 601,
                     }
@@ -138,7 +139,10 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
     tmp_path: Path,
 ) -> None:
     controlled = ControlledCampaign()
+    resolved_evidence_root = tmp_path / "resolved-campaign-evidence"
+    resolved_evidence_root.mkdir()
     evidence_root = tmp_path / "campaign-evidence"
+    evidence_root.symlink_to(resolved_evidence_root, target_is_directory=True)
 
     summary = run_truthful_real_e2e_campaign(
         repository=REPOSITORY,
@@ -171,6 +175,7 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
     assert all(outcome.passed for outcome in summary.stages)
     assert summary.fixtures == _fixtures()
     assert summary.checkpoint_b is not None
+    assert summary.checkpoint_b.previous_check_run_id == 500
     assert summary.checkpoint_b.check_run_id == 501
     assert summary.checkpoint_b.comment_id == 601
     assert summary.checkpoint_c is not None
@@ -180,6 +185,7 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
         ("pull_request", CampaignCleanupAction.REVIEW),
         ("pull_request", CampaignCleanupAction.REVIEW),
         ("comment", CampaignCleanupAction.DELETE),
+        ("check_run", CampaignCleanupAction.RETAIN),
         ("check_run", CampaignCleanupAction.RETAIN),
         ("comment", CampaignCleanupAction.DELETE),
         ("check_run", CampaignCleanupAction.RETAIN),
@@ -200,7 +206,9 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
         REPOSITORY,
         CAMPAIGN_ID,
     )
-    assert Path(fixture_effect[4]).is_relative_to(evidence_root / CAMPAIGN_ID)
+    assert Path(fixture_effect[4]).is_relative_to(
+        resolved_evidence_root / CAMPAIGN_ID
+    )
 
     stage_environments = {
         effect[1]: effect[2]
@@ -223,10 +231,10 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
     assert checkpoint_c_environment["CODEX_MODEL"] == "configured-model"
     assert checkpoint_c_environment["ACKNOWLEDGE_MODEL_COST"] == "1"
     assert Path(checkpoint_c_environment["STATE_ROOT"]).is_relative_to(
-        evidence_root / CAMPAIGN_ID
+        resolved_evidence_root / CAMPAIGN_ID
     )
     assert Path(checkpoint_c_environment["WORKSPACE_ROOT"]).is_relative_to(
-        evidence_root / CAMPAIGN_ID
+        resolved_evidence_root / CAMPAIGN_ID
     )
     assert checkpoint_c_environment["SANDBOX_NAME_PREFIX"].startswith(
         f"rae2e-{CAMPAIGN_ID}"
@@ -238,7 +246,7 @@ def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidenc
     )
 
     persisted = json.loads(
-        (evidence_root / CAMPAIGN_ID / "campaign-summary.json").read_text()
+        (resolved_evidence_root / CAMPAIGN_ID / "campaign-summary.json").read_text()
     )
     assert persisted["succeeded"] is True
     assert persisted["checkpoint_c"]["comment_id"] == 602

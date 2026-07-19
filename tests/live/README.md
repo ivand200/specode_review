@@ -57,9 +57,10 @@ interface. A controlled child first fails, allowing the test to verify a real ne
 with the exact `Review incomplete — technical failure` title. The retry button remains part of the
 write presentation; the subsequent read is intentionally actionless, matching GitHub's response
 contract. The profile then sends a real-shaped signed `check_run.requested_action`, verifies queued
-and running states, and a fresh attempt ID on the same Check Run. The successful controlled retry
-requires the exact `Review complete — no important findings` title, then exercises the public
-publication interface against GitHub:
+and running states on a new Check Run, and verifies a fresh attempt ID for the same accepted
+revision. The original incomplete Check Run remains terminal evidence. The successful controlled
+retry requires the exact `Review complete — no important findings` title, then exercises the
+public publication interface against GitHub:
 
 1. create the exact-revision clean comment;
 2. replace that complete comment with a findings result while retaining its comment ID;
@@ -88,11 +89,11 @@ preflight rereads the pull request and requires that immutable identity before c
 It runs before the HTTP service and controlled launcher exist, so a moved or polluted fixture fails
 without a Check Run/comment write or resource-record append.
 
-The resource file records the accepted base/head SHAs, Check Run ID, final comment ID, PR number,
-and cleanup instruction. Delete the recorded automated review comment manually. GitHub Check Runs
-cannot be deleted through this profile; retain it as rollout evidence. After interruption, inspect
-both the PR and its checks because GitHub writes can succeed before the local cleanup record is
-appended.
+The resource file records the accepted base/head SHAs, both the original incomplete and completed
+retry Check Run IDs, final comment ID, PR number, and cleanup instruction. Delete the recorded
+automated review comment manually. GitHub Check Runs cannot be deleted through this profile;
+retain both as rollout evidence. After interruption, inspect both the PR and its checks because
+GitHub writes can succeed before the local cleanup record is appended.
 
 The live harness cannot safely and deterministically make GitHub accept a comment mutation while
 hiding only its response. Ambiguous create/update reconciliation is therefore covered by the
