@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Never
@@ -180,4 +182,73 @@ def test_checkpoint_c_rejects_owned_comment_before_sandbox_model_or_service_effe
         test_full_live.test_full_live_production_lifecycle_reviews_and_publishes()
 
     assert not workspace_root.exists()
+    assert not resources_path.exists()
+
+
+def test_checkpoint_c_shutdown_failure_prevents_resource_record_append(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    PollutedGitHub.check_runs = ()
+    PollutedGitHub.comments = ()
+    workspace_root = tmp_path / "workspace"
+    resources_path = tmp_path / "resources.jsonl"
+    runtime = SimpleNamespace(
+        review_timeout_seconds=30,
+        sandbox_operation=SimpleNamespace(cleanup_timeout_seconds=5),
+        sandbox_name_prefix="review-agent-",
+    )
+    settings = SimpleNamespace(
+        webhook=SimpleNamespace(repository=request.repository, secret="secret"),
+        attempt=SimpleNamespace(
+            app_id=12345,
+            private_key_path=tmp_path / "key.pem",
+            workspace_root=workspace_root,
+            runtime=runtime,
+        ),
+    )
+
+    class Sandbox:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+    @contextmanager
+    def failed_shutdown(_app: object) -> Iterator[str]:
+        yield "http://checkpoint-c.test"
+        message = "simulated graceful shutdown failure"
+        raise RuntimeError(message)
+
+    monkeypatch.setenv("RUN_FULL_LIVE_E2E", "1")
+    monkeypatch.setenv("ACKNOWLEDGE_MODEL_COST", "1")
+    monkeypatch.setenv("E2E_GITHUB_REPOSITORY", request.repository)
+    monkeypatch.setenv("E2E_GITHUB_PR_NUMBER", "17")
+    monkeypatch.setenv("E2E_EXPECTED_FINDING", "seeded defect")
+    monkeypatch.setenv("E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT", "hostile instruction")
+    monkeypatch.setenv("E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT", "hostile config")
+    monkeypatch.setenv("E2E_CREATED_RESOURCES_PATH", str(resources_path))
+    monkeypatch.setattr(
+        test_full_live.ProductionSettings,
+        "from_environment",
+        lambda _environment: settings,
+    )
+    monkeypatch.setattr(test_full_live, "GitHubAppClient", PollutedGitHub)
+    monkeypatch.setattr(test_full_live, "DockerSandboxClient", Sandbox)
+    monkeypatch.setattr(test_full_live, "create_production_app", lambda **_kwargs: object())
+    monkeypatch.setattr(test_full_live, "_serve", failed_shutdown)
+    monkeypatch.setattr(
+        test_full_live,
+        "_send_signed_webhook",
+        lambda *_args, **_kwargs: (202, '{"status":"accepted"}'),
+    )
+    monkeypatch.setattr(
+        test_full_live,
+        "_wait_for_check_run",
+        lambda *_args, **_kwargs: _owned_check_run(derive_review_identity(request)),
+    )
+    monkeypatch.setattr(test_full_live, "_finish_checkpoint_c", _unexpected_effect)
+
+    with pytest.raises(RuntimeError, match="simulated graceful shutdown failure"):
+        test_full_live.test_full_live_production_lifecycle_reviews_and_publishes()
+
     assert not resources_path.exists()

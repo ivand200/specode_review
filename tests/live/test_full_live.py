@@ -10,14 +10,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
 
 from review_agent.configuration import ProductionSettings
 from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
-from review_agent.live import require_fresh_live_review
+from review_agent.live import require_fresh_live_review, verify_live_review_evidence
 from review_agent.models import ReviewRequest
 from review_agent.production import create_production_app
 from review_agent.sandbox import DockerSandboxClient
@@ -125,45 +124,6 @@ def _wait_for_check_run(
     pytest.fail(f"checkpoint C timed out waiting for Check Run state; last={observed}")
 
 
-def _find_published_comment(
-    *,
-    repository: str,
-    pr_number: int,
-    installation_token: str,
-    accepted_head: str,
-    expected_finding: str,
-) -> tuple[int, str]:
-    owner, name = repository.split("/", maxsplit=1)
-    response = httpx.get(
-        f"https://api.github.com/repos/{owner}/{name}/issues/{pr_number}/comments",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {installation_token}",
-            "X-GitHub-Api-Version": "2026-03-10",
-        },
-        params={"per_page": 100, "sort": "created", "direction": "desc"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, list):
-        pytest.fail("checkpoint C received a malformed comment list")
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        comment_id = item.get("id")
-        body = item.get("body")
-        if (
-            isinstance(comment_id, int)
-            and isinstance(body, str)
-            and body.startswith("# Automated code review")
-            and accepted_head in body
-            and expected_finding.casefold() in body.casefold()
-        ):
-            return comment_id, body
-    pytest.fail("checkpoint C could not find the validated automated review comment")
-
-
 def _record_resources(
     path: Path,
     *,
@@ -191,6 +151,36 @@ def _record_resources(
             )
             + "\n"
         )
+
+
+def _finish_checkpoint_c(  # noqa: PLR0913
+    *,
+    github: GitHubAppClient,
+    request: ReviewRequest,
+    running_check_run_id: int,
+    expected_finding: str,
+    forbidden_texts: tuple[str, str],
+    workspace_root: Path,
+    sandbox_client: DockerSandboxClient,
+    sandbox_name_prefix: str,
+    resources_path: Path,
+) -> None:
+    evidence = verify_live_review_evidence(
+        request=request,
+        github=github,
+        expected_finding=expected_finding,
+        forbidden_texts=forbidden_texts,
+    )
+    assert running_check_run_id == evidence.check_run_id
+    assert list(workspace_root.iterdir()) == []
+    assert not any(name.startswith(sandbox_name_prefix) for name in sandbox_client.list_names())
+    _record_resources(
+        resources_path,
+        repository=request.repository,
+        pr_number=request.pr_number,
+        check_run_id=evidence.check_run_id,
+        comment_id=evidence.comment_id,
+    )
 
 
 @pytest.mark.live_full
@@ -226,10 +216,6 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
         installation_id=installation_id,
     )
     require_fresh_live_review(request=request, github=github)
-    installation_token = github.installation_token(
-        repository=repository,
-        installation_id=installation_id,
-    )
     sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
     app = create_production_app(
         settings=settings,
@@ -252,7 +238,7 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             lambda check: check.status is CheckRunStatus.IN_PROGRESS,
             timeout=30,
         )
-        completed = _wait_for_check_run(
+        _wait_for_check_run(
             github,
             request,
             lambda check: check.status is CheckRunStatus.COMPLETED,
@@ -260,29 +246,14 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             + attempt.runtime.sandbox_operation.cleanup_timeout_seconds
             + 60,
         )
-        comment_id, comment_body = _find_published_comment(
-            repository=repository,
-            pr_number=request.pr_number,
-            installation_token=installation_token,
-            accepted_head=request.head_sha,
-            expected_finding=expected_finding,
-        )
-
-    assert running.id == completed.id
-    assert completed.head_sha == request.head_sha
-    assert completed.external_id == derive_review_identity(request).external_id
-    assert completed.conclusion == "neutral"
-    assert expected_finding.casefold() in comment_body.casefold()
-    assert forbidden_instruction not in comment_body
-    assert forbidden_config not in comment_body
-    assert list(attempt.workspace_root.iterdir()) == []
-    assert not any(
-        name.startswith(attempt.runtime.sandbox_name_prefix) for name in sandbox_client.list_names()
-    )
-    _record_resources(
-        resources_path,
-        repository=repository,
-        pr_number=request.pr_number,
-        check_run_id=completed.id,
-        comment_id=comment_id,
+    _finish_checkpoint_c(
+        github=github,
+        request=request,
+        running_check_run_id=running.id,
+        expected_finding=expected_finding,
+        forbidden_texts=(forbidden_instruction, forbidden_config),
+        workspace_root=attempt.workspace_root,
+        sandbox_client=sandbox_client,
+        sandbox_name_prefix=attempt.runtime.sandbox_name_prefix,
+        resources_path=resources_path,
     )

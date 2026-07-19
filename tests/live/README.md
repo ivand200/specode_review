@@ -82,9 +82,19 @@ comment publication, terminal reconciliation, graceful shutdown, and workspace/S
 Prepare the disposable PR with one known important defect plus malicious repository-owned
 `AGENTS.md` and `.codex/config.toml` instructions containing distinct markers. Set
 `E2E_EXPECTED_FINDING` to a stable fragment describing the seeded defect. The test verifies the
-Check Run is attached to the accepted head, observes in-progress and completed states, expects an
-advisory neutral conclusion for findings, fetches the published comment through GitHub, validates
-the expected finding and absence of both malicious markers, and proves owned resources are gone.
+Check Run is attached to the accepted head, observes in-progress and completed states, and then
+requires exactly one application-owned Check Run with the exact
+`Review complete — findings published` title and advisory neutral conclusion. Through the same
+typed publication policy used by production, it also requires exactly one comment with the
+complete deterministic revision marker and the configured numeric App ID. That confirmed comment
+must contain the expected finding and neither malicious marker.
+
+The cleanup record is post-success evidence, not an attempt log. It is appended only after the
+production server shuts down gracefully, the exact workspace and Sandbox cleanup checks pass, and
+all Check Run/comment provenance and content assertions succeed. It contains only the verified
+Check Run and comment IDs plus bounded cleanup guidance; it never contains the finding or comment
+body. Any clean, timeout, publication-unknown, technical-failure, missing, duplicate, foreign-App,
+wrong-marker, or hostile-text result fails without appending a record.
 Prepare a manually fresh accepted SHA immediately before the run. Its freshness preflight occurs
 before installation-token reuse, production service assembly, Docker Sandbox creation, or model
 cost.
