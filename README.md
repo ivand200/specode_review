@@ -1,8 +1,89 @@
 # Review Agent V0.1
 
-A bounded, single-worker service that reviews the exact revision from an eligible signed
-GitHub pull-request webhook inside a disposable Docker Sandbox and publishes one validated
-top-level comment.
+A bounded, security-focused service that reviews the exact revision accepted from an eligible
+signed GitHub pull-request webhook. Each accepted review runs in its own child process and
+disposable Docker Sandbox, then publishes one validated top-level GitHub comment.
+
+V0.1 is intended for a single dedicated host and one configured GitHub repository. It favors a
+small, high-signal review contract: report only blocking and important defects, or state that none
+were found.
+
+An example comment has this shape:
+
+```text
+# Automated code review
+Reviewed commit range: <merge-base>..<accepted-head>
+
+## Issues found
+### Finding 1: Existing data can be overwritten
+- Severity: important
+- Locations:
+  - feature.py:42
+- Evidence: ...
+- Impact: ...
+- Suggested fix: ...
+```
+
+## Architecture
+
+```text
+signed GitHub pull_request/opened webhook
+-> signature, repository, action, and draft validation
+-> in-memory admission and active-attempt deduplication
+-> one child process for the complete review attempt
+-> exact accepted commit materialization and bounded merge-base diff
+-> disposable Docker Sandbox with the application-owned review kit
+-> Codex schema-constrained candidate output
+-> outer-process validation and filesystem grounding
+-> one top-level GitHub review comment
+-> sandbox and workspace cleanup
+```
+
+The webhook process does not maintain a waiting queue. It starts up to
+`MAX_CONCURRENT_REVIEWS` child attempts, defaulting to one and bounded between one and ten.
+Distinct requests received at capacity are rejected immediately. The admission record and
+duplicate detection are process-local and exist only while an attempt is active.
+
+Each child owns one complete attempt: GitHub authentication, repository materialization, review,
+publication, and cleanup. The parent monitors the child's process group and applies a hard
+deadline. This is per-review process isolation on one host; it is not yet an external job runner
+or durable queue.
+
+## Trust model and guarantees
+
+Repository contents, pull-request text, and repository-provided agent configuration are untrusted
+data. The application-owned review kit instructs Codex not to follow repository instructions,
+hooks, skills, rules, or configuration.
+
+The important guarantees are:
+
+- The accepted base and head commits are materialized explicitly.
+- The checkout is detached at the accepted head SHA and verified before review.
+- The review range is the merge base through that accepted head, not a moving branch.
+- The host checkout is mounted read-only; the sandbox works on a disposable VM-local copy.
+- Sandbox network access is limited by the trusted review kit to model transport.
+- The GitHub App private key and installation token remain outside the review sandbox.
+- The sandbox cannot publish comments.
+- Codex output must satisfy a closed JSON Schema and a byte limit.
+- The outer process validates paths, files, and line locations against the fixed checkout.
+- Every accepted finding must reference at least one changed path.
+- Only the outer application renders and publishes the final GitHub comment.
+
+## Scope and non-goals
+
+V0.1 deliberately supports:
+
+- GitHub only, through a GitHub App.
+- One repository configured by `GITHUB_REPOSITORY`.
+- The original `opened` event for a non-draft pull request.
+- One validated top-level comment per successful attempt.
+- At most 100 changed files and 5,000 changed text lines.
+
+V0.1 does not provide a durable attempt store, waiting queue, delivery-level idempotency, automatic
+retry, crash recovery, or publication retry. Active-attempt duplicate detection prevents only an
+identical repository, pull request, base SHA, and head SHA from running concurrently in the current
+application process. After the attempt finishes—or after a restart—the same delivery can run
+again and can publish another comment.
 
 ## Prerequisites
 
@@ -71,13 +152,16 @@ chmod 600 .env
 Edit `.env`. `GITHUB_PRIVATE_KEY_PATH`, `REVIEW_KIT_PATH`, and `WORKSPACE_ROOT` must be absolute
 host paths. `GITHUB_WEBHOOK_SECRET` is the literal GitHub App webhook secret, not a path. Leave
 `NGROK_URL` empty on an ngrok free plan, or set it to a reserved HTTPS origin that belongs to your
-ngrok account.
+ngrok account. `MAX_CONCURRENT_REVIEWS` is optional, defaults to `1`, and accepts values from `1`
+through `10`. There is no waiting queue, so size this for the host's available CPU, memory, and
+Docker Sandbox capacity.
 
 ## Run locally with ngrok
 
 The Uvicorn listener at `0.0.0.0:8000` is not reachable from GitHub by itself. Run the service and
 ngrok in separate terminals, and keep both processes alive. Run exactly one process for the
-review service; it intentionally uses one web-server worker and one in-memory review worker.
+webhook service. That process owns in-memory admission and active-attempt identity; accepted
+reviews run in separate child processes.
 
 The recommended one-command launcher loads `.env`, starts both processes, discovers the assigned
 ngrok URL, verifies the local and public endpoints, reads the GitHub App's webhook configuration,
@@ -142,7 +226,10 @@ failed, open the GitHub App settings, go to **Advanced → Recent deliveries**, 
 the pull request does not trigger V0.1.
 
 An eligible webhook returns HTTP `202` with `{"status":"accepted"}`. A valid but ineligible event
-returns HTTP `200` with `{"status":"ignored"}`. Signature failures return HTTP `401`.
+returns HTTP `200` with `{"status":"ignored"}`. An identical attempt that is already active returns
+HTTP `200` with `{"status":"already_running"}`. A request received at capacity, during shutdown,
+or when a child cannot be launched returns HTTP `503`; it is not retained for later execution.
+Signature failures return HTTP `401`.
 
 ## Logs and troubleshooting
 
@@ -155,8 +242,10 @@ If a pull request produces no comment:
 
 1. Check the GitHub App's **Advanced → Recent deliveries** page.
 2. Confirm the delivery URL ends in `/webhooks/github`.
-3. Confirm the delivery returned `202`; a fast ngrok `404` usually means the tunnel is offline.
-4. Check the service terminal for `review failed ...` after an accepted delivery.
+3. Confirm the delivery returned `202`; a `503` means the attempt was not retained, while a fast
+   ngrok `404` usually means the tunnel is offline.
+4. Check the service terminal for correlated `review process` and `review attempt failed` records
+   after an accepted delivery.
 5. Run `sbx diagnose` if startup or sandbox creation fails.
 
 Startup fails before the socket accepts traffic unless all settings and secret paths are valid,
@@ -168,19 +257,17 @@ values are not logged.
 The service does not use `pydantic-ai` and does not claim model-request, tool-call, or token limits
 that Codex CLI cannot enforce.
 
-The worker keeps at most one active review plus ten waiting requests in memory. During graceful
-shutdown it stops accepting work immediately, gives only the active review up to the configured
-review timeout to finish review and publication, and discards every waiting request. Each discarded
-request produces a secret-safe `stage=worker_shutdown category=review_failure` warning identifying
-the repository, pull request number, and accepted head SHA. Use the GitHub App's
-**Advanced → Recent deliveries** page to redeliver each affected `pull_request / opened` webhook
-manually.
+During graceful shutdown the service stops admitting work immediately and waits for every active
+child attempt. A child has `REVIEW_TIMEOUT_SECONDS` for normal attempt work, including publication
+and normal cleanup. The parent allows the configured sandbox cleanup timeout beyond that deadline,
+then sends `SIGTERM` to the child's process group. If the group remains alive for another cleanup
+timeout, the parent sends `SIGKILL` and performs a bounded parent-side cleanup attempt.
 
-Shutdown cancellation is cooperative, not a hard-kill guarantee. After the grace period the async
-worker wrapper may be cancelled, but Python cannot forcibly terminate arbitrary synchronous work
-already running in its thread. An abrupt process loss provides no grace or discard warnings and can
-lose both active and waiting work. V0.1 has no delivery deduplication, retries, or crash recovery;
-manual webhook redelivery is the recovery path in either case.
+An abrupt host or application-process loss can still lose active work without a final status.
+V0.1 has no durable delivery deduplication, automatic retries, or crash recovery. Use the GitHub
+App's **Advanced → Recent deliveries** page to redeliver the affected `pull_request / opened`
+webhook manually. Because completed attempts are not recorded durably, confirm whether a comment
+was already published before redelivery.
 
 ## Why there is no production Dockerfile
 
@@ -207,7 +294,9 @@ uv run pytest
 ```
 
 Normal tests use fake GitHub and raw-byte candidate adapters through real candidate acceptance.
-They require no GitHub, Docker, OpenAI credentials, network access, or model budget. Docker
-lifecycle and live profiles are opt-in and documented in
+They also exercise per-review child-process admission, capacity, duplicate detection, deadlines,
+process-group termination, and cleanup without using a model. They require no GitHub, Docker,
+OpenAI credentials, network access, or model budget. Docker lifecycle and live profiles are
+opt-in and documented in
 [`tests/live/README.md`](tests/live/README.md). Run the full checkpoint C before rollout; a failure
 blocks rollout rather than weakening validation or isolation.
