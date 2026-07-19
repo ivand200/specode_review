@@ -6,6 +6,11 @@ from unittest.mock import patch
 
 import pytest
 
+from review_agent.active_attempts import (
+    ActiveAttempt,
+    ActiveAttemptStateError,
+    FileActiveAttemptRegistry,
+)
 from review_agent.attempt import AttemptOutcome, AttemptPublication, AttemptStatus
 from review_agent.coordinator import RetryReviewRequest, ReviewAttemptCoordinator
 from review_agent.errors import FailureCategory
@@ -25,6 +30,7 @@ from review_agent.process_manager import AttemptLaunchError, SubmissionOutcome
 from review_agent.reconciliation import (
     CheckRunReconciler,
     DesiredCheckRun,
+    ReconciliationStateError,
     ReconciliationTiming,
 )
 
@@ -161,6 +167,10 @@ class _Attempt:
         await self.release.wait()
         return self._outcome
 
+    def assign_attempt_id(self, attempt_id: str) -> None:
+        self.attempt_id = attempt_id
+        self._outcome = self._outcome.model_copy(update={"attempt_id": attempt_id})
+
 
 class _Process:
     def __init__(self, github: _GitHub, attempt: _Attempt) -> None:
@@ -186,7 +196,7 @@ class _Process:
         if self.launch_error is not None:
             raise self.launch_error
         if attempt_id is not None:
-            assert attempt_id == self._attempt.attempt_id
+            self._attempt.assign_attempt_id(attempt_id)
         return self._attempt
 
     def use_attempt(self, attempt: _Attempt) -> None:
@@ -196,15 +206,83 @@ class _Process:
 class _Reconciler:
     def __init__(self) -> None:
         self.desired: list[DesiredCheckRun] = []
+        self.exits = 0
 
     async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *args: object) -> None:
         del args
+        self.exits += 1
 
     async def set_desired(self, desired: DesiredCheckRun) -> None:
         self.desired.append(desired)
+
+
+class _FailingOnceReconciler(_Reconciler):
+    def __init__(self, output_kind: str) -> None:
+        super().__init__()
+        self._output_kind = output_kind
+        self._failed = False
+
+    async def set_desired(self, desired: DesiredCheckRun) -> None:
+        if desired.output_kind.value == self._output_kind and not self._failed:
+            self._failed = True
+            raise ReconciliationStateError
+        await super().set_desired(desired)
+
+
+class _ActiveAttempts:
+    def __init__(self, *records: ActiveAttempt) -> None:
+        self.records = list(records)
+
+    def load(self) -> tuple[ActiveAttempt, ...]:
+        return tuple(self.records)
+
+    def prepare(self, attempt: ActiveAttempt) -> None:
+        self.records.append(attempt)
+
+    def bind(self, *, attempt_id: str, check_run_id: int) -> None:
+        self.records = [
+            record.model_copy(update={"check_run_id": check_run_id})
+            if record.attempt_id == attempt_id
+            else record
+            for record in self.records
+        ]
+
+    def finish(self, *, attempt_id: str) -> None:
+        self.records = [record for record in self.records if record.attempt_id != attempt_id]
+
+
+class _FailingOnceActiveAttempts(_ActiveAttempts):
+    def __init__(self, operation: str) -> None:
+        super().__init__()
+        self._operation = operation
+        self._failed = False
+
+    def load(self) -> tuple[ActiveAttempt, ...]:
+        if self._operation == "load" and not self._failed:
+            self._failed = True
+            raise ActiveAttemptStateError
+        return super().load()
+
+    def prepare(self, attempt: ActiveAttempt) -> None:
+        if self._operation == "prepare" and not self._failed:
+            self._failed = True
+            raise ActiveAttemptStateError
+        super().prepare(attempt)
+
+    def bind(self, *, attempt_id: str, check_run_id: int) -> None:
+        if self._operation == "bind" and not self._failed:
+            self._failed = True
+            raise ActiveAttemptStateError
+        super().bind(attempt_id=attempt_id, check_run_id=check_run_id)
+
+    def finish(self, *, attempt_id: str) -> None:
+        if self._operation == "finish" and not self._failed:
+            self._failed = True
+            raise ActiveAttemptStateError
+        super().finish(attempt_id=attempt_id)
 
 
 def _outcome(  # noqa: PLR0913
@@ -253,6 +331,38 @@ def test_new_identity_creates_check_run_before_launch_and_returns_without_waitin
     asyncio.run(exercise())
 
 
+def test_active_attempt_is_durable_from_admission_until_terminal_intent() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        attempt = _Attempt(_outcome())
+        active_attempts = _ActiveAttempts()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, attempt),
+            reconciler=_Reconciler(),
+            active_attempts=active_attempts,
+            installation_id=23,
+        )
+
+        with patch("review_agent.coordinator.uuid.uuid4") as generate_attempt_id:
+            generate_attempt_id.return_value.hex = "1" * 32
+            async with coordinator:
+                assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
+                durable_records = list(active_attempts.records)
+                attempt.release.set()
+                assert durable_records == [
+                    ActiveAttempt(
+                        identity=derive_review_identity(_request()),
+                        attempt_id="1" * 32,
+                        check_run_id=101,
+                    )
+                ]
+
+        assert active_attempts.records == []
+
+    asyncio.run(exercise())
+
+
 def test_durable_check_run_state_prevents_duplicate_execution() -> None:
     async def exercise() -> None:
         request = _request()
@@ -283,6 +393,144 @@ def test_durable_check_run_state_prevents_duplicate_execution() -> None:
         assert process.launches == 0
 
     asyncio.run(exercise())
+
+
+def test_startup_terminalizes_interrupted_active_attempt_without_model_work() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        github = _GitHub()
+        github.check_runs = [_check_run(identity, status=CheckRunStatus.IN_PROGRESS)]
+        process = _Process(github, _Attempt(_outcome()))
+        reconciler = _Reconciler()
+        active_attempts = _ActiveAttempts(
+            ActiveAttempt(
+                identity=identity,
+                attempt_id="1" * 32,
+                check_run_id=101,
+            )
+        )
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            active_attempts=active_attempts,
+            installation_id=23,
+        )
+
+        async with coordinator:
+            pass
+
+        assert process.launches == 0
+        assert active_attempts.records == []
+        assert len(reconciler.desired) == 1
+        recovered = reconciler.desired[0]
+        assert recovered.output_kind.value == "technical_failure"
+        assert recovered.failure_stage == "parent_restart"
+        assert recovered.failure_category == "review_failure"
+
+    asyncio.run(exercise())
+
+
+def test_startup_resolves_unbound_created_check_run_without_model_work() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        github = _GitHub()
+        github.check_runs = [_check_run(identity)]
+        process = _Process(github, _Attempt(_outcome()))
+        reconciler = _Reconciler()
+        active_attempts = _ActiveAttempts(
+            ActiveAttempt(
+                identity=identity,
+                attempt_id="1" * 32,
+            )
+        )
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            active_attempts=active_attempts,
+            installation_id=23,
+        )
+
+        async with coordinator:
+            pass
+
+        assert process.launches == 0
+        assert active_attempts.records == []
+        assert [state.output_kind.value for state in reconciler.desired] == [
+            "technical_failure"
+        ]
+
+    asyncio.run(exercise())
+
+
+def test_restart_recovers_persisted_active_attempt_through_coordinator(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path / "repository-state"
+    repository_root.mkdir(mode=0o700)
+    github = _GitHub()
+
+    async def interrupted_run() -> None:
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, _Attempt(_outcome())),
+            reconciler=_Reconciler(),
+            active_attempts=FileActiveAttemptRegistry(
+                repository_root,
+                repository="octo-org/example",
+            ),
+            installation_id=23,
+        )
+        await coordinator.__aenter__()
+        with patch("review_agent.coordinator.uuid.uuid4") as generate_attempt_id:
+            generate_attempt_id.return_value.hex = "1" * 32
+            assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
+
+    asyncio.run(interrupted_run())
+
+    async def recovered_run() -> None:
+        reconciler = _Reconciler()
+        process = _Process(github, _Attempt(_outcome()))
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            active_attempts=FileActiveAttemptRegistry(
+                repository_root,
+                repository="octo-org/example",
+            ),
+            installation_id=23,
+        )
+        async with coordinator:
+            pass
+
+        assert process.launches == 0
+        assert [state.output_kind.value for state in reconciler.desired] == [
+            "technical_failure"
+        ]
+
+    asyncio.run(recovered_run())
+
+    async def clean_restart() -> None:
+        reconciler = _Reconciler()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, _Attempt(_outcome())),
+            reconciler=reconciler,
+            active_attempts=FileActiveAttemptRegistry(
+                repository_root,
+                repository="octo-org/example",
+            ),
+            installation_id=23,
+        )
+        async with coordinator:
+            pass
+        assert reconciler.desired == []
+
+    asyncio.run(clean_restart())
 
 
 def test_capacity_is_reserved_before_creation_and_released_after_completion() -> None:
@@ -318,6 +566,77 @@ def test_capacity_is_reserved_before_creation_and_released_after_completion() ->
             second.release.set()
 
         assert process.launches == 2
+
+    asyncio.run(exercise())
+
+
+def test_running_state_failure_still_consumes_child_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        first = _Attempt(_outcome())
+        process = _Process(github, first)
+        reconciler = _FailingOnceReconciler("running")
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+
+        async with coordinator:
+            assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
+            first.release.set()
+            for _ in range(20):
+                if reconciler.desired:
+                    break
+                await asyncio.sleep(0)
+            assert [state.output_kind.value for state in reconciler.desired] == ["clean"]
+
+            second = _Attempt(_outcome(attempt_id="2" * 32))
+            process.use_attempt(second)
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            second.release.set()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_state_failure_does_not_break_coordinator_shutdown() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        attempt = _Attempt(_outcome())
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, attempt),
+            reconciler=_FailingOnceReconciler("clean"),
+            installation_id=23,
+        )
+
+        async with coordinator:
+            assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
+            attempt.release.set()
+
+    asyncio.run(exercise())
+
+
+def test_active_attempt_finish_failure_does_not_break_coordinator_shutdown() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        attempt = _Attempt(_outcome())
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, attempt),
+            reconciler=_Reconciler(),
+            active_attempts=_FailingOnceActiveAttempts("finish"),
+            installation_id=23,
+        )
+
+        async with coordinator:
+            assert await coordinator.start(_request()) is SubmissionOutcome.ACCEPTED
+            attempt.release.set()
 
     asyncio.run(exercise())
 
@@ -422,6 +741,65 @@ def test_github_unavailability_never_launches_invisible_work() -> None:
     async def exercise() -> None:
         await run_failure(fail_list=True)
         await run_failure(fail_list=False)
+
+    asyncio.run(exercise())
+
+
+def test_active_attempt_prepare_failure_does_not_launch_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        next_attempt = _Attempt(_outcome())
+        process = _Process(github, next_attempt)
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=_Reconciler(),
+            active_attempts=_FailingOnceActiveAttempts("prepare"),
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+
+        async with coordinator:
+            assert await coordinator.start(_request()) is SubmissionOutcome.UNAVAILABLE
+            assert process.launches == 0
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            next_attempt.release.set()
+
+    asyncio.run(exercise())
+
+
+def test_active_attempt_bind_failure_terminalizes_without_launch_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        next_attempt = _Attempt(_outcome())
+        process = _Process(github, next_attempt)
+        reconciler = _Reconciler()
+        active_attempts = _FailingOnceActiveAttempts("bind")
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            active_attempts=active_attempts,
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+
+        async with coordinator:
+            assert await coordinator.start(_request()) is SubmissionOutcome.UNAVAILABLE
+            assert process.launches == 0
+            assert active_attempts.records == []
+            assert reconciler.desired[-1].output_kind.value == "technical_failure"
+            assert reconciler.desired[-1].failure_stage == "active_attempt_state"
+
+            github.check_runs.clear()
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            next_attempt.release.set()
 
     asyncio.run(exercise())
 
@@ -761,6 +1139,144 @@ def test_retry_launch_failure_restores_retryable_terminal_state_and_capacity() -
     asyncio.run(exercise())
 
 
+def test_retry_queued_state_failure_does_not_launch_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        next_attempt = _Attempt(_outcome(attempt_id="2" * 32))
+        process = _Process(github, next_attempt)
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=_FailingOnceReconciler("queued"),
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        async with coordinator:
+            assert await coordinator.retry(retry) is SubmissionOutcome.UNAVAILABLE
+            assert process.launches == 0
+
+            github.check_runs.clear()
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            next_attempt.release.set()
+
+    asyncio.run(exercise())
+
+
+def test_retry_active_state_failure_does_not_launch_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        next_attempt = _Attempt(_outcome())
+        process = _Process(github, next_attempt)
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=_Reconciler(),
+            active_attempts=_FailingOnceActiveAttempts("prepare"),
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        async with coordinator:
+            assert await coordinator.retry(retry) is SubmissionOutcome.UNAVAILABLE
+            assert process.launches == 0
+
+            github.check_runs.clear()
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            next_attempt.release.set()
+
+    asyncio.run(exercise())
+
+
+def test_retry_running_state_failure_still_consumes_child_and_releases_capacity() -> None:
+    async def exercise() -> None:
+        request = _request()
+        identity = derive_review_identity(request)
+        incomplete = _check_run(
+            identity,
+            status=CheckRunStatus.COMPLETED,
+            conclusion=CheckRunConclusion.NEUTRAL,
+            retryable=True,
+        )
+        github = _GitHub()
+        github.check_runs = [incomplete]
+        retry_attempt = _Attempt(_outcome())
+        process = _Process(github, retry_attempt)
+        reconciler = _FailingOnceReconciler("running")
+        active_attempts = _ActiveAttempts()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=process,
+            reconciler=reconciler,
+            active_attempts=active_attempts,
+            installation_id=23,
+            max_concurrent_reviews=1,
+        )
+        retry = RetryReviewRequest(
+            installation_id=request.installation_id,
+            identity=identity,
+            check_run=incomplete,
+        )
+
+        async with coordinator:
+            assert await coordinator.retry(retry) is SubmissionOutcome.ACCEPTED
+            retry_attempt.release.set()
+            for _ in range(20):
+                if reconciler.desired[-1].output_kind.value == "clean":
+                    break
+                await asyncio.sleep(0)
+            assert [state.output_kind.value for state in reconciler.desired] == [
+                "queued",
+                "clean",
+            ]
+            assert active_attempts.records == []
+
+            github.check_runs.clear()
+            next_attempt = _Attempt(_outcome())
+            process.use_attempt(next_attempt)
+            assert (
+                await coordinator.start(_request(pr_number=18, head_sha="c" * 40))
+                is SubmissionOutcome.ACCEPTED
+            )
+            next_attempt.release.set()
+
+    asyncio.run(exercise())
+
+
 def test_single_use_lifecycle_rejects_admission_outside_active_context() -> None:
     async def exercise() -> None:
         github = _GitHub()
@@ -796,6 +1312,25 @@ def test_single_use_lifecycle_rejects_admission_outside_active_context() -> None
             match="review attempt coordinator cannot be restarted",
         ):
             await coordinator.__aenter__()
+
+    asyncio.run(exercise())
+
+
+def test_active_attempt_recovery_failure_unwinds_reconciler_startup() -> None:
+    async def exercise() -> None:
+        github = _GitHub()
+        reconciler = _Reconciler()
+        coordinator = ReviewAttemptCoordinator(
+            github=github,
+            process=_Process(github, _Attempt(_outcome())),
+            reconciler=reconciler,
+            active_attempts=_FailingOnceActiveAttempts("load"),
+            installation_id=23,
+        )
+
+        with pytest.raises(ActiveAttemptStateError, match="active attempt state unavailable"):
+            await coordinator.__aenter__()
+        assert reconciler.exits == 1
 
     asyncio.run(exercise())
 

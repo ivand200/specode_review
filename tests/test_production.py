@@ -357,6 +357,41 @@ def test_invalid_reconciliation_state_prevents_readiness_and_releases_ownership(
         pass
 
 
+def test_invalid_active_attempt_state_prevents_readiness_and_releases_ownership(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with RepositoryOwnership.acquire(settings.state) as ownership:
+        active_attempts = ownership.repository_root / "active-attempts-v1"
+        active_attempts.mkdir(mode=0o700)
+        (active_attempts / "untrusted-entry").write_text("secret", encoding="utf-8")
+    events: list[str] = []
+    app = create_production_app(
+        settings=settings,
+        readiness=RecordingReadiness(events),
+        sandbox_client=RecordingSandboxResources(events),
+        github_client=RecordingGitHub(events),
+    )
+
+    async def exercise() -> None:
+        with pytest.raises(StartupReadinessError) as failure:
+            async with app.router.lifespan_context(app):
+                pytest.fail("invalid active attempt state entered its lifespan")
+        assert failure.value.stage == "active_attempt_state"
+
+    asyncio.run(exercise())
+
+    assert events == [
+        "readiness",
+        "sweep",
+        "remove_stale",
+        "installation",
+        "github_close",
+    ]
+    with RepositoryOwnership.acquire(settings.state):
+        pass
+
+
 def test_production_uses_configured_child_capacity_without_a_waiting_queue(
     tmp_path: Path,
 ) -> None:

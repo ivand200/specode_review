@@ -18,6 +18,7 @@ signed pull_request/opened webhook
 -> bounded body and exact-byte signature validation
 -> durable revision identity and duplicate Check Run lookup
 -> queued Check Run on the accepted head SHA
+-> bounded active-attempt identity persisted under the repository state root
 -> one child process and disposable Docker Sandbox
 -> exact accepted commit materialization and bounded merge-base diff
 -> schema-constrained candidate acceptance and filesystem grounding
@@ -37,6 +38,12 @@ desired Check Run state before sending an update to GitHub, retries transient up
 capped backoff, and replays pending state after restart. The child owns exact-revision
 materialization, review, comment publication, and cleanup, then returns one closed, byte-bounded
 outcome over a dedicated pipe.
+
+The parent also keeps one bounded, secret-free active-attempt record from admission until terminal
+intent is durably persisted. After process loss, startup uses that record to complete an orphaned
+queued or running Check Run neutrally with `Retry review`; it never restarts model work
+automatically. This active registry is not review history and is removed after recovery or normal
+terminal persistence.
 
 Repository contents, pull-request text, and repository-provided agent configuration are untrusted.
 The application-owned review kit tells Codex not to follow repository instructions, hooks, skills,
@@ -128,6 +135,8 @@ paths. `STATE_ROOT` is private persistent operational data, not disposable scrat
 - Back it up with the host configuration, and restore it with the same owner and mode.
 - Do not place it inside `WORKSPACE_ROOT`, and do not routinely delete it on deploy or restart.
 - Keep it distinct for separate repositories.
+- Expect it to contain bounded reconciliation and active-attempt documents, never credentials,
+  repository content, pull-request text, model output, subprocess output, or finding text.
 
 The process holds a repository-scoped lock under that state root for its full lifespan, including
 startup cleanup and shutdown reconciliation. A second process for the same repository on the same
@@ -200,7 +209,8 @@ On `SIGTERM` or Ctrl+C, readiness drops first and both admission paths stop. Act
 their configured review and cleanup budgets. The parent then makes a bounded final reconciliation
 pass before releasing repository ownership. A hard-killed child becomes an incomplete neutral
 Check Run when the parent survives; abrupt loss of the entire process may leave a pending
-projection that startup replay will reconcile.
+projection or active-attempt record that startup will reconcile to an incomplete neutral Check Run
+without rerunning the model.
 
 The service logs normalized operation, repository, Check Run ID, attempt ID, failure stage, and
 category. It does not log GitHub response bodies, credentials, raw model output, subprocess output,

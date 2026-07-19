@@ -8,6 +8,7 @@ from typing import Protocol, Self
 import uvicorn
 from fastapi import FastAPI
 
+from review_agent.active_attempts import ActiveAttemptStateError, FileActiveAttemptRegistry
 from review_agent.configuration import ProductionSettings
 from review_agent.coordinator import (
     CheckRunGateway,
@@ -117,6 +118,10 @@ class _ProductionCoordinator:
                 github=github,
                 process=process,
                 reconciler=reconciler,
+                active_attempts=FileActiveAttemptRegistry(
+                    self._ownership.repository_root,
+                    repository=self._settings.webhook.repository,
+                ),
                 installation_id=installation_id,
                 max_concurrent_reviews=self._settings.webhook.max_concurrent_reviews,
             )
@@ -130,6 +135,9 @@ class _ProductionCoordinator:
             await self._unwind_startup()
             raise
         except ReconciliationStateError as error:
+            await self._unwind_startup()
+            raise StartupReadinessError(error.stage) from None
+        except ActiveAttemptStateError as error:
             await self._unwind_startup()
             raise StartupReadinessError(error.stage) from None
         except GitHubError:
