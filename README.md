@@ -67,7 +67,7 @@ rules, or configuration. In addition:
 
 ## Check Run lifecycle
 
-One `Review Agent` Check Run is attached to the accepted head:
+Each attempt has one `Review Agent` Check Run attached to the accepted head:
 
 - `Review queued` is `queued`.
 - `Review in progress` is `in_progress`; detailed findings go to the PR comment.
@@ -76,12 +76,14 @@ One `Review Agent` Check Run is attached to the accepted head:
 - Technical failure, timeout, and publication-unknown states are `completed/neutral`.
 
 Incomplete states expose one `Retry review` action. The signed
-`check_run.requested_action` delivery revalidates current GitHub state, reuses the same Check Run,
-and launches a fresh attempt ID. Completed clean or findings-bearing reviews cannot be retried.
-When publication is unknown, Review Agent has exhausted its bounded read-after-mutation checks
-without confirming one final application-owned comment state. Inspect the pull request before
-retrying; a complete retry will reconcile, replace, or reuse the exact-revision comment instead of
-blindly creating another.
+`check_run.requested_action` delivery revalidates current GitHub state, retains the incomplete
+Check Run as terminal evidence, and creates a new queued Check Run with a fresh attempt ID for the
+same accepted revision. Replayed actions from an older run cannot create duplicate work after a
+newer owned run exists. Completed clean or findings-bearing reviews cannot be retried. When
+publication is unknown, Review Agent has exhausted its bounded read-after-mutation checks without
+confirming one final application-owned comment state. Inspect the pull request before retrying; a
+complete retry will reconcile, replace, or reuse the exact-revision comment instead of blindly
+creating another.
 
 No Check Run update is discarded merely because GitHub is temporarily unavailable. The
 application writes the latest desired projection under `STATE_ROOT`, retries it, and removes the
@@ -98,11 +100,13 @@ silicon, macOS Sonoma or later, and the pinned CLI:
 brew trust docker/tap
 brew install docker/tap/sbx
 sbx login
-npm install --global @openai/codex@0.144.5
+npm install --global @openai/codex@0.144.6
 ```
 
-Startup requires `sbx 0.35.0` and `Codex CLI 0.144.5`. Configure the OpenAI credential in the
-Docker Sandboxes host-managed credential proxy; OAuth is preferred:
+Startup requires `sbx 0.35.0` and `Codex CLI 0.144.6`. Configure the OpenAI credential in the
+Docker Sandboxes host-managed credential proxy. Review Agent uses the public Responses API through
+that proxy, so the credential must authorize `api.responses.write`. OAuth may be used when the
+proxy-issued credential has that scope:
 
 ```bash
 sbx secret set -g openai --oauth
@@ -115,6 +119,11 @@ environment:
 sbx secret import openai --force
 unset OPENAI_API_KEY
 ```
+
+If the non-generative Docker preflight reports a missing Responses scope, replace the host-managed
+`openai` secret with an appropriately scoped API key. Switching credentials does not require an
+application provider setting. Review Agent never forwards `OPENAI_API_KEY` from its environment
+into the child process or review sandbox.
 
 ## GitHub App setup
 
@@ -194,6 +203,24 @@ curl --fail --silent --show-error http://127.0.0.1:8000/health/live
 curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
 ```
 
+For rollout verification, the single real-system campaign prepares two fresh disposable pull
+requests and runs the network-free checks, no-model Sandbox lifecycle, real GitHub retry
+lifecycle, and full production/model lifecycle in fail-fast order:
+
+```bash
+set -a
+source .env
+set +a
+uv run review-agent-real-e2e \
+  --repository <owner/test-repository> \
+  --evidence-root /tmp/review-agent-real-e2e
+```
+
+Invoking this command authorizes its documented Docker Sandbox, GitHub, and one-model-request
+effects; no additional model-cost flag is required. See
+[`tests/live/README.md`](tests/live/README.md#ordered-truthful-real-e2e-campaign) for prerequisites,
+model override, evidence interpretation, interruption handling, and manual cleanup.
+
 Liveness means the web process is alive. Readiness becomes successful only after persistent state,
 the repository lock, host readiness, stale-resource cleanup, GitHub installation lookup, and
 coordinator/reconciler startup all succeed. It becomes unavailable before shutdown stops
@@ -256,8 +283,8 @@ uv run pytest
 Then follow [the opt-in live profile](tests/live/README.md). Production rollout requires:
 
 1. Passing network-free tests.
-2. Passing the no-model Docker Sandbox lifecycle profile.
-3. Passing the live GitHub controlled failure/same-Check-Run retry profile.
+2. Passing the no-model Docker Sandbox lifecycle and Codex authentication preflight.
+3. Passing the live GitHub controlled failure/new-Check-Run retry profile.
 4. Passing the cost-bearing full production lifecycle profile.
 5. Confirming state backups, host ownership, health probes, graceful shutdown, and a process
    supervisor are configured.

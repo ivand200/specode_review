@@ -67,7 +67,7 @@ class ProductionReadiness:
     def check(self, settings: ProductionSettings) -> None:
         self._verify_paths(settings)
         attempt = settings.attempt
-        process_output_max_bytes = attempt.runtime.sandbox_operation.process_output_max_bytes
+        process_output_max_bytes = attempt.process_output_max_bytes
         sbx = self._executable("sbx")
         codex = self._executable("codex")
         git = self._executable("git")

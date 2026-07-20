@@ -9,7 +9,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from review_agent.active_attempts import ActiveAttemptStateError, FileActiveAttemptRegistry
-from review_agent.configuration import ProductionSettings
+from review_agent.configuration import ProductionSettings, SandboxOperationPolicy
 from review_agent.coordinator import (
     CheckRunGateway,
     RetryReviewRequest,
@@ -75,13 +75,15 @@ class _ProductionCoordinator:
 
             startup_stage = "stale_resource_sweep"
             attempt = self._settings.attempt
-            runtime = attempt.runtime
             sandbox_client = self._sandbox_client or DockerSandboxClient(
-                config=runtime.sandbox_operation
+                config=SandboxOperationPolicy(
+                    process_output_max_bytes=attempt.process_output_max_bytes,
+                    cleanup_timeout_seconds=attempt.sandbox_cleanup_timeout_seconds,
+                )
             )
             resource_manager = ReviewResourceManager(
                 workspace_root=attempt.workspace_root,
-                sandbox_prefix=runtime.sandbox_name_prefix,
+                sandbox_prefix=attempt.sandbox_name_prefix,
                 sandbox_client=sandbox_client,
             )
             resource_manager.sweep_stale()

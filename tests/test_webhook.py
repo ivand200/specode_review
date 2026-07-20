@@ -22,6 +22,7 @@ from review_agent.github import (
     CheckRunConclusion,
     CheckRunStatus,
     ReviewIdentity,
+    derive_review_identity,
 )
 from review_agent.models import ReviewRequest
 from review_agent.reconciliation import DesiredCheckRun
@@ -586,6 +587,41 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
     class GitHub:
         def __init__(self) -> None:
             self.current = current
+            self.created: CheckRun | None = None
+
+        def list_check_runs(
+            self,
+            *,
+            identity: ReviewIdentity,
+            installation_id: int,
+        ) -> tuple[CheckRun, ...]:
+            assert identity == derive_review_identity(review_request)
+            assert installation_id == 23
+            return (
+                (self.current,)
+                if self.created is None
+                else (self.current, self.created)
+            )
+
+        def create_check_run(
+            self,
+            *,
+            identity: ReviewIdentity,
+            installation_id: int,
+        ) -> CheckRun:
+            assert identity == derive_review_identity(review_request)
+            assert installation_id == 23
+            self.created = current.model_copy(
+                update={
+                    "id": 102,
+                    "status": CheckRunStatus.QUEUED,
+                    "conclusion": None,
+                    "output": current.output.model_copy(
+                        update={"title": "Review queued"}
+                    ),
+                }
+            )
+            return self.created
 
         def is_owned_check_run(
             self,
@@ -661,19 +697,17 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
 
         async def set_desired(self, desired: DesiredCheckRun) -> None:
             self.desired.append(desired)
-            if desired.output_kind.value == "queued":
-                update = {
-                    "status": CheckRunStatus.QUEUED,
-                    "conclusion": None,
-                    "output": self.github.current.output.model_copy(
-                        update={"title": "Review queued"}
-                    ),
-                }
-            elif desired.output_kind.value == "running":
+            target = (
+                self.github.created
+                if desired.check_run_id == 102
+                else self.github.current
+            )
+            assert target is not None
+            if desired.output_kind.value == "running":
                 update = {
                     "status": CheckRunStatus.IN_PROGRESS,
                     "conclusion": None,
-                    "output": self.github.current.output.model_copy(
+                    "output": target.output.model_copy(
                         update={"title": "Review in progress"}
                     ),
                 }
@@ -681,11 +715,15 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
                 update = {
                     "status": CheckRunStatus.COMPLETED,
                     "conclusion": CheckRunConclusion.SUCCESS,
-                    "output": self.github.current.output.model_copy(
+                    "output": target.output.model_copy(
                         update={"title": "Review complete — no important findings"}
                     ),
                 }
-            self.github.current = self.github.current.model_copy(update=update)
+            updated = target.model_copy(update=update)
+            if desired.check_run_id == 102:
+                self.github.created = updated
+            else:
+                self.github.current = updated
 
     github = GitHub()
     process = Process()
@@ -765,14 +803,12 @@ def test_application_factory_coordinates_retry_validation_duplicate_and_replay( 
         assert duplicate.text == '{"status":"already_running"}'
         assert len(process.attempt_ids) == 1
         assert len(process.attempt_ids[0]) == 32
-        assert process.check_run_ids == [101]
-        assert [state.attempt_id for state in reconciler.desired[:2]] == (
-            process.attempt_ids * 2
-        )
+        assert process.check_run_ids == [102]
+        assert [state.attempt_id for state in reconciler.desired] == process.attempt_ids
 
         process.release.set()
         for _ in range(100):
-            if len(reconciler.desired) == 3:
+            if len(reconciler.desired) == 2:
                 break
             time.sleep(0.01)
         replay = _post_signed_webhook(

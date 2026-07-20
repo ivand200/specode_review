@@ -6,7 +6,7 @@ from review_agent.github import (
     GitHubAppClient,
     derive_review_identity,
 )
-from review_agent.models import ReviewRequest
+from review_agent.models import AcceptedRevision, ReviewRequest
 from review_agent.publishing import owned_revision_comments
 
 FINDINGS_COMPLETE_TITLE = "Review complete — findings published"
@@ -32,7 +32,17 @@ def require_fresh_live_review(
     *,
     request: ReviewRequest,
     github: GitHubAppClient,
+    expected: AcceptedRevision,
 ) -> None:
+    if (
+        request.repository.casefold() != expected.repository.casefold()
+        or request.pr_number != expected.pr_number
+        or request.base_sha.casefold() != expected.base_sha.casefold()
+        or request.head_sha.casefold() != expected.head_sha.casefold()
+    ):
+        message = "live pull request does not match the prepared accepted revision"
+        raise LiveProfilePreconditionError(message)
+
     identity = derive_review_identity(request)
     owned_check_runs = tuple(
         check_run

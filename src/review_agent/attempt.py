@@ -7,7 +7,11 @@ from typing import Annotated, BinaryIO, Literal, Protocol, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from review_agent.configuration import AttemptSettings
+from review_agent.configuration import (
+    AttemptSettings,
+    ReviewLimits,
+    SandboxOperationPolicy,
+)
 from review_agent.core import CandidateAcceptance, GitHubRepository, Reviewer
 from review_agent.deadline import ReviewDeadline, review_deadline_scope
 from review_agent.errors import FailureCategory, ReviewError
@@ -218,11 +222,15 @@ class _ProductionAttemptServices:
         command: AttemptCommand,
         settings: AttemptSettings,
     ) -> None:
-        runtime = settings.runtime
-        sandbox_client = DockerSandboxClient(config=runtime.sandbox_operation)
+        sandbox_client = DockerSandboxClient(
+            config=SandboxOperationPolicy(
+                process_output_max_bytes=settings.process_output_max_bytes,
+                cleanup_timeout_seconds=settings.sandbox_cleanup_timeout_seconds,
+            )
+        )
         resource_manager = ReviewResourceManager(
             workspace_root=settings.workspace_root,
-            sandbox_prefix=runtime.sandbox_name_prefix,
+            sandbox_prefix=settings.sandbox_name_prefix,
             sandbox_client=sandbox_client,
         )
         resources = resource_manager.for_attempt(command.attempt_id)
@@ -236,18 +244,21 @@ class _ProductionAttemptServices:
                 client=sandbox_client,
                 resources=resources,
                 kit=settings.review_kit_path,
-                config=runtime.codex_execution,
+                config=settings.codex_execution,
             )
             candidate_acceptance = CandidateAcceptance(
                 adapter=adapter,
-                max_bytes=runtime.candidate_output_max_bytes,
+                max_bytes=settings.candidate_output_max_bytes,
             )
             reviewer = Reviewer(
                 repository=command.request.repository,
                 resources=resources,
                 candidate_acceptance=candidate_acceptance,
                 source_repository=GitHubRepository(credentials=github),
-                limits=runtime.review_limits,
+                limits=ReviewLimits(
+                    process_output_max_bytes=settings.process_output_max_bytes,
+                    sandbox_resources=settings.sandbox_resources,
+                ),
             )
         except BaseException:
             try:
@@ -371,7 +382,7 @@ def _execute_configured_attempt(
     *,
     services_factory: AttemptServicesFactory,
 ) -> AttemptOutcome:
-    deadline = ReviewDeadline.after(settings.runtime.review_timeout_seconds)
+    deadline = ReviewDeadline.after(settings.review_timeout_seconds)
     services: AttemptServices | None = None
     failure: tuple[str, FailureCategory] | None = None
     review_status: Literal["no_important_issues", "issues_found"] | None = None

@@ -111,8 +111,8 @@ class ReviewProcessManager:
         resolved_attempt_id = attempt_id or uuid.uuid4().hex
         hard_deadline = (
             asyncio.get_running_loop().time()
-            + self._attempt_settings.runtime.review_timeout_seconds
-            + self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
+            + self._attempt_settings.review_timeout_seconds
+            + self._attempt_settings.sandbox_cleanup_timeout_seconds
         )
         running = await self._launch_outcome_attempt(
             request,
@@ -215,9 +215,7 @@ class ReviewProcessManager:
         await _terminate_process_group(
             process,
             attempt_id=attempt_id,
-            grace_seconds=(
-                self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
-            ),
+            grace_seconds=self._attempt_settings.sandbox_cleanup_timeout_seconds,
         )
 
     async def _consume_outcome_attempt(
@@ -238,9 +236,7 @@ class ReviewProcessManager:
             await _terminate_process_group(
                 running.process,
                 attempt_id=attempt_id,
-                grace_seconds=(
-                    self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds
-                ),
+                grace_seconds=self._attempt_settings.sandbox_cleanup_timeout_seconds,
             )
 
         document = await running.reader
@@ -268,7 +264,7 @@ class ReviewProcessManager:
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(self._resource_manager.cleanup, attempt_id),
-                timeout=(self._attempt_settings.runtime.sandbox_operation.cleanup_timeout_seconds),
+                timeout=self._attempt_settings.sandbox_cleanup_timeout_seconds,
             )
         except Exception:  # noqa: BLE001 - exact parent cleanup failure boundary.
             logger.warning(

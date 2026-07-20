@@ -3,14 +3,53 @@
 All live profiles are opt-in and must target a disposable, open, non-draft pull request in a
 dedicated repository whose name contains `test`. Normal `pytest` runs skip them. Use a fresh
 accepted base/head revision: durable Check Run identity intentionally makes a repeated completed
-run return `already_reviewed`. Before either profile starts its service or creates any external
-resource, it derives that deterministic review identity and requires both:
+run return `already_reviewed`. Install and verify the production prerequisites from the root
+operator guide before rollout; the profiles require `sbx 0.35.0` and `Codex CLI 0.144.6`.
+Before either profile starts its service or creates any external resource, it derives that
+deterministic review identity and requires both:
 
 - zero application-owned Check Runs for the accepted revision; and
 - zero exact-marker review comments performed by the configured numeric GitHub App ID.
 
 If either exists, stop and manually prepare a new accepted SHA on the disposable PR. The profiles
 do not create commits, move branches, delete old evidence, or repair a polluted fixture.
+
+## Ordered truthful real E2E campaign
+
+Run the complete rollout campaign from the repository root after installing the production
+prerequisites, signing in to `sbx`, authenticating the operator `gh` CLI for the dedicated test
+repository, and loading the normal production environment:
+
+```bash
+set -a
+source .env
+set +a
+uv run review-agent-real-e2e \
+  --repository ivand200/test_repo \
+  --evidence-root /tmp/review-agent-real-e2e
+```
+
+The command itself authorizes the documented Docker Sandbox use, two operator-authenticated
+fixture branches and pull requests, Checkpoint B and C GitHub writes, and one Checkpoint C model
+request. There is no separate cost-acknowledgement option. Omit `--repository` to use
+`GITHUB_REPOSITORY`, omit `--model` to use `CODEX_MODEL`, or supply `--model <approved-model>` to
+override only Checkpoint C. `--campaign-id` is optional; generated identifiers are unique and
+bounded.
+
+The campaign runs Ruff, strict mypy, the complete network-free pytest suite, the no-model Docker
+Sandbox profile with a non-generative Codex authentication preflight, fixture preparation,
+Checkpoint B, and Checkpoint C in that order. It stops at the first failure and exits nonzero. Its
+JSON summary and
+`<evidence-root>/<campaign-id>/campaign-summary.json` contain only bounded stage results, fixture
+URLs and accepted SHAs, and resource IDs verified by successful profiles. A failed or interrupted
+profile may have completed external writes before returning, so inspect every fixture URL and
+GitHub check before retrying; never reuse the same campaign identifier or accepted revision.
+
+After a successful campaign, manually delete the recorded Checkpoint B and C comments. Retain the
+Check Runs as rollout evidence. Close the two disposable pull requests and delete their fixture
+branches only when the release owner no longer needs them. The campaign never performs those
+destructive actions automatically. Campaign state, workspace, server, and Sandbox cleanup remains
+owned by the existing profiles; a cleanup assertion failure is a campaign failure.
 
 ## Checkpoint B: real GitHub lifecycle without a model
 
@@ -19,9 +58,10 @@ interface. A controlled child first fails, allowing the test to verify a real ne
 with the exact `Review incomplete — technical failure` title. The retry button remains part of the
 write presentation; the subsequent read is intentionally actionless, matching GitHub's response
 contract. The profile then sends a real-shaped signed `check_run.requested_action`, verifies queued
-and running states, and a fresh attempt ID on the same Check Run. The successful controlled retry
-requires the exact `Review complete — no important findings` title, then exercises the public
-publication interface against GitHub:
+and running states on a new Check Run, and verifies a fresh attempt ID for the same accepted
+revision. The original incomplete Check Run remains terminal evidence. The successful controlled
+retry requires the exact `Review complete — no important findings` title, then exercises the
+public publication interface against GitHub:
 
 1. create the exact-revision clean comment;
 2. replace that complete comment with a findings result while retaining its comment ID;
@@ -39,18 +79,22 @@ set +a
 RUN_LIVE_GITHUB_E2E=1 \
 E2E_GITHUB_REPOSITORY=ivand200/test_repo \
 E2E_GITHUB_PR_NUMBER=<number> \
+E2E_EXPECTED_BASE_SHA=<prepared-base-sha> \
+E2E_EXPECTED_HEAD_SHA=<prepared-head-sha> \
 E2E_CREATED_RESOURCES_PATH=/tmp/review-agent-live-resources.jsonl \
 uv run pytest tests/live/test_github_live.py -q -s
 ```
 
-Use a manually prepared fresh accepted SHA for this invocation. The preflight runs before the HTTP
-service and controlled launcher exist, so polluted evidence fails without a Check Run/comment
-write or resource-record append.
+Use the exact base and head SHAs returned when manually preparing the fresh accepted revision. The
+preflight rereads the pull request and requires that immutable identity before checking freshness.
+It runs before the HTTP service and controlled launcher exist, so a moved or polluted fixture fails
+without a Check Run/comment write or resource-record append.
 
-The resource file records the Check Run ID, final comment ID, PR number, and cleanup instruction.
-Delete the recorded automated review comment manually. GitHub Check Runs cannot be deleted through
-this profile; retain it as rollout evidence. After interruption, inspect both the PR and its checks
-because GitHub writes can succeed before the local cleanup record is appended.
+The resource file records the accepted base/head SHAs, both the original incomplete and completed
+retry Check Run IDs, final comment ID, PR number, and cleanup instruction. Delete the recorded
+automated review comment manually. GitHub Check Runs cannot be deleted through this profile;
+retain both as rollout evidence. After interruption, inspect both the PR and its checks because
+GitHub writes can succeed before the local cleanup record is appended.
 
 The live harness cannot safely and deterministically make GitHub accept a comment mutation while
 hiding only its response. Ambiguous create/update reconciliation is therefore covered by the
@@ -70,7 +114,8 @@ RUN_DOCKER_SANDBOX_E2E=1 \
 uv run pytest tests/integration/test_no_model_sandbox_probe.py -q -s
 ```
 
-It needs a working, signed-in Docker Sandboxes runtime but no OpenAI credential or model budget.
+It needs a working, signed-in Docker Sandboxes runtime and a host-managed OpenAI credential. Its
+Codex authentication check is non-generative, so this profile needs no model budget.
 
 ## Checkpoint C: full production lifecycle
 
@@ -107,6 +152,8 @@ RUN_FULL_LIVE_E2E=1 \
 ACKNOWLEDGE_MODEL_COST=1 \
 E2E_GITHUB_REPOSITORY=ivand200/test_repo \
 E2E_GITHUB_PR_NUMBER=<number> \
+E2E_EXPECTED_BASE_SHA=<prepared-base-sha> \
+E2E_EXPECTED_HEAD_SHA=<prepared-head-sha> \
 E2E_EXPECTED_FINDING=<stable-defect-fragment> \
 E2E_FORBIDDEN_REPOSITORY_INSTRUCTION_TEXT=<malicious-output-marker> \
 E2E_FORBIDDEN_REPOSITORY_CONFIG_TEXT=<malicious-config-marker> \

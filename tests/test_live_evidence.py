@@ -328,6 +328,8 @@ def test_checkpoint_c_records_only_the_ids_confirmed_after_cleanup(tmp_path: Pat
         "kind": "full_live_github_resources",
         "repository": "Octo-Org/Example",
         "pr_number": 17,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
         "check_run_id": 91,
         "comment_id": 72,
         "cleanup": (

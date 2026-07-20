@@ -27,7 +27,14 @@ from review_agent.github import (
     derive_review_identity,
 )
 from review_agent.live import require_fresh_live_review
-from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
+from review_agent.models import (
+    AcceptedRevision,
+    DiffRange,
+    Finding,
+    Location,
+    ReviewRequest,
+    ReviewResult,
+)
 from review_agent.publishing import (
     PublicationDisposition,
     PublicationReceipt,
@@ -323,16 +330,45 @@ def _wait_for_check_run(
             )
             if github.is_owned_check_run(check_run, identity=identity)
         )
-        if len(owned) == 1 and callable(predicate) and predicate(owned[0]):
-            return owned[0]
+        for check_run in owned:
+            active_shape = {
+                "Review queued": CheckRunStatus.QUEUED,
+                "Review in progress": CheckRunStatus.IN_PROGRESS,
+            }.get(check_run.output.title)
+            if active_shape is not None and (
+                check_run.status is not active_shape or check_run.conclusion is not None
+            ):
+                pytest.fail(
+                    "checkpoint B observed an active Check Run title with a terminal state"
+                )
+        if callable(predicate):
+            matching = tuple(check_run for check_run in owned if predicate(check_run))
+            if len(matching) == 1:
+                return matching[0]
         time.sleep(0.2)
     pytest.fail("timed out waiting for the expected Review Agent Check Run state")
 
 
-def _fresh_review_request(github: GitHubAppClient, *, pr_number: int) -> ReviewRequest:
+def _fresh_review_request(
+    github: GitHubAppClient,
+    *,
+    repository: str,
+    pr_number: int,
+    expected_base_sha: str,
+    expected_head_sha: str,
+) -> ReviewRequest:
     installation_id = github.repository_installation_id()
     request = github.review_request(pr_number=pr_number, installation_id=installation_id)
-    require_fresh_live_review(request=request, github=github)
+    require_fresh_live_review(
+        request=request,
+        github=github,
+        expected=AcceptedRevision(
+            repository=repository,
+            pr_number=pr_number,
+            base_sha=expected_base_sha,
+            head_sha=expected_head_sha,
+        ),
+    )
     return request
 
 
@@ -341,6 +377,7 @@ def _record_resources(
     request: ReviewRequest,
     check_run: CheckRun,
     *,
+    previous_check_run_id: int,
     comment_id: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,6 +388,9 @@ def _record_resources(
                     "kind": "github_check_run_and_pull_request_comment",
                     "repository": request.repository,
                     "pr_number": request.pr_number,
+                    "base_sha": request.base_sha,
+                    "head_sha": request.head_sha,
+                    "previous_check_run_id": previous_check_run_id,
                     "check_run_id": check_run.id,
                     "comment_id": comment_id,
                     "cleanup": (
@@ -365,7 +405,7 @@ def _record_resources(
 
 
 @pytest.mark.live_github
-def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
+def test_real_retry_exercises_the_exact_revision_comment_lifecycle(  # noqa: PLR0915
     tmp_path: Path,
 ) -> None:
     if os.environ.get("RUN_LIVE_GITHUB_E2E") != "1":
@@ -386,7 +426,10 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     )
     request = _fresh_review_request(
         github,
+        repository=repository,
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
+        expected_base_sha=_required_environment("E2E_EXPECTED_BASE_SHA"),
+        expected_head_sha=_required_environment("E2E_EXPECTED_HEAD_SHA"),
     )
     installation_id = request.installation_id
     repository_root = tmp_path / "state"
@@ -411,90 +454,106 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     )
 
     with _serve(app) as url, ThreadPoolExecutor(max_workers=1) as executor:
-        initial_response = executor.submit(
-            _send_signed_webhook,
-            url,
-            _pull_request_payload(request),
-            webhook_secret,
-            event="pull_request",
-        )
-        assert launcher.launch_started[0].wait(timeout=30)
-        queued = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.QUEUED,
-        )
-        launcher.allow_launch[0].set()
-        assert initial_response.result() == (202, '{"status":"accepted"}')
-        running = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
-        )
-        assert running.id == queued.id
-
-        launcher.executions[0].release.set()
-        retryable = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.COMPLETED
-            and check.conclusion == "neutral"
-            and check.output.title == "Review incomplete — technical failure",
-        )
-
-        retry_response = executor.submit(
-            _send_signed_webhook,
-            url,
-            _retry_payload(request, retryable),
-            webhook_secret,
-            event="check_run",
-        )
-        assert launcher.launch_started[1].wait(timeout=30)
-        retry_queued = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.QUEUED,
-        )
-        assert retry_queued.id == queued.id
-        launcher.allow_launch[1].set()
-        assert retry_response.result() == (202, '{"status":"accepted"}')
-        retry_running = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.IN_PROGRESS,
-        )
-        assert retry_running.id == queued.id
-        assert launcher.executions[1].attempt_id != launcher.executions[0].attempt_id
-
-        launcher.executions[1].release.set()
-        completed = _wait_for_check_run(
-            github,
-            request,
-            lambda check: check.status is CheckRunStatus.COMPLETED
-            and check.conclusion == "success"
-            and check.output.title == "Review complete — no important findings",
-        )
-        receipts = launcher.executions[1].publication_receipts
-        marker = f"<!-- {derive_review_identity(request).external_id} -->"
-        owned_revision_comments = tuple(
-            comment
-            for comment in github.list_review_comments(
-                repository=request.repository,
-                pr_number=request.pr_number,
-                installation_id=request.installation_id,
+        try:
+            initial_response = executor.submit(
+                _send_signed_webhook,
+                url,
+                _pull_request_payload(request),
+                webhook_secret,
+                event="pull_request",
             )
-            if comment.body.endswith(f"{marker}\n")
-            and comment.performed_via_github_app is not None
-            and comment.performed_via_github_app.id == github.app_id
-        )
-        _record_resources(
-            resources_path,
-            request,
-            completed,
-            comment_id=receipts[3].comment_id,
-        )
+            assert launcher.launch_started[0].wait(timeout=30)
+            queued = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.QUEUED
+                and check.conclusion is None
+                and check.output.title == "Review queued",
+            )
+            launcher.allow_launch[0].set()
+            assert initial_response.result() == (202, '{"status":"accepted"}')
+            running = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.IN_PROGRESS
+                and check.conclusion is None
+                and check.output.title == "Review in progress",
+            )
+            assert running.id == queued.id
 
-    assert completed.id == queued.id
+            launcher.executions[0].release.set()
+            retryable = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.COMPLETED
+                and check.conclusion == "neutral"
+                and check.output.title == "Review incomplete — technical failure",
+            )
+
+            retry_response = executor.submit(
+                _send_signed_webhook,
+                url,
+                _retry_payload(request, retryable),
+                webhook_secret,
+                event="check_run",
+            )
+            assert launcher.launch_started[1].wait(timeout=30)
+            retry_queued = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.QUEUED
+                and check.conclusion is None
+                and check.output.title == "Review queued",
+            )
+            assert retry_queued.id != queued.id
+            launcher.allow_launch[1].set()
+            assert retry_response.result() == (202, '{"status":"accepted"}')
+            retry_running = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.IN_PROGRESS
+                and check.conclusion is None
+                and check.output.title == "Review in progress",
+            )
+            assert retry_running.id == retry_queued.id
+            assert launcher.executions[1].attempt_id != launcher.executions[0].attempt_id
+
+            launcher.executions[1].release.set()
+            completed = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.status is CheckRunStatus.COMPLETED
+                and check.conclusion == "success"
+                and check.output.title == "Review complete — no important findings",
+            )
+            retained_incomplete = _wait_for_check_run(
+                github,
+                request,
+                lambda check: check.id == retryable.id
+                and check.status is CheckRunStatus.COMPLETED
+                and check.conclusion == "neutral"
+                and check.output.title == "Review incomplete — technical failure",
+            )
+            receipts = launcher.executions[1].publication_receipts
+            marker = f"<!-- {derive_review_identity(request).external_id} -->"
+            owned_revision_comments = tuple(
+                comment
+                for comment in github.list_review_comments(
+                    repository=request.repository,
+                    pr_number=request.pr_number,
+                    installation_id=request.installation_id,
+                )
+                if comment.body.endswith(f"{marker}\n")
+                and comment.performed_via_github_app is not None
+                and comment.performed_via_github_app.id == github.app_id
+            )
+        finally:
+            for event in launcher.allow_launch:
+                event.set()
+            for execution in launcher.executions:
+                execution.release.set()
+    assert completed.id == retry_queued.id
+    assert retained_incomplete.id != completed.id
     assert completed.head_sha == request.head_sha
     assert completed.external_id == derive_review_identity(request).external_id
     assert completed.output.title == "Review complete — no important findings"
@@ -507,3 +566,10 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(
     assert receipts[0].comment_id == receipts[1].comment_id == receipts[2].comment_id
     assert receipts[3].comment_id != receipts[2].comment_id
     assert [comment.id for comment in owned_revision_comments] == [receipts[3].comment_id]
+    _record_resources(
+        resources_path,
+        request,
+        completed,
+        previous_check_run_id=retained_incomplete.id,
+        comment_id=receipts[3].comment_id,
+    )

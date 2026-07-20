@@ -14,10 +14,10 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from review_agent.configuration import ProductionSettings
+from review_agent.configuration import ProductionSettings, SandboxOperationPolicy
 from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
 from review_agent.live import require_fresh_live_review, verify_live_review_evidence
-from review_agent.models import ReviewRequest
+from review_agent.models import AcceptedRevision, ReviewRequest
 from review_agent.production import create_production_app
 from review_agent.sandbox import DockerSandboxClient
 
@@ -126,9 +126,8 @@ def _wait_for_check_run(
 
 def _record_resources(
     path: Path,
+    request: ReviewRequest,
     *,
-    repository: str,
-    pr_number: int,
     check_run_id: int,
     comment_id: int,
 ) -> None:
@@ -138,8 +137,10 @@ def _record_resources(
             json.dumps(
                 {
                     "kind": "full_live_github_resources",
-                    "repository": repository,
-                    "pr_number": pr_number,
+                    "repository": request.repository,
+                    "pr_number": request.pr_number,
+                    "base_sha": request.base_sha,
+                    "head_sha": request.head_sha,
                     "check_run_id": check_run_id,
                     "comment_id": comment_id,
                     "cleanup": (
@@ -176,8 +177,7 @@ def _finish_checkpoint_c(  # noqa: PLR0913
     assert not any(name.startswith(sandbox_name_prefix) for name in sandbox_client.list_names())
     _record_resources(
         resources_path,
-        repository=request.repository,
-        pr_number=request.pr_number,
+        request,
         check_run_id=evidence.check_run_id,
         comment_id=evidence.comment_id,
     )
@@ -215,8 +215,22 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
         pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
         installation_id=installation_id,
     )
-    require_fresh_live_review(request=request, github=github)
-    sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
+    require_fresh_live_review(
+        request=request,
+        github=github,
+        expected=AcceptedRevision(
+            repository=repository,
+            pr_number=int(_required_environment("E2E_GITHUB_PR_NUMBER")),
+            base_sha=_required_environment("E2E_EXPECTED_BASE_SHA"),
+            head_sha=_required_environment("E2E_EXPECTED_HEAD_SHA"),
+        ),
+    )
+    sandbox_client = DockerSandboxClient(
+        config=SandboxOperationPolicy(
+            process_output_max_bytes=attempt.process_output_max_bytes,
+            cleanup_timeout_seconds=attempt.sandbox_cleanup_timeout_seconds,
+        )
+    )
     app = create_production_app(
         settings=settings,
         environment=os.environ,
@@ -242,18 +256,28 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             github,
             request,
             lambda check: check.status is CheckRunStatus.COMPLETED,
-            timeout=attempt.runtime.review_timeout_seconds
-            + attempt.runtime.sandbox_operation.cleanup_timeout_seconds
-            + 60,
+            timeout=(
+                attempt.review_timeout_seconds
+                + attempt.sandbox_cleanup_timeout_seconds
+                + 60
+            ),
         )
-    _finish_checkpoint_c(
-        github=github,
-        request=request,
-        running_check_run_id=running.id,
-        expected_finding=expected_finding,
-        forbidden_texts=(forbidden_instruction, forbidden_config),
-        workspace_root=attempt.workspace_root,
-        sandbox_client=sandbox_client,
-        sandbox_name_prefix=attempt.runtime.sandbox_name_prefix,
-        resources_path=resources_path,
+    verification_github = GitHubAppClient(
+        repository=repository,
+        app_id=attempt.app_id,
+        private_key_path=attempt.private_key_path,
     )
+    try:
+        _finish_checkpoint_c(
+            github=verification_github,
+            request=request,
+            running_check_run_id=running.id,
+            expected_finding=expected_finding,
+            forbidden_texts=(forbidden_instruction, forbidden_config),
+            workspace_root=attempt.workspace_root,
+            sandbox_client=sandbox_client,
+            sandbox_name_prefix=attempt.sandbox_name_prefix,
+            resources_path=resources_path,
+        )
+    finally:
+        verification_github.close()

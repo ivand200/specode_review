@@ -65,18 +65,16 @@ def test_production_settings_accept_the_complete_bounded_configuration(
     assert "review-fixture" not in settings.state.repository_root.name
     assert settings.attempt.private_key_path == tmp_path / "github-app.pem"
     assert settings.webhook.secret == "a" * 32
-    assert settings.attempt.runtime.codex_execution.model == "gpt-5.4"
-    assert settings.attempt.runtime.codex_execution.reasoning_effort is ReasoningEffort.HIGH
-    assert settings.attempt.runtime.review_timeout_seconds == 900
-    assert settings.attempt.runtime.review_limits.sandbox_resources.cpus == 2
-    assert settings.attempt.runtime.review_limits.sandbox_resources.memory_mib == 4096
-    assert settings.attempt.runtime.review_limits.sandbox_resources.pids == 256
-    assert settings.attempt.runtime.review_limits.process_output_max_bytes == 1_048_576
-    assert settings.attempt.runtime.sandbox_operation.process_output_max_bytes == 1_048_576
-    assert settings.attempt.runtime.candidate_output_max_bytes == 65_536
-    assert settings.attempt.runtime.sandbox_operation.cleanup_timeout_seconds == 30
-    assert settings.attempt.runtime.sandbox_operation.deny_network is True
-    assert settings.attempt.runtime.sandbox_name_prefix == "review-agent-"
+    assert settings.attempt.codex_execution.model == "gpt-5.4"
+    assert settings.attempt.codex_execution.reasoning_effort is ReasoningEffort.HIGH
+    assert settings.attempt.review_timeout_seconds == 900
+    assert settings.attempt.sandbox_resources.cpus == 2
+    assert settings.attempt.sandbox_resources.memory_mib == 4096
+    assert settings.attempt.sandbox_resources.pids == 256
+    assert settings.attempt.process_output_max_bytes == 1_048_576
+    assert settings.attempt.candidate_output_max_bytes == 65_536
+    assert settings.attempt.sandbox_cleanup_timeout_seconds == 30
+    assert settings.attempt.sandbox_name_prefix == "review-agent-"
     assert settings.reconciliation.periodic_interval_seconds == 2.5
     assert settings.reconciliation.shutdown_timeout_seconds == 45
 
@@ -117,7 +115,7 @@ def test_production_settings_expose_immutable_webhook_and_attempt_views(
     assert settings.attempt.private_key_path == tmp_path / "github-app.pem"
     assert settings.attempt.review_kit_path == tmp_path / "review-kit"
     assert settings.attempt.workspace_root == tmp_path / "runtime" / "workspaces"
-    assert settings.attempt.runtime.review_timeout_seconds == 900
+    assert settings.attempt.review_timeout_seconds == 900
     assert not hasattr(settings, "webhook_secret")
     assert not hasattr(settings, "runtime")
 
@@ -203,37 +201,25 @@ def test_production_settings_preserve_every_runtime_default(tmp_path: Path) -> N
     ):
         environment.pop(name)
 
-    runtime = ProductionSettings.from_environment(environment).attempt.runtime
+    attempt = ProductionSettings.from_environment(environment).attempt
 
-    assert runtime.review_timeout_seconds == 900
-    assert runtime.review_limits.sandbox_resources.cpus == 2
-    assert runtime.review_limits.sandbox_resources.memory_mib == 4_096
-    assert runtime.review_limits.sandbox_resources.pids == 256
-    assert runtime.review_limits.process_output_max_bytes == 1_048_576
-    assert runtime.sandbox_operation.process_output_max_bytes == 1_048_576
-    assert runtime.candidate_output_max_bytes == 65_536
-    assert runtime.sandbox_operation.cleanup_timeout_seconds == 30
-    assert runtime.sandbox_operation.deny_network is True
-    assert runtime.sandbox_name_prefix == "review-agent-"
+    assert attempt.review_timeout_seconds == 900
+    assert attempt.sandbox_resources.cpus == 2
+    assert attempt.sandbox_resources.memory_mib == 4_096
+    assert attempt.sandbox_resources.pids == 256
+    assert attempt.process_output_max_bytes == 1_048_576
+    assert attempt.candidate_output_max_bytes == 65_536
+    assert attempt.sandbox_cleanup_timeout_seconds == 30
+    assert attempt.sandbox_name_prefix == "review-agent-"
 
 
-def test_production_settings_expose_only_one_immutable_runtime_policy(tmp_path: Path) -> None:
+def test_production_settings_expose_flat_immutable_attempt_settings(tmp_path: Path) -> None:
     settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
 
-    for old_name in (
-        "codex_model",
-        "openai_reasoning_effort",
-        "review_timeout_seconds",
-        "sandbox_resources",
-        "process_output_max_bytes",
-        "candidate_output_max_bytes",
-        "sandbox_cleanup_timeout_seconds",
-        "sandbox_name_prefix",
-    ):
-        assert not hasattr(settings, old_name)
+    assert not hasattr(settings.attempt, "runtime")
 
     with pytest.raises(FrozenInstanceError):
-        settings.attempt.runtime.review_timeout_seconds = 1
+        settings.attempt.review_timeout_seconds = 1
 
 
 @pytest.mark.parametrize(
@@ -249,7 +235,7 @@ def test_production_settings_parse_each_supported_reasoning_effort(
 
     reasoning_effort = ProductionSettings.from_environment(
         environment
-    ).attempt.runtime.codex_execution.reasoning_effort
+    ).attempt.codex_execution.reasoning_effort
 
     assert isinstance(reasoning_effort, ReasoningEffort)
     assert reasoning_effort.value == configured
@@ -263,7 +249,7 @@ def test_production_settings_keep_future_codex_model_names_configurable(
 
     settings = ProductionSettings.from_environment(environment)
 
-    assert settings.attempt.runtime.codex_execution.model == "future-model-2030"
+    assert settings.attempt.codex_execution.model == "future-model-2030"
 
 
 def test_production_settings_exclude_the_webhook_secret_from_representations(
@@ -371,7 +357,7 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     runner = RecordingReadinessProcessRunner(
         {
             (sbx, "version"): b"sbx version: v0.35.0 build\n",
-            (codex, "--version"): b"codex-cli 0.144.5\n",
+            (codex, "--version"): b"codex-cli 0.144.6\n",
             (git, "--version"): b"git version 2.50.1\n",
             (sbx, "diagnose"): b"Docker Sandboxes is ready\n",
             (sbx, "kit", "validate", str(settings.attempt.review_kit_path)): b"valid\n",
@@ -385,7 +371,7 @@ def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
     readiness.check(settings)
 
     assert settings.attempt.workspace_root.is_dir()
-    process_output_max_bytes = settings.attempt.runtime.sandbox_operation.process_output_max_bytes
+    process_output_max_bytes = settings.attempt.process_output_max_bytes
     assert runner.calls == [
         ((sbx, "version"), process_output_max_bytes),
         ((codex, "--version"), process_output_max_bytes),
@@ -417,6 +403,84 @@ def test_readiness_rejects_an_incompatible_version_without_exposing_output(
     assert "99.0.0" not in str(failure.value)
 
 
+@pytest.mark.parametrize(
+    "version_output",
+    [
+        pytest.param(b"codex-cli 0.144.5 token=old-secret\n", id="earlier"),
+        pytest.param(b"codex-cli 0.144.7 token=new-secret\n", id="later"),
+        pytest.param(b"unexpected token=malformed-secret\n", id="malformed"),
+    ],
+)
+def test_readiness_rejects_incompatible_codex_versions_without_exposing_output(
+    tmp_path: Path,
+    version_output: bytes,
+) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    sbx = "/bin/sbx"
+    codex = "/bin/codex"
+    runner = RecordingReadinessProcessRunner(
+        {
+            (sbx, "version"): b"sbx version: v0.35.0\n",
+            (codex, "--version"): version_output,
+        }
+    )
+    readiness = ProductionReadiness(
+        process_runner=runner,
+        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
+    )
+
+    with pytest.raises(StartupReadinessError) as failure:
+        readiness.check(settings)
+
+    assert failure.value.stage == "codex_version"
+    assert str(failure.value) == "production startup readiness failed: codex_version"
+    assert "secret" not in str(failure.value)
+
+
+def test_readiness_normalizes_failed_codex_version_checks(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    sbx = "/bin/sbx"
+    codex = "/bin/codex"
+
+    def fail_codex_version(
+        arguments: tuple[str, ...],
+        output_max_bytes: int,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del output_max_bytes
+        if arguments == (sbx, "version"):
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=b"sbx version: v0.35.0\n",
+                stderr=b"",
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            1,
+            stdout=b"codex-cli token=stdout-secret\n",
+            stderr=b"token=stderr-secret\n",
+        )
+
+    readiness = ProductionReadiness(
+        process_runner=fail_codex_version,
+        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
+    )
+    caplog.set_level(logging.ERROR, logger="review_agent.readiness")
+
+    with pytest.raises(StartupReadinessError) as failure:
+        readiness.check(settings)
+
+    assert failure.value.stage == "codex_version"
+    observable = (
+        str(failure.value) + "\n" + "\n".join(record.getMessage() for record in caplog.records)
+    )
+    assert "stdout-secret" not in observable
+    assert "stderr-secret" not in observable
+
+
 def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -427,7 +491,7 @@ def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
     git = "/bin/git"
     successful = {
         (sbx, "version"): b"sbx version: v0.35.0\n",
-        (codex, "--version"): b"codex-cli 0.144.5\n",
+        (codex, "--version"): b"codex-cli 0.144.6\n",
         (git, "--version"): b"git version 2.50.1\n",
         (sbx, "diagnose"): b"ready\n",
     }
@@ -591,7 +655,8 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
     ):
         assert setting in example
     assert "sbx 0.35.0" in operator_guide
-    assert "Codex CLI 0.144.5" in operator_guide
+    assert "Codex CLI 0.144.6" in operator_guide
+    assert "Codex CLI 0.144.6" in live_guide
     assert "host-managed credential proxy" in operator_guide
     assert "one process" in operator_guide
     assert "RUN_FULL_LIVE_E2E=1" in live_guide
