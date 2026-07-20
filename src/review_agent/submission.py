@@ -11,6 +11,7 @@ class SubmissionOutcome(Enum):
     ACCEPTED = auto()
     ALREADY_RUNNING = auto()
     ALREADY_REVIEWED = auto()
+    NOT_AUTHORIZED = auto()
     AT_CAPACITY = auto()
     STOPPING = auto()
     UNAVAILABLE = auto()

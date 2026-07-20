@@ -8,6 +8,7 @@ from review_agent.core import (
 )
 from review_agent.errors import FailureCategory, ReviewError
 from review_agent.github import GitHubAppClient, GitHubError
+from review_agent.lifecycle import ReviewLifecycle
 from review_agent.models import (
     AgentReview,
     DiffRange,
@@ -45,6 +46,7 @@ __all__ = [
     "ReviewCompletion",
     "ReviewContext",
     "ReviewError",
+    "ReviewLifecycle",
     "ReviewLimits",
     "ReviewRequest",
     "ReviewResourceManager",
