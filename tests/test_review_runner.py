@@ -1,3 +1,5 @@
+import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -416,7 +418,59 @@ def test_run_owns_the_complete_clean_review_transaction(tmp_path: Path) -> None:
     assert github.created_bodies[0].endswith(" -->\n")
 
 
-def test_run_failure_force_cleans_and_publishes_nothing(tmp_path: Path) -> None:
+def test_run_emits_cleanup_and_publication_evidence(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source, base_sha, head_sha = _repository(tmp_path)
+    github = ControlledRunClient()
+    resources = ReviewResourceManager(
+        workspace_root=tmp_path / "workspaces",
+        sandbox_prefix="specode-review-",
+        sandbox_client=EmptySandboxInventory(),
+    )
+    runner = ReviewRunner(
+        github_client_factory=lambda _repository: github,
+        resource_manager=resources,
+        candidate_adapter_factory=lambda _resources: CleanCandidateAdapter(),
+        source_repository=source,
+    )
+    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+
+    runner.run(
+        _request(base_sha=base_sha, head_sha=head_sha),
+        "4" * 32,
+    )
+
+    records = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "review_agent.lifecycle_evidence"
+    ]
+    assert records == [
+        {
+            "accepted_revision": head_sha,
+            "attempt_id": "4" * 32,
+            "cleanup_outcome": "confirmed",
+            "event": "cleanup",
+            "pull_request": 17,
+            "repository": "octo-org/example",
+        },
+        {
+            "accepted_revision": head_sha,
+            "attempt_id": "4" * 32,
+            "event": "publication",
+            "publication_disposition": "created",
+            "pull_request": 17,
+            "repository": "octo-org/example",
+        },
+    ]
+
+
+def test_run_failure_force_cleans_and_publishes_nothing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
     github = ControlledRunClient()
     resources = ReviewResourceManager(
@@ -430,6 +484,7 @@ def test_run_failure_force_cleans_and_publishes_nothing(tmp_path: Path) -> None:
         candidate_adapter_factory=lambda _resources: FailingCandidateAdapter(),
         source_repository=source,
     )
+    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
 
     with pytest.raises(ReviewError) as failure:
         runner.run(
@@ -445,9 +500,20 @@ def test_run_failure_force_cleans_and_publishes_nothing(tmp_path: Path) -> None:
     assert not resources.for_attempt("2" * 32).workspace.exists()
     assert github.created_bodies == []
     assert github.closed
+    records = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "review_agent.lifecycle_evidence"
+    ]
+    assert records[0]["cleanup_outcome"] == "confirmed"
+    assert records[1]["publication_disposition"] == "suppressed"
+    assert "model output contained sensitive source" not in caplog.text
 
 
-def test_cleanup_failure_suppresses_publication_and_is_normalized(tmp_path: Path) -> None:
+def test_cleanup_failure_suppresses_publication_and_is_normalized(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     source, base_sha, head_sha = _repository(tmp_path)
     github = ControlledRunClient()
     sandbox = FailingSandboxInventory()
@@ -462,6 +528,7 @@ def test_cleanup_failure_suppresses_publication_and_is_normalized(tmp_path: Path
         candidate_adapter_factory=lambda _resources: CleanCandidateAdapter(),
         source_repository=source,
     )
+    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
 
     with pytest.raises(ReviewError) as failure:
         runner.run(
@@ -477,6 +544,15 @@ def test_cleanup_failure_suppresses_publication_and_is_normalized(tmp_path: Path
     assert sandbox.cleanup_attempts == 2
     assert github.created_bodies == []
     assert github.closed
+    records = [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "review_agent.lifecycle_evidence"
+    ]
+    assert [record["event"] for record in records] == ["cleanup", "publication"]
+    assert records[0]["cleanup_outcome"] == "failed"
+    assert records[1]["publication_disposition"] == "suppressed"
+    assert "sensitive output" not in caplog.text
 
 
 def test_run_reconciles_an_ambiguous_comment_create(tmp_path: Path) -> None:

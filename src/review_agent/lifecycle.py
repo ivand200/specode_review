@@ -1,4 +1,5 @@
 import asyncio
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
@@ -7,8 +8,12 @@ from types import TracebackType
 from typing import Protocol, Self
 
 from review_agent.github import ReviewIdentity, derive_review_identity
+from review_agent.lifecycle_evidence import (
+    emit_lifecycle_evidence,
+    emit_normalized_failure,
+)
 from review_agent.models import ReviewRequest
-from review_agent.review_runner import PreflightOutcome
+from review_agent.review_runner import PreflightOutcome, ReviewCompletion
 from review_agent.submission import SubmissionOutcome
 
 DEFAULT_MAX_CONCURRENT_REVIEWS = 3
@@ -85,12 +90,17 @@ class ReviewLifecycle:
 
     async def submit(self, request: ReviewRequest) -> SubmissionOutcome:
         identity = derive_review_identity(request)
+        immediate_outcome: SubmissionOutcome | None = None
         async with self._condition:
             if self._state is not _LifecycleState.ACCEPTING:
-                return SubmissionOutcome.STOPPING
-            if identity in self._claims:
-                return SubmissionOutcome.ALREADY_RUNNING
-            self._claims[identity] = _ClaimPhase.PREFLIGHT
+                immediate_outcome = SubmissionOutcome.STOPPING
+            elif identity in self._claims:
+                immediate_outcome = SubmissionOutcome.ALREADY_RUNNING
+            else:
+                self._claims[identity] = _ClaimPhase.PREFLIGHT
+        if immediate_outcome is not None:
+            _emit_admission(request, immediate_outcome)
+            return immediate_outcome
 
         try:
             return await self._submit_claimed(request, identity)
@@ -103,41 +113,79 @@ class ReviewLifecycle:
         request: ReviewRequest,
         identity: ReviewIdentity,
     ) -> SubmissionOutcome:
+        preflight_started = time.monotonic()
         preflight = await self._preflight(request, identity)
+        emit_lifecycle_evidence(
+            request,
+            "preflight",
+            terminal_outcome=(
+                preflight.name.lower()
+                if isinstance(preflight, SubmissionOutcome)
+                else preflight.value
+            ),
+            duration_ms=_duration_ms(preflight_started),
+        )
         if isinstance(preflight, SubmissionOutcome):
+            _emit_admission(request, preflight)
             return preflight
 
         if preflight is PreflightOutcome.ALREADY_REVIEWED:
             await self._release_claim(identity)
-            return SubmissionOutcome.ALREADY_REVIEWED
+            outcome = SubmissionOutcome.ALREADY_REVIEWED
+            _emit_admission(request, outcome)
+            return outcome
         if preflight is PreflightOutcome.NOT_AUTHORIZED:
             await self._release_claim(identity)
-            return SubmissionOutcome.NOT_AUTHORIZED
+            outcome = SubmissionOutcome.NOT_AUTHORIZED
+            _emit_admission(request, outcome)
+            return outcome
         if preflight is not PreflightOutcome.READY:
             await self._release_claim(identity)
-            return SubmissionOutcome.UNAVAILABLE
+            outcome = SubmissionOutcome.UNAVAILABLE
+            _emit_admission(request, outcome)
+            return outcome
 
         try:
             attempt_id = self._attempt_id_factory()
-        except Exception:  # noqa: BLE001 - keep unexpected admission failures bounded.
+        except Exception as error:  # noqa: BLE001 - keep unexpected admission failures bounded.
             await self._release_claim(identity)
-            return SubmissionOutcome.UNAVAILABLE
+            emit_normalized_failure(
+                request,
+                error,
+                fallback_stage="attempt_construction",
+            )
+            outcome = SubmissionOutcome.UNAVAILABLE
+            _emit_admission(request, outcome)
+            return outcome
 
+        promotion_outcome: SubmissionOutcome | None = None
         async with self._condition:
             if self._state is not _LifecycleState.ACCEPTING:
                 self._claims.pop(identity, None)
                 self._condition.notify_all()
-                return SubmissionOutcome.STOPPING
-            running = sum(phase is _ClaimPhase.RUNNING for phase in self._claims.values())
-            if running >= self._max_concurrent_reviews:
+                promotion_outcome = SubmissionOutcome.STOPPING
+            elif (
+                sum(phase is _ClaimPhase.RUNNING for phase in self._claims.values())
+                >= self._max_concurrent_reviews
+            ):
                 self._claims.pop(identity, None)
                 self._condition.notify_all()
-                return SubmissionOutcome.AT_CAPACITY
-
-            self._claims[identity] = _ClaimPhase.RUNNING
-            task = asyncio.create_task(self._run(identity, request, attempt_id))
-            self._tasks.add(task)
-            return SubmissionOutcome.ACCEPTED
+                promotion_outcome = SubmissionOutcome.AT_CAPACITY
+            else:
+                self._claims[identity] = _ClaimPhase.RUNNING
+                task = asyncio.create_task(self._run(identity, request, attempt_id))
+                self._tasks.add(task)
+        if promotion_outcome is not None:
+            _emit_admission(request, promotion_outcome)
+            return promotion_outcome
+        emit_lifecycle_evidence(
+            request,
+            "running",
+            attempt_id=attempt_id,
+            terminal_outcome="started",
+        )
+        _emit_admission(request, SubmissionOutcome.ACCEPTED, attempt_id=attempt_id)
+        return SubmissionOutcome.ACCEPTED
 
     async def _preflight(
         self,
@@ -153,8 +201,13 @@ class ReviewLifecycle:
             with suppress(Exception):
                 await preflight_task
             raise
-        except Exception:  # noqa: BLE001 - normalize the configured runner seam.
+        except Exception as error:  # noqa: BLE001 - normalize the configured runner seam.
             await self._release_claim(identity)
+            emit_normalized_failure(
+                request,
+                error,
+                fallback_stage="preflight",
+            )
             return SubmissionOutcome.UNAVAILABLE
 
     async def _run(
@@ -163,10 +216,20 @@ class ReviewLifecycle:
         request: ReviewRequest,
         attempt_id: str,
     ) -> None:
+        started = time.monotonic()
+        terminal_facts: dict[str, str | int] = {"terminal_outcome": "succeeded"}
         try:
-            await asyncio.to_thread(self._runner.run, request, attempt_id)
-        except Exception:  # noqa: BLE001 - the retained task must consume normalized failures.
-            return
+            completion = await asyncio.to_thread(self._runner.run, request, attempt_id)
+            if isinstance(completion, ReviewCompletion):
+                terminal_facts["publication_disposition"] = completion.publication.value
+        except Exception as error:  # noqa: BLE001 - consume normalized failures.
+            terminal_facts["terminal_outcome"] = "failed"
+            emit_normalized_failure(
+                request,
+                error,
+                fallback_stage="review",
+                attempt_id=attempt_id,
+            )
         finally:
             current = asyncio.current_task()
             async with self._condition:
@@ -174,6 +237,13 @@ class ReviewLifecycle:
                 if current is not None:
                     self._tasks.discard(current)
                 self._condition.notify_all()
+            emit_lifecycle_evidence(
+                request,
+                "terminal_release",
+                attempt_id=attempt_id,
+                duration_ms=_duration_ms(started),
+                **terminal_facts,
+            )
 
     async def _release_claim(self, identity: ReviewIdentity) -> None:
         async with self._condition:
@@ -183,3 +253,21 @@ class ReviewLifecycle:
 
 def _new_attempt_id() -> str:
     return uuid.uuid4().hex
+
+
+def _duration_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1_000))
+
+
+def _emit_admission(
+    request: ReviewRequest,
+    outcome: SubmissionOutcome,
+    *,
+    attempt_id: str | None = None,
+) -> None:
+    emit_lifecycle_evidence(
+        request,
+        "admission",
+        attempt_id=attempt_id,
+        admission_disposition=outcome.name.lower(),
+    )

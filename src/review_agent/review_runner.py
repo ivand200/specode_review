@@ -21,6 +21,7 @@ from review_agent.github import (
     ReviewComment,
     ReviewCommentGateway,
 )
+from review_agent.lifecycle_evidence import emit_lifecycle_evidence
 from review_agent.models import ReviewRequest
 from review_agent.publishing import (
     PublicationDisposition,
@@ -203,6 +204,7 @@ class ReviewRunner:
             if resources is not None and not cleanup_confirmed:
                 try:
                     resource_manager.cleanup(attempt_id)
+                    cleanup_confirmed = True
                 except Exception as error:  # noqa: BLE001 - cleanup overrides earlier failure.
                     failure = _normalized_failure(error, stage="cleanup")
             if github is not None:
@@ -212,6 +214,30 @@ class ReviewRunner:
                     if failure is None:
                         failure = _normalized_failure(error, stage="client_cleanup")
 
+        emit_lifecycle_evidence(
+            request,
+            "cleanup",
+            attempt_id=attempt_id,
+            cleanup_outcome=(
+                "not_required"
+                if resources is None
+                else "confirmed"
+                if cleanup_confirmed
+                else "failed"
+            ),
+        )
+        emit_lifecycle_evidence(
+            request,
+            "publication",
+            attempt_id=attempt_id,
+            publication_disposition=(
+                completion.publication.value
+                if completion is not None
+                else "failed"
+                if failure is not None and failure.stage == "publication"
+                else "suppressed"
+            ),
+        )
         if failure is not None:
             raise failure from None
         if completion is None:
