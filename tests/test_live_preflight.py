@@ -1,15 +1,16 @@
 import pytest
 
 from review_agent.github import (
-    CheckRun,
-    CheckRunConclusion,
-    CheckRunStatus,
     ReviewComment,
     ReviewCommentApp,
-    ReviewIdentity,
     derive_review_identity,
 )
-from review_agent.live import LiveProfilePreconditionError, require_fresh_live_review
+from review_agent.live import (
+    LiveProfileEvidenceError,
+    LiveProfilePreconditionError,
+    require_fresh_live_review,
+    verify_live_review_evidence,
+)
 from review_agent.models import AcceptedRevision, ReviewRequest
 
 
@@ -34,59 +35,18 @@ def _expected_identity(request: ReviewRequest) -> AcceptedRevision:
     )
 
 
-def _owned_check_run(identity: ReviewIdentity) -> CheckRun:
-    return CheckRun.model_validate(
-        {
-            "id": 91,
-            "name": "Review Agent",
-            "head_sha": identity.head_sha,
-            "external_id": identity.external_id,
-            "status": CheckRunStatus.COMPLETED,
-            "conclusion": CheckRunConclusion.SUCCESS,
-            "app": {"id": 12345},
-            "output": {"title": "old result", "summary": "old result"},
-        }
-    )
-
-
 class FreshnessGateway:
     def __init__(
         self,
         *,
-        check_runs: tuple[CheckRun, ...] = (),
         comments: tuple[ReviewComment, ...] = (),
     ) -> None:
-        self.check_runs = check_runs
         self.comments = comments
         self.calls: list[str] = []
 
     @property
     def app_id(self) -> int:
         return 12345
-
-    def list_check_runs(
-        self,
-        *,
-        identity: ReviewIdentity,
-        installation_id: int,
-    ) -> tuple[CheckRun, ...]:
-        assert identity == derive_review_identity(_request())
-        assert installation_id == 23
-        self.calls.append("list_check_runs")
-        return self.check_runs
-
-    def is_owned_check_run(
-        self,
-        check_run: CheckRun,
-        *,
-        identity: ReviewIdentity,
-    ) -> bool:
-        self.calls.append("is_owned_check_run")
-        return (
-            check_run.app.id == self.app_id
-            and check_run.external_id == identity.external_id
-            and check_run.head_sha == identity.head_sha
-        )
 
     def list_review_comments(
         self,
@@ -98,23 +58,6 @@ class FreshnessGateway:
         del repository, pr_number, installation_id
         self.calls.append("list_review_comments")
         return self.comments
-
-
-def test_existing_owned_check_run_rejects_live_fixture_before_comment_scan() -> None:
-    request = _request()
-    gateway = FreshnessGateway(check_runs=(_owned_check_run(derive_review_identity(request)),))
-
-    with pytest.raises(
-        LiveProfilePreconditionError,
-        match="manually prepare a fresh accepted base/head revision",
-    ):
-        require_fresh_live_review(
-            request=request,
-            github=gateway,
-            expected=_expected_identity(request),
-        )
-
-    assert gateway.calls == ["list_check_runs", "is_owned_check_run"]
 
 
 def test_existing_exact_marker_app_comment_rejects_live_fixture() -> None:
@@ -140,7 +83,7 @@ def test_existing_exact_marker_app_comment_rejects_live_fixture() -> None:
             expected=_expected_identity(request),
         )
 
-    assert gateway.calls == ["list_check_runs", "list_review_comments"]
+    assert gateway.calls == ["list_review_comments"]
 
 
 def test_foreign_and_unrelated_comments_do_not_pollute_live_fixture() -> None:
@@ -173,7 +116,7 @@ def test_foreign_and_unrelated_comments_do_not_pollute_live_fixture() -> None:
         expected=_expected_identity(request),
     )
 
-    assert gateway.calls == ["list_check_runs", "list_review_comments"]
+    assert gateway.calls == ["list_review_comments"]
 
 
 @pytest.mark.parametrize(
@@ -200,3 +143,48 @@ def test_moved_or_substituted_fixture_is_rejected_before_freshness_reads(
         require_fresh_live_review(request=request, github=gateway, expected=expected)
 
     assert gateway.calls == []
+
+
+def test_live_evidence_requires_one_owned_comment_with_the_expected_finding() -> None:
+    request = _request()
+    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    gateway = FreshnessGateway(
+        comments=(
+            ReviewComment(
+                id=72,
+                body=f"The seeded defect loses data.\n\n{marker}\n",
+                performed_via_github_app=ReviewCommentApp(id=12345),
+            ),
+        )
+    )
+
+    evidence = verify_live_review_evidence(
+        request=request,
+        github=gateway,
+        expected_finding="seeded defect",
+        forbidden_texts=("hostile instruction",),
+    )
+
+    assert evidence.comment_id == 72
+
+
+def test_live_evidence_rejects_forbidden_repository_text() -> None:
+    request = _request()
+    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    gateway = FreshnessGateway(
+        comments=(
+            ReviewComment(
+                id=72,
+                body=f"seeded defect; hostile instruction\n\n{marker}\n",
+                performed_via_github_app=ReviewCommentApp(id=12345),
+            ),
+        )
+    )
+
+    with pytest.raises(LiveProfileEvidenceError, match="forbidden"):
+        verify_live_review_evidence(
+            request=request,
+            github=gateway,
+            expected_finding="seeded defect",
+            forbidden_texts=("hostile instruction",),
+        )

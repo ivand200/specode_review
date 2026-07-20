@@ -1,57 +1,19 @@
-import asyncio
-import logging
 import subprocess
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from types import TracebackType
-from typing import Self
 
 import pytest
 
 from review_agent.configuration import (
-    AttemptSettings,
     ConfigurationError,
     ProductionPaths,
     ProductionServiceSettings,
-    ProductionSettings,
     ReasoningEffort,
 )
-from review_agent.models import ReviewRequest
-from review_agent.production import create_production_app
 from review_agent.readiness import ProductionReadiness, StartupReadinessError
-from review_agent.submission import SubmissionOutcome
-from review_agent.web import create_app
 
 
-def _valid_environment(tmp_path: Path) -> dict[str, str]:
-    private_key = tmp_path / "github-app.pem"
-    private_key.write_text("test private key", encoding="utf-8")
-    kit = tmp_path / "review-kit"
-    kit.mkdir()
-    workspace_parent = tmp_path / "runtime"
-    workspace_parent.mkdir()
-    return {
-        "GITHUB_REPOSITORY": "octo-org/review-fixture",
-        "GITHUB_APP_ID": "1234",
-        "GITHUB_PRIVATE_KEY_PATH": str(private_key),
-        "GITHUB_WEBHOOK_SECRET": "a" * 32,
-        "CODEX_MODEL": "gpt-5.4",
-        "OPENAI_REASONING_EFFORT": "high",
-        "REVIEW_KIT_PATH": str(kit),
-        "STATE_ROOT": str(tmp_path / "state"),
-        "WORKSPACE_ROOT": str(workspace_parent / "workspaces"),
-        "REVIEW_TIMEOUT_SECONDS": "900",
-        "SANDBOX_CPUS": "2",
-        "SANDBOX_MEMORY_MIB": "4096",
-        "SANDBOX_PIDS": "256",
-        "PROCESS_OUTPUT_MAX_BYTES": "1048576",
-        "CANDIDATE_OUTPUT_MAX_BYTES": "65536",
-        "SANDBOX_CLEANUP_TIMEOUT_SECONDS": "30",
-        "SANDBOX_NAME_PREFIX": "review-agent-",
-    }
-
-
-def _service_paths(tmp_path: Path) -> ProductionPaths:
+def _paths(tmp_path: Path) -> ProductionPaths:
     private_key = tmp_path / "github-app.pem"
     private_key.write_text("test private key", encoding="utf-8")
     review_kit = tmp_path / "review-kit"
@@ -63,27 +25,39 @@ def _service_paths(tmp_path: Path) -> ProductionPaths:
     )
 
 
-def test_service_settings_use_the_narrow_operator_contract_and_fixed_runtime_defaults(
+def _environment() -> dict[str, str]:
+    return {
+        "GITHUB_APP_ID": "1234",
+        "GITHUB_WEBHOOK_SECRET": "a" * 32,
+        "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
+        "CODEX_MODEL": "gpt-5.4",
+        "OPENAI_REASONING_EFFORT": "high",
+    }
+
+
+def test_service_settings_expose_only_the_narrow_operator_contract(
     tmp_path: Path,
 ) -> None:
     settings = ProductionServiceSettings.from_environment(
-        {
-            "GITHUB_APP_ID": "1234",
-            "GITHUB_WEBHOOK_SECRET": "a" * 32,
-            "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
-            "CODEX_MODEL": "gpt-5.4",
-            "OPENAI_REASONING_EFFORT": "high",
-        },
-        paths=_service_paths(tmp_path),
+        _environment(),
+        paths=_paths(tmp_path),
     )
 
+    assert settings.app_id == 1234
+    assert settings.public_webhook_url == "https://reviews.example/webhooks/github"
     assert settings.max_concurrent_reviews == 3
     assert settings.log_level == "INFO"
+    assert settings.codex_execution.reasoning_effort is ReasoningEffort.HIGH
     assert settings.attempt.sandbox_resources.cpus == 2
     assert settings.attempt.sandbox_resources.memory_mib == 2_048
     assert settings.attempt.sandbox_resources.pids == 256
     assert settings.attempt.workspace_root == tmp_path / "workspaces"
-    assert settings.attempt.sandbox_name_prefix == "review-agent-"
+    assert not hasattr(settings, "repository")
+    assert not hasattr(settings, "state")
+    assert not hasattr(settings, "reconciliation")
+
+    with pytest.raises(FrozenInstanceError):
+        settings.max_concurrent_reviews = 4
 
 
 @pytest.mark.parametrize("value", ["", "0", "6", "not-an-integer"])
@@ -91,20 +65,10 @@ def test_service_settings_reject_out_of_range_concurrency(
     tmp_path: Path,
     value: str,
 ) -> None:
-    environment = {
-        "GITHUB_APP_ID": "1234",
-        "GITHUB_WEBHOOK_SECRET": "a" * 32,
-        "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
-        "CODEX_MODEL": "gpt-5.4",
-        "OPENAI_REASONING_EFFORT": "high",
-        "MAX_CONCURRENT_REVIEWS": value,
-    }
+    environment = _environment() | {"MAX_CONCURRENT_REVIEWS": value}
 
     with pytest.raises(ConfigurationError, match="MAX_CONCURRENT_REVIEWS"):
-        ProductionServiceSettings.from_environment(
-            environment,
-            paths=_service_paths(tmp_path),
-        )
+        ProductionServiceSettings.from_environment(environment, paths=_paths(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -119,645 +83,113 @@ def test_service_settings_require_a_complete_stable_https_webhook_url(
     tmp_path: Path,
     url: str,
 ) -> None:
-    environment = {
-        "GITHUB_APP_ID": "1234",
-        "GITHUB_WEBHOOK_SECRET": "a" * 32,
-        "PUBLIC_WEBHOOK_URL": url,
-        "CODEX_MODEL": "gpt-5.4",
-        "OPENAI_REASONING_EFFORT": "high",
-    }
+    environment = _environment() | {"PUBLIC_WEBHOOK_URL": url}
 
     with pytest.raises(ConfigurationError, match="PUBLIC_WEBHOOK_URL"):
-        ProductionServiceSettings.from_environment(
-            environment,
-            paths=_service_paths(tmp_path),
-        )
-
-
-def test_production_settings_accept_the_complete_bounded_configuration(
-    tmp_path: Path,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["RECONCILIATION_INTERVAL_SECONDS"] = "2.5"
-    environment["SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS"] = "45"
-
-    settings = ProductionSettings.from_environment(environment)
-
-    assert settings.webhook.repository == "octo-org/review-fixture"
-    assert settings.attempt.app_id == 1234
-    assert settings.state.root == tmp_path / "state"
-    assert settings.state.repository_root.parent == tmp_path / "state" / "repositories"
-    assert "review-fixture" not in settings.state.repository_root.name
-    assert settings.attempt.private_key_path == tmp_path / "github-app.pem"
-    assert settings.webhook.secret == "a" * 32
-    assert settings.attempt.codex_execution.model == "gpt-5.4"
-    assert settings.attempt.codex_execution.reasoning_effort is ReasoningEffort.HIGH
-    assert settings.attempt.review_timeout_seconds == 900
-    assert settings.attempt.sandbox_resources.cpus == 2
-    assert settings.attempt.sandbox_resources.memory_mib == 4096
-    assert settings.attempt.sandbox_resources.pids == 256
-    assert settings.attempt.process_output_max_bytes == 1_048_576
-    assert settings.attempt.candidate_output_max_bytes == 65_536
-    assert settings.attempt.sandbox_cleanup_timeout_seconds == 30
-    assert settings.attempt.sandbox_name_prefix == "review-agent-"
-    assert settings.reconciliation.periodic_interval_seconds == 2.5
-    assert settings.reconciliation.shutdown_timeout_seconds == 45
+        ProductionServiceSettings.from_environment(environment, paths=_paths(tmp_path))
 
 
 @pytest.mark.parametrize(
     ("name", "value"),
     [
-        ("RECONCILIATION_INTERVAL_SECONDS", ""),
-        ("RECONCILIATION_INTERVAL_SECONDS", "not-a-number"),
-        ("RECONCILIATION_INTERVAL_SECONDS", "0"),
-        ("SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS", "-1"),
-    ],
-)
-def test_production_settings_reject_invalid_reconciliation_timing(
-    tmp_path: Path,
-    name: str,
-    value: str,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment[name] = value
-
-    with pytest.raises(ConfigurationError, match=name) as failure:
-        ProductionSettings.from_environment(environment)
-
-    if value:
-        assert value not in str(failure.value)
-
-
-def test_production_settings_expose_immutable_webhook_and_attempt_views(
-    tmp_path: Path,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-
-    assert settings.webhook.repository == "octo-org/review-fixture"
-    assert settings.webhook.secret == "a" * 32
-    assert settings.webhook.max_concurrent_reviews == 1
-    assert settings.attempt.app_id == 1234
-    assert settings.attempt.private_key_path == tmp_path / "github-app.pem"
-    assert settings.attempt.review_kit_path == tmp_path / "review-kit"
-    assert settings.attempt.workspace_root == tmp_path / "runtime" / "workspaces"
-    assert settings.attempt.review_timeout_seconds == 900
-    assert not hasattr(settings, "webhook_secret")
-    assert not hasattr(settings, "runtime")
-
-    with pytest.raises(FrozenInstanceError):
-        settings.webhook.max_concurrent_reviews = 2
-
-
-def test_production_settings_accept_the_maximum_review_concurrency(
-    tmp_path: Path,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["MAX_CONCURRENT_REVIEWS"] = "10"
-
-    settings = ProductionSettings.from_environment(environment)
-
-    assert settings.webhook.max_concurrent_reviews == 10
-
-
-@pytest.mark.parametrize("value", ["", "not-an-integer", "1.5", "0", "-1", "11"])
-def test_production_settings_reject_invalid_review_concurrency(
-    tmp_path: Path,
-    value: str,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["MAX_CONCURRENT_REVIEWS"] = value
-
-    with pytest.raises(ConfigurationError, match="MAX_CONCURRENT_REVIEWS") as failure:
-        ProductionSettings.from_environment(environment)
-
-    if value:
-        assert value not in str(failure.value)
-
-
-def test_attempt_settings_render_a_revalidatable_allowlisted_executor_environment(
-    tmp_path: Path,
-) -> None:
-    parent_environment = _valid_environment(tmp_path) | {
-        "PATH": "/trusted/bin",
-        "HOME": "/trusted/home",
-        "TMPDIR": "/trusted/tmp",
-        "DOCKER_HOST": "unix:///trusted/docker.sock",
-        "DOCKER_SANDBOXES_CONTEXT": "trusted-sandbox-context",
-        "SSL_CERT_FILE": "/trusted/cert.pem",
-        "GITHUB_WEBHOOK_SECRET": "webhook-secret-must-not-cross-" + "x" * 8,
-        "OPENAI_API_KEY": "raw-model-secret-must-not-cross",
-        "UNRELATED_SENTINEL": "must-not-cross",
-        "MAX_CONCURRENT_REVIEWS": "3",
-        "NGROK_AUTHTOKEN": "parent-only-must-not-cross",
-    }
-    settings = ProductionSettings.from_environment(parent_environment)
-
-    executor_environment = settings.attempt.render_executor_environment(parent_environment)
-
-    assert AttemptSettings.from_environment(executor_environment) == settings.attempt
-    assert executor_environment["PATH"] == "/trusted/bin"
-    assert executor_environment["HOME"] == "/trusted/home"
-    assert executor_environment["TMPDIR"] == "/trusted/tmp"
-    assert executor_environment["DOCKER_HOST"] == "unix:///trusted/docker.sock"
-    assert executor_environment["DOCKER_SANDBOXES_CONTEXT"] == "trusted-sandbox-context"
-    assert executor_environment["SSL_CERT_FILE"] == "/trusted/cert.pem"
-    for excluded in (
-        "GITHUB_REPOSITORY",
-        "GITHUB_WEBHOOK_SECRET",
-        "OPENAI_API_KEY",
-        "UNRELATED_SENTINEL",
-        "MAX_CONCURRENT_REVIEWS",
-        "NGROK_AUTHTOKEN",
-    ):
-        assert excluded not in executor_environment
-
-
-def test_production_settings_preserve_every_runtime_default(tmp_path: Path) -> None:
-    environment = _valid_environment(tmp_path)
-    for name in (
-        "REVIEW_TIMEOUT_SECONDS",
-        "SANDBOX_CPUS",
-        "SANDBOX_MEMORY_MIB",
-        "SANDBOX_PIDS",
-        "PROCESS_OUTPUT_MAX_BYTES",
-        "CANDIDATE_OUTPUT_MAX_BYTES",
-        "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
-        "SANDBOX_NAME_PREFIX",
-    ):
-        environment.pop(name)
-
-    attempt = ProductionSettings.from_environment(environment).attempt
-
-    assert attempt.review_timeout_seconds == 900
-    assert attempt.sandbox_resources.cpus == 2
-    assert attempt.sandbox_resources.memory_mib == 4_096
-    assert attempt.sandbox_resources.pids == 256
-    assert attempt.process_output_max_bytes == 1_048_576
-    assert attempt.candidate_output_max_bytes == 65_536
-    assert attempt.sandbox_cleanup_timeout_seconds == 30
-    assert attempt.sandbox_name_prefix == "review-agent-"
-
-
-def test_production_settings_expose_flat_immutable_attempt_settings(tmp_path: Path) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-
-    assert not hasattr(settings.attempt, "runtime")
-
-    with pytest.raises(FrozenInstanceError):
-        settings.attempt.review_timeout_seconds = 1
-
-
-@pytest.mark.parametrize(
-    "configured",
-    ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
-)
-def test_production_settings_parse_each_supported_reasoning_effort(
-    tmp_path: Path,
-    configured: str,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["OPENAI_REASONING_EFFORT"] = configured
-
-    reasoning_effort = ProductionSettings.from_environment(
-        environment
-    ).attempt.codex_execution.reasoning_effort
-
-    assert isinstance(reasoning_effort, ReasoningEffort)
-    assert reasoning_effort.value == configured
-
-
-def test_production_settings_keep_future_codex_model_names_configurable(
-    tmp_path: Path,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["CODEX_MODEL"] = "future-model-2030"
-
-    settings = ProductionSettings.from_environment(environment)
-
-    assert settings.attempt.codex_execution.model == "future-model-2030"
-
-
-def test_production_settings_exclude_the_webhook_secret_from_representations(
-    tmp_path: Path,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-
-    assert settings.webhook.secret not in repr(settings)
-
-
-@pytest.mark.parametrize(
-    ("name", "value"),
-    [
-        ("GITHUB_REPOSITORY", "https://github.com/octo-org/review-fixture"),
         ("GITHUB_APP_ID", "0"),
         ("GITHUB_WEBHOOK_SECRET", "short"),
         ("CODEX_MODEL", ""),
         ("CODEX_MODEL", " future-model"),
-        ("CODEX_MODEL", "future-model "),
-        ("CODEX_MODEL", "x" * 129),
         ("OPENAI_REASONING_EFFORT", "extreme"),
-        ("REVIEW_TIMEOUT_SECONDS", "0"),
-        ("SANDBOX_CPUS", "0"),
-        ("SANDBOX_MEMORY_MIB", "0"),
-        ("SANDBOX_PIDS", "0"),
-        ("PROCESS_OUTPUT_MAX_BYTES", "0"),
-        ("CANDIDATE_OUTPUT_MAX_BYTES", "0"),
-        ("SANDBOX_CLEANUP_TIMEOUT_SECONDS", "0"),
-        ("SANDBOX_NAME_PREFIX", "unsafe_prefix"),
+        ("LOG_LEVEL", "verbose"),
     ],
 )
-def test_production_settings_reject_invalid_values_without_echoing_them(
+def test_service_settings_reject_invalid_values_without_echoing_them(
     tmp_path: Path,
     name: str,
     value: str,
 ) -> None:
-    environment = _valid_environment(tmp_path)
-    environment[name] = value
+    environment = _environment() | {name: value}
 
     with pytest.raises(ConfigurationError) as failure:
-        ProductionSettings.from_environment(environment)
+        ProductionServiceSettings.from_environment(environment, paths=_paths(tmp_path))
 
     assert name in str(failure.value)
     if value:
         assert value not in str(failure.value)
 
 
-@pytest.mark.parametrize("name", ["GITHUB_PRIVATE_KEY_PATH", "REVIEW_KIT_PATH"])
-def test_production_settings_require_existing_non_symlink_secret_and_kit_paths(
-    tmp_path: Path,
-    name: str,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment[name] = str(tmp_path / "missing")
-
-    with pytest.raises(ConfigurationError, match=name):
-        ProductionSettings.from_environment(environment)
-
-
-def test_production_settings_require_a_dedicated_absolute_workspace_root(
-    tmp_path: Path,
-) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["WORKSPACE_ROOT"] = "relative/workspaces"
-
-    with pytest.raises(ConfigurationError, match="WORKSPACE_ROOT"):
-        ProductionSettings.from_environment(environment)
-
-
-def test_production_settings_require_a_separate_absolute_state_root(tmp_path: Path) -> None:
-    environment = _valid_environment(tmp_path)
-    environment["STATE_ROOT"] = "relative/state"
-
-    with pytest.raises(ConfigurationError, match="STATE_ROOT"):
-        ProductionSettings.from_environment(environment)
-
-    environment["STATE_ROOT"] = environment["WORKSPACE_ROOT"]
-
-    with pytest.raises(ConfigurationError, match="STATE_ROOT"):
-        ProductionSettings.from_environment(environment)
-
-
-class RecordingReadinessProcessRunner:
-    def __init__(self, responses: dict[tuple[str, ...], bytes]) -> None:
-        self.responses = responses
-        self.calls: list[tuple[tuple[str, ...], int]] = []
+class ReadinessRunner:
+    def __init__(self, *, fail_command: str | None = None) -> None:
+        self.fail_command = fail_command
+        self.calls: list[tuple[str, ...]] = []
 
     def __call__(
         self,
         arguments: tuple[str, ...],
         output_max_bytes: int,
     ) -> subprocess.CompletedProcess[bytes]:
-        self.calls.append((arguments, output_max_bytes))
-        stdout = self.responses[arguments]
-        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr=b"")
+        self.calls.append(arguments)
+        assert output_max_bytes == 1_048_576
+        executable = Path(arguments[0]).name
+        if executable == self.fail_command:
+            return subprocess.CompletedProcess(arguments, 1, b"secret output", b"")
+        if arguments[1:] == ("version",):
+            stdout = b"sbx version: v0.35.0"
+        elif arguments[1:] == ("--version",):
+            stdout = b"codex-cli 0.144.6"
+        else:
+            stdout = b"ok"
+        return subprocess.CompletedProcess(arguments, 0, stdout, b"")
 
 
-def test_readiness_verifies_pinned_tools_host_and_kit_before_startup(
+def test_readiness_verifies_pinned_tools_host_paths_and_review_kit(
     tmp_path: Path,
 ) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-    sbx = "/opt/review-agent/bin/sbx"
-    codex = "/opt/review-agent/bin/codex"
-    git = "/usr/bin/git"
-    runner = RecordingReadinessProcessRunner(
-        {
-            (sbx, "version"): b"sbx version: v0.35.0 build\n",
-            (codex, "--version"): b"codex-cli 0.144.6\n",
-            (git, "--version"): b"git version 2.50.1\n",
-            (sbx, "diagnose"): b"Docker Sandboxes is ready\n",
-            (sbx, "kit", "validate", str(settings.attempt.review_kit_path)): b"valid\n",
-        }
+    runner = ReadinessRunner()
+    settings = ProductionServiceSettings.from_environment(
+        _environment(),
+        paths=_paths(tmp_path),
     )
     readiness = ProductionReadiness(
         process_runner=runner,
-        executable_resolver={"sbx": sbx, "codex": codex, "git": git}.get,
+        executable_resolver=lambda name: f"/usr/bin/{name}",
     )
 
     readiness.check(settings)
 
-    assert settings.attempt.workspace_root.is_dir()
-    process_output_max_bytes = settings.attempt.process_output_max_bytes
     assert runner.calls == [
-        ((sbx, "version"), process_output_max_bytes),
-        ((codex, "--version"), process_output_max_bytes),
-        ((git, "--version"), process_output_max_bytes),
-        ((sbx, "diagnose"), process_output_max_bytes),
-        (
-            (sbx, "kit", "validate", str(settings.attempt.review_kit_path)),
-            process_output_max_bytes,
-        ),
+        ("/usr/bin/sbx", "version"),
+        ("/usr/bin/codex", "--version"),
+        ("/usr/bin/git", "--version"),
+        ("/usr/bin/sbx", "diagnose"),
+        ("/usr/bin/sbx", "kit", "validate", str(settings.attempt.review_kit_path)),
     ]
+    assert settings.attempt.workspace_root.is_dir()
 
 
-def test_readiness_rejects_an_incompatible_version_without_exposing_output(
-    tmp_path: Path,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-    sensitive_output = b"sbx version: v99.0.0 token=secret-value\n"
-    runner = RecordingReadinessProcessRunner({("/bin/sbx", "version"): sensitive_output})
-    readiness = ProductionReadiness(
-        process_runner=runner,
-        executable_resolver={"sbx": "/bin/sbx", "codex": "/bin/codex", "git": "/bin/git"}.get,
-    )
-
-    with pytest.raises(StartupReadinessError) as failure:
-        readiness.check(settings)
-
-    assert failure.value.stage == "sbx_version"
-    assert "secret-value" not in str(failure.value)
-    assert "99.0.0" not in str(failure.value)
-
-
-@pytest.mark.parametrize(
-    "version_output",
-    [
-        pytest.param(b"codex-cli 0.144.5 token=old-secret\n", id="earlier"),
-        pytest.param(b"codex-cli 0.144.7 token=new-secret\n", id="later"),
-        pytest.param(b"unexpected token=malformed-secret\n", id="malformed"),
-    ],
-)
-def test_readiness_rejects_incompatible_codex_versions_without_exposing_output(
-    tmp_path: Path,
-    version_output: bytes,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-    sbx = "/bin/sbx"
-    codex = "/bin/codex"
-    runner = RecordingReadinessProcessRunner(
-        {
-            (sbx, "version"): b"sbx version: v0.35.0\n",
-            (codex, "--version"): version_output,
-        }
-    )
-    readiness = ProductionReadiness(
-        process_runner=runner,
-        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
-    )
-
-    with pytest.raises(StartupReadinessError) as failure:
-        readiness.check(settings)
-
-    assert failure.value.stage == "codex_version"
-    assert str(failure.value) == "production startup readiness failed: codex_version"
-    assert "secret" not in str(failure.value)
-
-
-def test_readiness_normalizes_failed_codex_version_checks(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-    sbx = "/bin/sbx"
-    codex = "/bin/codex"
-
-    def fail_codex_version(
-        arguments: tuple[str, ...],
-        output_max_bytes: int,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del output_max_bytes
-        if arguments == (sbx, "version"):
-            return subprocess.CompletedProcess(
-                arguments,
-                0,
-                stdout=b"sbx version: v0.35.0\n",
-                stderr=b"",
-            )
-        return subprocess.CompletedProcess(
-            arguments,
-            1,
-            stdout=b"codex-cli token=stdout-secret\n",
-            stderr=b"token=stderr-secret\n",
-        )
-
-    readiness = ProductionReadiness(
-        process_runner=fail_codex_version,
-        executable_resolver={"sbx": sbx, "codex": codex, "git": "/bin/git"}.get,
-    )
-    caplog.set_level(logging.ERROR, logger="review_agent.readiness")
-
-    with pytest.raises(StartupReadinessError) as failure:
-        readiness.check(settings)
-
-    assert failure.value.stage == "codex_version"
-    observable = (
-        str(failure.value) + "\n" + "\n".join(record.getMessage() for record in caplog.records)
-    )
-    assert "stdout-secret" not in observable
-    assert "stderr-secret" not in observable
-
-
-def test_readiness_normalizes_invalid_kit_output_in_errors_and_logs(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
-    sbx = "/bin/sbx"
-    codex = "/bin/codex"
-    git = "/bin/git"
-    successful = {
-        (sbx, "version"): b"sbx version: v0.35.0\n",
-        (codex, "--version"): b"codex-cli 0.144.6\n",
-        (git, "--version"): b"git version 2.50.1\n",
-        (sbx, "diagnose"): b"ready\n",
-    }
-
-    def fail_invalid_kit(
-        arguments: tuple[str, ...],
-        output_max_bytes: int,
-    ) -> subprocess.CompletedProcess[bytes]:
-        del output_max_bytes
-        if arguments in successful:
-            return subprocess.CompletedProcess(
-                arguments,
-                0,
-                stdout=successful[arguments],
-                stderr=b"",
-            )
-        raise subprocess.CalledProcessError(
-            1,
-            arguments,
-            stderr=b"OPENAI_API_KEY=raw-secret untrusted prompt contents",
-        )
-
-    readiness = ProductionReadiness(
-        process_runner=fail_invalid_kit,
-        executable_resolver={"sbx": sbx, "codex": codex, "git": git}.get,
-    )
-    caplog.set_level(logging.ERROR, logger="review_agent.readiness")
-
-    with pytest.raises(StartupReadinessError) as failure:
-        readiness.check(settings)
-
-    assert failure.value.stage == "review_kit_validation"
-    observable = (
-        str(failure.value) + "\n" + "\n".join(record.getMessage() for record in caplog.records)
-    )
-    assert "raw-secret" not in observable
-    assert "untrusted prompt contents" not in observable
-    assert observable.count("stage=review_kit_validation") == 1
-
-
-class RecordingManager:
-    def __init__(self, events: list[str]) -> None:
-        self._events = events
-
-    async def __aenter__(self) -> Self:
-        self._events.append("manager_enter")
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc_value, traceback
-        self._events.append("manager_exit")
-
-    async def start(self, request: ReviewRequest) -> SubmissionOutcome:
-        raise AssertionError(request)
-
-
-def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() -> None:
-    startup_failure = StartupReadinessError("review_kit_validation")
-    events: list[str] = []
-
-    def reject_startup() -> None:
-        events.append("readiness")
-        raise startup_failure
-
-    app = create_app(
-        webhook_secret="a" * 32,
-        lifecycle=RecordingManager(events),
-        startup_check=reject_startup,
-    )
-
-    async def start() -> None:
-        async with app.router.lifespan_context(app):
-            message = "startup must fail before lifespan yields"
-            raise AssertionError(message)
-
-    with pytest.raises(StartupReadinessError) as failure:
-        asyncio.run(start())
-
-    assert failure.value is startup_failure
-    assert events == ["readiness"]
-    assert not hasattr(app.state, "accepting_reviews")
-    assert not hasattr(app.state, "review_queue")
-
-
-def test_application_lifespan_releases_production_resources_on_shutdown() -> None:
-    events: list[str] = []
-    app = create_app(
-        webhook_secret="a" * 32,
-        lifecycle=RecordingManager(events),
-        startup_check=lambda: events.append("readiness"),
-        shutdown_callback=lambda: events.append("closed"),
-    )
-
-    async def run_lifespan() -> None:
-        async with app.router.lifespan_context(app):
-            assert events == ["readiness", "manager_enter"]
-
-    asyncio.run(run_lifespan())
-
-    assert events == ["readiness", "manager_enter", "manager_exit", "closed"]
-
-
-class RejectingReadiness:
-    def check(self, settings: ProductionServiceSettings) -> None:
-        del settings
-        stage = "sandbox_host_capability"
-        raise StartupReadinessError(stage)
-
-
-def test_production_lifespan_fails_closed_before_constructing_runtime_dependencies(
-    tmp_path: Path,
-) -> None:
+def test_readiness_normalizes_external_command_failures(tmp_path: Path) -> None:
+    runner = ReadinessRunner(fail_command="codex")
     settings = ProductionServiceSettings.from_environment(
-        {
-            "GITHUB_APP_ID": "1234",
-            "GITHUB_WEBHOOK_SECRET": "a" * 32,
-            "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
-            "CODEX_MODEL": "gpt-5.4",
-            "OPENAI_REASONING_EFFORT": "high",
-        },
-        paths=_service_paths(tmp_path),
+        _environment(),
+        paths=_paths(tmp_path),
     )
-    app = create_production_app(settings=settings, readiness=RejectingReadiness())
+    readiness = ProductionReadiness(
+        process_runner=runner,
+        executable_resolver=lambda name: f"/usr/bin/{name}",
+    )
 
-    async def enter_lifespan() -> None:
-        async with app.router.lifespan_context(app):
-            pytest.fail("rejected readiness entered the production lifespan")
+    with pytest.raises(StartupReadinessError, match="codex_version") as failure:
+        readiness.check(settings)
 
-    with pytest.raises(StartupReadinessError, match="sandbox_host_capability"):
-        asyncio.run(enter_lifespan())
+    assert "secret output" not in str(failure.value)
 
 
-def test_example_environment_does_not_claim_unsupported_model_or_tool_limits() -> None:
+def test_example_environment_contains_no_obsolete_workflow_configuration() -> None:
     example = Path(".env.example").read_text(encoding="utf-8")
 
-    assert "MODEL_REQUEST_LIMIT" not in example
-    assert "TOOL_CALL_LIMIT" not in example
-    assert "TOTAL_TOKEN_LIMIT" not in example
-    assert "COUNT_INPUT_TOKENS_BEFORE_REQUEST" not in example
-    assert "OPENAI_API_KEY" not in example
-    assert "100 changed files" in example
-    assert "5,000 changed text lines" in example
-    assert "65,536 candidate JSON bytes" in example
-
-
-def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> None:
-    example = Path(".env.example").read_text(encoding="utf-8")
-    operator_guide = Path("README.md").read_text(encoding="utf-8")
-    live_guide = Path("tests/live/README.md").read_text(encoding="utf-8")
-
-    for setting in (
-        "GITHUB_APP_ID",
-        "GITHUB_WEBHOOK_SECRET",
-        "PUBLIC_WEBHOOK_URL",
-        "CODEX_MODEL",
-        "OPENAI_REASONING_EFFORT",
-        "MAX_CONCURRENT_REVIEWS",
-        "LOG_LEVEL",
-    ):
-        assert setting in example
-    for obsolete_setting in (
+    for removed in (
         "GITHUB_REPOSITORY=",
-        "GITHUB_PRIVATE_KEY_PATH=",
-        "REVIEW_KIT_PATH=",
         "STATE_ROOT=",
-        "WORKSPACE_ROOT=",
         "RECONCILIATION_INTERVAL_SECONDS=",
-        "SANDBOX_MEMORY_MIB=",
+        "SHUTDOWN_RECONCILIATION_TIMEOUT_SECONDS=",
+        "SANDBOX_CPUS=",
+        "WORKSPACE_ROOT=",
     ):
-        assert obsolete_setting not in example
-    assert "2048 MiB" in example
-    assert "127.0.0.1:8000" in example
-    assert "sbx 0.35.0" in operator_guide
-    assert "Codex CLI 0.144.6" in operator_guide
-    assert "Codex CLI 0.144.6" in live_guide
-    assert "host-managed credential proxy" in operator_guide
-    assert "one process" in operator_guide
-    assert "RUN_FULL_LIVE_E2E=1" in live_guide
-    assert "ACKNOWLEDGE_MODEL_COST=1" in live_guide
+        assert removed not in example

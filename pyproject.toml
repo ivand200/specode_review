@@ -13,7 +13,6 @@ dependencies = [
 
 [project.scripts]
 review-agent = "review_agent.production:main"
-review-agent-real-e2e = "review_agent.campaign:campaign_main"
 
 [dependency-groups]
 dev = [

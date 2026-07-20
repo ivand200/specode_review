@@ -57,7 +57,7 @@ starts up to
 |---|---|
 | Bind work to accepted base and head SHAs | Reviewing a moving branch or reporting against the wrong revision |
 | Keep GitHub credentials outside the sandbox | Untrusted code or model tools publishing directly |
-| Own one exact-revision comment | Duplicate comments across delivery and retry |
+| Own one exact-revision comment | Duplicate comments across webhook redelivery |
 | Cleanup before publication | A developer seeing a result from an incompletely isolated transaction |
 | Use one process and host-wide capacity limit | Queues and hidden per-repository reservations |
 
@@ -147,21 +147,9 @@ uv run mypy
 uv run pytest
 ```
 
-The real-system campaign adds a no-model Sandbox lifecycle, a controlled GitHub retry lifecycle,
-and one full production/model lifecycle:
-
-```bash
-set -a
-source .env
-set +a
-uv run review-agent-real-e2e \
-  --repository <owner/test-repository> \
-  --evidence-root /tmp/review-agent-real-e2e
-```
-
-This command creates documented external resources and makes one model request. Read the
-[live rollout guide](tests/live/README.md#ordered-truthful-real-e2e-campaign) before running it;
-the guide covers prerequisites, evidence, interruption handling, and cleanup.
+The network-free suite includes the no-model Sandbox probe contract. The signed, model-backed
+production campaign is being refocused on the surviving comment-only path and is not exposed as
+an installable command in this intermediate refactor phase.
 
 ## Operational constraints
 

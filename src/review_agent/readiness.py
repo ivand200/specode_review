@@ -11,7 +11,6 @@ from review_agent.configuration import (
     PINNED_CODEX_VERSION,
     PINNED_SBX_VERSION,
     ProductionServiceSettings,
-    ProductionSettings,
 )
 from review_agent.process import ProcessOptions, _run_bounded_process
 
@@ -67,7 +66,7 @@ class ProductionReadiness:
 
     def check(
         self,
-        settings: ProductionSettings | ProductionServiceSettings,
+        settings: ProductionServiceSettings,
     ) -> None:
         self._verify_paths(settings)
         attempt = settings.attempt
@@ -107,7 +106,7 @@ class ProductionReadiness:
 
     @staticmethod
     def _verify_paths(
-        settings: ProductionSettings | ProductionServiceSettings,
+        settings: ProductionServiceSettings,
     ) -> None:
         attempt = settings.attempt
         try:

@@ -120,7 +120,7 @@ from pathlib import Path
 from review_agent.github import GitHubAppClient
 
 github = GitHubAppClient(
-    repository=os.environ["GITHUB_REPOSITORY"],
+    repository="unused/unused",
     app_id=int(os.environ["GITHUB_APP_ID"]),
     private_key_path=Path(os.environ["GITHUB_PRIVATE_KEY_PATH"]),
 )

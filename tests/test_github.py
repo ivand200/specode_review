@@ -61,7 +61,6 @@ def test_installation_token_is_scoped_to_the_configured_repository(tmp_path: Pat
         assert json.loads(request.content) == {
             "repositories": ["example"],
             "permissions": {
-                "checks": "write",
                 "contents": "read",
                 "pull_requests": "write",
             },
