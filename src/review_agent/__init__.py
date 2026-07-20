@@ -24,6 +24,7 @@ from review_agent.publishing import (
     render_review_comment,
 )
 from review_agent.resources import AttemptResources, ReviewResourceManager
+from review_agent.review_runner import PreflightOutcome, ReviewRunner
 
 __all__ = [
     "AgentReview",
@@ -37,6 +38,7 @@ __all__ = [
     "GitHubError",
     "GitHubRepository",
     "Location",
+    "PreflightOutcome",
     "PublicationConsistencyError",
     "PublicationDisposition",
     "PublicationReceipt",
@@ -46,6 +48,7 @@ __all__ = [
     "ReviewRequest",
     "ReviewResourceManager",
     "ReviewResult",
+    "ReviewRunner",
     "Reviewer",
     "SandboxResourceLimits",
     "publish_review_result",
