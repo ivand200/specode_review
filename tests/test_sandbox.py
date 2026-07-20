@@ -169,6 +169,7 @@ def _review_context(tmp_path: Path, *, title: str = "Safe title") -> ReviewConte
             changed_text_lines=4,
         ),
         sandbox_resources=SandboxResourceLimits(cpus=2, memory_mib=2_048, pids=64),
+        primary_diff=b"diff --git a/src/example.py b/src/example.py\n",
     )
 
 
@@ -246,11 +247,14 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert client.removed == [client.created[0][0]]
     request_payload = json.loads((context.workspace / "control/request.json").read_bytes())
     output_schema_bytes = (context.workspace / "control/review.schema.json").read_bytes()
+    primary_diff = (context.workspace / "control/diff.patch").read_bytes()
     assert request_payload["diff_range"] == context.diff_range.model_dump(mode="json")
     assert request_payload["changed_paths"] == ["src/example.py"]
     assert request_payload["untrusted_pull_request"]["title"] == context.request.title
     assert "installation_id" not in request_payload
     assert output_schema_bytes == contract.schema_json
+    assert primary_diff == context.primary_diff
+    assert (context.workspace / "control/diff.patch").stat().st_mode & 0o777 == 0o444
 
 
 def test_codex_sandbox_adapter_prepares_an_exact_vm_local_copy_before_codex(

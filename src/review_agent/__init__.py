@@ -24,7 +24,7 @@ from review_agent.publishing import (
     render_review_comment,
 )
 from review_agent.resources import AttemptResources, ReviewResourceManager
-from review_agent.review_runner import PreflightOutcome, ReviewRunner
+from review_agent.review_runner import PreflightOutcome, ReviewCompletion, ReviewRunner
 
 __all__ = [
     "AgentReview",
@@ -42,6 +42,7 @@ __all__ = [
     "PublicationConsistencyError",
     "PublicationDisposition",
     "PublicationReceipt",
+    "ReviewCompletion",
     "ReviewContext",
     "ReviewError",
     "ReviewLimits",

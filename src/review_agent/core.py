@@ -36,6 +36,7 @@ class ReviewContext:
     diff_range: DiffRange
     manifest: ChangedPathManifest
     sandbox_resources: SandboxResourceLimits
+    primary_diff: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +306,7 @@ class Reviewer:
             or manifest.changed_text_lines > MAX_CHANGED_TEXT_LINES
         ):
             raise ReviewError(FailureCategory.REVIEW_TOO_LARGE, stage="review_size")
+        primary_diff = self._primary_diff(checkout, diff_range)
         return ReviewContext(
             request=request,
             workspace=workspace,
@@ -312,6 +314,7 @@ class Reviewer:
             diff_range=diff_range,
             manifest=manifest,
             sandbox_resources=self._limits.sandbox_resources,
+            primary_diff=primary_diff,
         )
 
     def _materialize_repository(
@@ -413,10 +416,13 @@ class Reviewer:
         )
 
     def _git(self, repository: Path, *arguments: str) -> str:
+        return self._git_bytes(repository, *arguments).decode("utf-8").strip()
+
+    def _git_bytes(self, repository: Path, *arguments: str) -> bytes:
         completed = self._run_process(
             (self._git_executable, "-C", str(repository), *arguments),
         )
-        return completed.stdout.decode("utf-8").strip()
+        return completed.stdout
 
     def _run_process(
         self,
@@ -480,3 +486,14 @@ class Reviewer:
                 continue
             changed_lines += int(added) + int(deleted)
         return changed_lines
+
+    def _primary_diff(self, checkout: Path, diff_range: DiffRange) -> bytes:
+        return self._git_bytes(
+            checkout,
+            "diff",
+            "--no-ext-diff",
+            "--no-renames",
+            diff_range.start_sha,
+            diff_range.end_sha,
+            "--",
+        )
