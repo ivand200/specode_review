@@ -3,13 +3,13 @@
 The former Check Run and retry profiles were removed with the durable workflow.
 
 The surviving live verification contract is comment-only: prepare a fresh exact base/head
-revision, deliver a normally signed eligible pull-request webhook, require exactly one
-application-owned exact-revision comment containing the seeded finding, and confirm that no owned
-Sandbox or workspace remains. The installed `specode-review-real-e2e` command reserves that
-purpose-specific entry point and reports that the campaign is unavailable until the complete
-production-path profile is implemented.
+revision in a dedicated test repository, then run the installed `specode-review-real-e2e`
+command. It closes and reopens that PR so GitHub delivers one normally signed eligible event
+through the configured public endpoint. The command requires exactly one application-owned
+exact-revision comment containing the seeded finding at the expected changed path and line,
+correlated safe lifecycle logs, and no owned Sandbox or workspace.
 
-Until then, use the deterministic network-free gates:
+Before the live campaign, run the deterministic network-free gates:
 
 ```bash
 uv run ruff check .
@@ -22,3 +22,6 @@ The opt-in no-model Docker Sandbox capability probe remains available separately
 ```bash
 uv run pytest tests/integration/test_no_model_sandbox_probe.py -q -s
 ```
+
+See the root `README.md` “Signed production release campaign” section for prerequisites, bounded
+external effects, interruption recovery, manual cleanup, and evidence interpretation.

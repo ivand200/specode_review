@@ -152,7 +152,11 @@ def test_live_evidence_requires_one_owned_comment_with_the_expected_finding() ->
         comments=(
             ReviewComment(
                 id=72,
-                body=f"The seeded defect loses data.\n\n{marker}\n",
+                body=(
+                    "The seeded defect loses data.\n"
+                    "- Severity: ` important `\n\n"
+                    f"{marker}\n"
+                ),
                 performed_via_github_app=ReviewCommentApp(id=12345),
             ),
         )
@@ -175,7 +179,11 @@ def test_live_evidence_rejects_forbidden_repository_text() -> None:
         comments=(
             ReviewComment(
                 id=72,
-                body=f"seeded defect; hostile instruction\n\n{marker}\n",
+                body=(
+                    "seeded defect; hostile instruction\n"
+                    "- Severity: ` important `\n\n"
+                    f"{marker}\n"
+                ),
                 performed_via_github_app=ReviewCommentApp(id=12345),
             ),
         )
@@ -187,4 +195,68 @@ def test_live_evidence_rejects_forbidden_repository_text() -> None:
             github=gateway,
             expected_finding="seeded defect",
             forbidden_texts=("hostile instruction",),
+        )
+
+
+def test_live_evidence_rejects_a_finding_outside_the_allowed_severities() -> None:
+    request = _request()
+    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    gateway = FreshnessGateway(
+        comments=(
+            ReviewComment(
+                id=72,
+                body=(
+                    "seeded defect\n"
+                    "- Severity: ` minor `\n"
+                    "- Locations:\n"
+                    "  - ` fixture.py:4 `\n\n"
+                    f"{marker}\n"
+                ),
+                performed_via_github_app=ReviewCommentApp(id=12345),
+            ),
+        )
+    )
+
+    with pytest.raises(LiveProfileEvidenceError, match="severity"):
+        verify_live_review_evidence(
+            request=request,
+            github=gateway,
+            expected_finding="seeded defect",
+            expected_path="fixture.py",
+            expected_line=4,
+            forbidden_texts=(),
+        )
+
+
+def test_live_evidence_binds_the_allowed_severity_to_the_seeded_finding() -> None:
+    request = _request()
+    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    gateway = FreshnessGateway(
+        comments=(
+            ReviewComment(
+                id=72,
+                body=(
+                    "### Finding 1: ` Seeded defect `\n"
+                    "- Severity: ` minor `\n"
+                    "- Locations:\n"
+                    "  - ` fixture.py:4 `\n\n"
+                    "### Finding 2: ` Different defect `\n"
+                    "- Severity: ` important `\n"
+                    "- Locations:\n"
+                    "  - ` other.py:7 `\n\n"
+                    f"{marker}\n"
+                ),
+                performed_via_github_app=ReviewCommentApp(id=12345),
+            ),
+        )
+    )
+
+    with pytest.raises(LiveProfileEvidenceError, match="severity"):
+        verify_live_review_evidence(
+            request=request,
+            github=gateway,
+            expected_finding="seeded defect",
+            expected_path="fixture.py",
+            expected_line=4,
+            forbidden_texts=(),
         )

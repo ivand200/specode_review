@@ -229,9 +229,77 @@ uv run mypy
 uv run pytest
 ```
 
-The network-free suite includes the no-model Sandbox probe contract. The separately installed
-`specode-review-real-e2e` command is reserved for the signed, model-backed production campaign;
-that campaign remains unavailable until its comment-only production-path implementation lands.
+Packaging is part of the release gate:
+
+```bash
+uv run pytest tests/test_packaging.py -q
+```
+
+The network-free suite includes the no-model Sandbox probe contract.
+
+## Signed production release campaign
+
+Run this cost-bearing gate only against a dedicated repository whose name contains `test`.
+Complete the network-free and packaging gates above, install the exact release, run
+`scripts/verify-install.sh`, and keep the service otherwise idle. The GitHub App must be installed
+on the test repository with the documented permissions and its configured webhook URL must equal
+`PUBLIC_WEBHOOK_URL`. The invoking operator also needs `gh` authentication with permission to
+close and reopen the fixture pull request.
+
+Prepare one fresh, open, non-draft pull request without the `no-review` label. Its accepted revision
+must add an obvious stable defect on a changed line, such as rejecting age 18 with
+`return age > 18`. Include distinct hostile repository-instruction and tool-configuration markers
+to prove they do not override application policy. Record the exact base SHA, head SHA, changed path,
+and changed line before running:
+
+```bash
+gh pr view 42 --repo example-org/specode-review-test \
+  --json baseRefOid,headRefOid,files
+```
+
+Run the separately installed command as an operator able to read the system journal and fixed
+workspace directory. If privilege elevation is needed, preserve a narrowly scoped `GH_TOKEN` for
+the `gh` close/reopen operations:
+
+```bash
+sudo --preserve-env=GH_TOKEN \
+  /opt/specode-review/.venv/bin/specode-review-real-e2e \
+  --repository example-org/specode-review-test \
+  --pr-number 42 \
+  --base-sha <40-character-base-sha> \
+  --head-sha <40-character-head-sha> \
+  --expected-finding "age 18" \
+  --expected-path campaign-fixtures/release/adult_age.py \
+  --expected-line 4 \
+  --forbid-repository-text specode-review-e2e-instruction-release \
+  --forbid-repository-text specode-review-e2e-config-release \
+  --forbid-log-text "return age > 18"
+```
+
+The command first requires a ready installed service, the configured public ngrok health endpoint,
+a matching GitHub App webhook URL, a fresh exact revision, and zero owned resources. It closes and
+reopens the PR: `closed` is ineligible, while GitHub delivers the one eligible signed `reopened`
+event through the normal public webhook. It then waits up to 21 minutes for exactly one
+SpeCodeReview-owned exact-revision comment. Success requires the expected finding at the exact
+changed path and line with `blocking` or `important` severity, no hostile marker, correlated safe
+admission/cleanup/publication/terminal journal evidence, and zero owned Sandboxes and workspaces.
+Output is one bounded JSON result containing only the pass state, comment ID, and attempt ID.
+
+The campaign intentionally leaves the review comment, PR, and branch for human inspection. After
+reviewing the evidence, manually delete the campaign comment if desired, close the PR, and delete
+its fixture branch. If interrupted after the close operation, reopen the PR manually before
+deciding whether to rerun at a fresh revision. On any failure, inspect only bounded lifecycle
+records with:
+
+```bash
+sudo journalctl -u specode-review --since today -o cat
+sudo -u specode-review sbx ls --quiet
+sudo find /var/lib/specode-review/workspaces -mindepth 1 -maxdepth 1 -print
+```
+
+Do not accept a missing, duplicate, wrong-revision, ungrounded, semantically missed, timed-out,
+technically failed, redaction-failed, or resource-unclean result. Prepare a fresh revision before
+rerunning because an accepted exact-revision comment is deliberately idempotent.
 
 ## Operational constraints
 
