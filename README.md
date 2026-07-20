@@ -129,6 +129,60 @@ uv run specode-review
 
 Health probes are available at `/health/live` and `/health/ready`.
 
+## Production installation
+
+The supported production target is a native Ubuntu host running `systemd`. Clone the repository
+at `/opt/specode-review`, fetch the release tags, and detach at the exact supported tag:
+
+```bash
+sudo git clone <repository-url> /opt/specode-review
+sudo git -C /opt/specode-review fetch --tags
+sudo git -C /opt/specode-review checkout --detach v0.1.0
+```
+
+Install `uv`, Git, `runuser`, `systemd`, `sbx 0.35.0`, and Codex CLI `0.144.6` in the system
+`PATH`. Configure Docker Sandboxes for the dedicated service identity; model credentials must use
+its host-managed credential store and must not be placed in `.env`:
+
+```bash
+sudo -u specode-review env -i \
+  HOME=/var/lib/specode-review \
+  PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin \
+  sbx secret set -g openai --oauth
+```
+
+On a first installation the installer creates the `specode-review` identity. If it is not yet
+present when configuring the credential, run the installer once to provision managed host state,
+configure the credential with the command above, and rerun the same installer command.
+
+Create `/opt/specode-review/.env` from `.env.example` and place the unencrypted RSA GitHub App key
+at `/opt/specode-review/.secrets/github-app.pem`. Then install or repair the selected release:
+
+```bash
+cd /opt/specode-review
+sudo ./scripts/install.sh --release v0.1.0
+```
+
+The installer rejects branches, commits that are not exactly tagged, unsupported tags, malformed
+or placeholder configuration, model credentials in the application environment, unsafe secret
+files, and unpinned host tools. It converges the non-login service user and restrictive managed
+paths, installs the locked non-development environment with `uv`, runs a disposable no-model
+Sandbox capability probe, writes `specode-review.service`, and enables and starts it.
+
+The unit listens through the application's fixed `127.0.0.1:8000` bind, logs to `journald`,
+restarts after failures no more than five times in five minutes, and allows up to twenty minutes
+for graceful shutdown:
+
+```bash
+sudo systemctl status specode-review
+sudo journalctl -u specode-review --since today
+sudo systemctl restart specode-review
+```
+
+Upgrade and rollback use the same operation after checking out another exact supported release
+tag. The installer never runs `git clean`, deletes foreign Docker Sandboxes, or changes GitHub App
+configuration.
+
 ## Review lifecycle
 
 The service admits non-draft `opened`, `synchronize`, `ready_for_review`, and `reopened` pull
