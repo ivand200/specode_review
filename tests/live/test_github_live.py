@@ -447,9 +447,8 @@ def test_real_retry_exercises_the_exact_revision_comment_lifecycle(  # noqa: PLR
         installation_id=installation_id,
     )
     app = create_app(
-        repository=repository,
         webhook_secret=webhook_secret,
-        manager=coordinator,
+        lifecycle=coordinator,
         shutdown_callback=github.close,
     )
 

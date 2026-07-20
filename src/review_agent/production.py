@@ -168,6 +168,9 @@ class _ProductionCoordinator:
             return SubmissionOutcome.STOPPING
         return await coordinator.start(request)
 
+    async def submit(self, request: ReviewRequest) -> SubmissionOutcome:
+        return await self.start(request)
+
     async def retry(self, request: RetryReviewRequest) -> SubmissionOutcome:
         coordinator = self._coordinator
         if not self._coordinator_entered or coordinator is None:
@@ -212,9 +215,8 @@ def create_production_app(  # noqa: PLR0913 - injectable production assembly sea
         child_arguments=child_arguments,
     )
     return create_app(
-        repository=webhook.repository,
         webhook_secret=webhook.secret,
-        manager=coordinator,
+        lifecycle=coordinator,
     )
 
 

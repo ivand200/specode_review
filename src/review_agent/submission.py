@@ -17,8 +17,8 @@ class SubmissionOutcome(Enum):
     UNAVAILABLE = auto()
 
 
-class ReviewSubmissionManager(Protocol):
-    """Application lifecycle and initial-review admission used by the webhook."""
+class ReviewSubmissionLifecycle(Protocol):
+    """Application lifecycle and review admission used by the webhook."""
 
     async def __aenter__(self) -> Self: ...
 
@@ -29,4 +29,4 @@ class ReviewSubmissionManager(Protocol):
         traceback: TracebackType | None,
     ) -> None: ...
 
-    async def start(self, request: ReviewRequest) -> SubmissionOutcome: ...
+    async def submit(self, request: ReviewRequest) -> SubmissionOutcome: ...

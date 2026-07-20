@@ -3,29 +3,19 @@ import hmac
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from review_agent.coordinator import RetryReviewRequest
-from review_agent.github import CHECK_RUN_NAME, CheckRun, ReviewIdentity
 from review_agent.models import ReviewRequest, bound_description
-from review_agent.submission import ReviewSubmissionManager, SubmissionOutcome
+from review_agent.submission import ReviewSubmissionLifecycle, SubmissionOutcome
 
 _MAX_WEBHOOK_BODY_BYTES = 256 * 1024
-
-
-@runtime_checkable
-class _RetryManager(Protocol):
-    async def retry(self, request: RetryReviewRequest) -> SubmissionOutcome: ...
-
-
-class _RetryAction(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-
-    identifier: Literal["retry_review"]
+_SUPPORTED_PULL_REQUEST_ACTIONS = frozenset(
+    {"opened", "synchronize", "ready_for_review", "reopened"}
+)
 
 
 class _CommitReference(BaseModel):
@@ -34,16 +24,22 @@ class _CommitReference(BaseModel):
     sha: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
 
 
-class _PullRequestReference(BaseModel):
+class _LabelReference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    name: str = Field(min_length=1, max_length=100)
+
+
+class _PullRequestPayload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     number: int = Field(gt=0, strict=True)
+    draft: bool
+    title: str = Field(min_length=1, max_length=256)
+    body: str | None = None
+    labels: tuple[_LabelReference, ...] = Field(default=(), max_length=100)
     base: _CommitReference
     head: _CommitReference
-
-
-class _RetryCheckRun(CheckRun):
-    pull_requests: tuple[_PullRequestReference, ...] = Field(min_length=1, max_length=100)
 
 
 class _InstallationReference(BaseModel):
@@ -62,14 +58,13 @@ class _RepositoryReference(BaseModel):
     )
 
 
-class _RetryWebhook(BaseModel):
+class _PullRequestWebhook(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
-    action: Literal["requested_action"]
-    requested_action: _RetryAction
+    action: Literal["opened", "synchronize", "ready_for_review", "reopened"]
     installation: _InstallationReference
     repository: _RepositoryReference
-    check_run: _RetryCheckRun
+    pull_request: _PullRequestPayload
 
 
 async def _read_bounded_body(request: Request) -> bytes:
@@ -96,99 +91,49 @@ async def _read_bounded_body(request: Request) -> bytes:
     return bytes(body)
 
 
-def _review_request_from_payload(payload: object) -> ReviewRequest:
-    if not isinstance(payload, dict):
-        msg = "payload must be an object"
-        raise TypeError(msg)
-    pull_request = payload["pull_request"]
-    installation = payload["installation"]
-    repository = payload["repository"]
+def _review_request_from_event(event: _PullRequestWebhook) -> ReviewRequest:
+    pull_request = event.pull_request
     return ReviewRequest(
-        repository=repository["full_name"],
-        pr_number=pull_request["number"],
-        installation_id=installation["id"],
-        base_sha=pull_request["base"]["sha"],
-        head_sha=pull_request["head"]["sha"],
-        title=pull_request["title"],
-        description=bound_description(pull_request.get("body")),
+        repository=event.repository.full_name.lower(),
+        pr_number=pull_request.number,
+        installation_id=event.installation.id,
+        base_sha=pull_request.base.sha.lower(),
+        head_sha=pull_request.head.sha.lower(),
+        title=pull_request.title,
+        description=bound_description(pull_request.body),
     )
 
 
-def _payload_is_eligible(payload: object, repository: str) -> bool:
+def _payload_action(payload: object) -> str:
     if not isinstance(payload, dict):
         msg = "payload must be an object"
         raise TypeError(msg)
-
     action = payload.get("action")
     if not isinstance(action, str):
         msg = "payload action must be a string"
         raise TypeError(msg)
-    if action != "opened":
+    return action
+
+
+def _event_is_eligible(event: _PullRequestWebhook, no_review_label: str) -> bool:
+    if event.pull_request.draft:
         return False
-
-    repository_payload = payload.get("repository")
-    if not isinstance(repository_payload, dict):
-        msg = "payload repository must be an object"
-        raise TypeError(msg)
-    full_name = repository_payload.get("full_name")
-    if not isinstance(full_name, str):
-        msg = "payload repository name must be a string"
-        raise TypeError(msg)
-    if full_name != repository:
-        return False
-
-    pull_request = payload.get("pull_request")
-    if not isinstance(pull_request, dict):
-        msg = "payload pull request must be an object"
-        raise TypeError(msg)
-    draft = pull_request.get("draft")
-    if not isinstance(draft, bool):
-        msg = "pull request draft state must be a boolean"
-        raise TypeError(msg)
-    return not draft
-
-
-def _retry_request_from_payload(
-    payload: object,
-    repository: str,
-) -> RetryReviewRequest | None:
-    try:
-        event = _RetryWebhook.model_validate(payload)
-    except ValidationError:
-        return None
-    if event.repository.full_name.lower() != repository.lower():
-        return None
-    if event.check_run.name != CHECK_RUN_NAME:
-        return None
-    external_id = event.check_run.external_id
-    if external_id is None:
-        return None
-    for pull_request in event.check_run.pull_requests:
-        if pull_request.head.sha.lower() != event.check_run.head_sha.lower():
-            continue
-        try:
-            identity = ReviewIdentity(
-                repository=event.repository.full_name,
-                pr_number=pull_request.number,
-                base_sha=pull_request.base.sha,
-                head_sha=pull_request.head.sha,
-                external_id=external_id,
-            )
-        except ValidationError:
-            continue
-        return RetryReviewRequest(
-            installation_id=event.installation.id,
-            identity=identity,
-            check_run=event.check_run,
-        )
-    return None
+    suppressed_label = no_review_label.casefold()
+    return all(
+        label.name.casefold() != suppressed_label for label in event.pull_request.labels
+    )
 
 
 def _submission_response(outcome: SubmissionOutcome) -> JSONResponse:
     if outcome is SubmissionOutcome.ALREADY_RUNNING:
-        return JSONResponse({"status": "already_running"})
+        return JSONResponse({"status": "duplicate"})
     if outcome is SubmissionOutcome.ALREADY_REVIEWED:
-        return JSONResponse({"status": "already_reviewed"})
+        return JSONResponse({"status": "ignored"})
+    if outcome is SubmissionOutcome.NOT_AUTHORIZED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="repository is not authorized",
+        )
     if outcome is SubmissionOutcome.AT_CAPACITY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -210,9 +155,9 @@ def _submission_response(outcome: SubmissionOutcome) -> JSONResponse:
 async def _accept_github_webhook(
     request: Request,
     *,
-    repository: str,
     webhook_secret: str,
-    manager: ReviewSubmissionManager,
+    lifecycle: ReviewSubmissionLifecycle,
+    no_review_label: str,
 ) -> JSONResponse:
     body = await _read_bounded_body(request)
     expected = (
@@ -230,25 +175,24 @@ async def _accept_github_webhook(
             detail="invalid webhook signature",
         )
     event_name = request.headers.get("X-GitHub-Event")
-    if event_name not in {"pull_request", "check_run"}:
+    if event_name != "pull_request":
         return JSONResponse({"status": "ignored"})
 
     try:
         payload = json.loads(body)
-        if event_name == "check_run":
-            retry_request = _retry_request_from_payload(payload, repository)
-            if retry_request is None or not isinstance(manager, _RetryManager):
-                return JSONResponse({"status": "ignored"})
-            return _submission_response(await manager.retry(retry_request))
-        if not _payload_is_eligible(payload, repository):
+        if _payload_action(payload) not in _SUPPORTED_PULL_REQUEST_ACTIONS:
             return JSONResponse({"status": "ignored"})
-        review_request = _review_request_from_payload(payload)
+        event = _PullRequestWebhook.model_validate(payload)
+        if not _event_is_eligible(event, no_review_label):
+            return JSONResponse({"status": "ignored"})
+        review_request = _review_request_from_event(event)
     except (
         AttributeError,
         json.JSONDecodeError,
         KeyError,
         TypeError,
         UnicodeDecodeError,
+        ValidationError,
         ValueError,
     ) as error:
         raise HTTPException(
@@ -256,14 +200,14 @@ async def _accept_github_webhook(
             detail="malformed pull request webhook",
         ) from error
 
-    return _submission_response(await manager.start(review_request))
+    return _submission_response(await lifecycle.submit(review_request))
 
 
 def create_app(
     *,
-    repository: str,
     webhook_secret: str,
-    manager: ReviewSubmissionManager,
+    lifecycle: ReviewSubmissionLifecycle,
+    no_review_label: str = "no-review",
     startup_check: Callable[[], None] | None = None,
     shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
@@ -276,7 +220,7 @@ def create_app(
         if startup_check is not None:
             startup_check()
         try:
-            async with manager:
+            async with lifecycle:
                 is_ready = True
                 try:
                     yield
@@ -292,9 +236,9 @@ def create_app(
     async def github_webhook(request: Request) -> JSONResponse:
         return await _accept_github_webhook(
             request,
-            repository=repository,
             webhook_secret=webhook_secret,
-            manager=manager,
+            lifecycle=lifecycle,
+            no_review_label=no_review_label,
         )
 
     @app.get("/health/live")

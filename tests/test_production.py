@@ -17,7 +17,6 @@ from review_agent.github import (
     CheckRunPresentation,
     CheckRunStatus,
     ReviewIdentity,
-    derive_review_identity,
 )
 from review_agent.models import ReviewRequest
 from review_agent.ownership import RepositoryOwnership, RepositoryOwnershipError
@@ -457,7 +456,7 @@ def test_production_uses_configured_child_capacity_without_a_waiting_queue(
         release.touch()
 
 
-def test_shutdown_stops_both_admission_paths_before_waiting_and_releases_lock_last(
+def test_shutdown_stops_pull_request_admission_before_waiting_and_releases_lock_last(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -493,48 +492,6 @@ def test_shutdown_stops_both_admission_paths_before_waiting_and_releases_lock_la
             "head": {"sha": "b" * 40},
         },
     }
-    identity = derive_review_identity(
-        ReviewRequest(
-            repository="octo-org/example",
-            pr_number=17,
-            installation_id=23,
-            base_sha="a" * 40,
-            head_sha="b" * 40,
-            title="Review",
-            description="",
-        )
-    )
-    retry_payload = {
-        "action": "requested_action",
-        "requested_action": {"identifier": "retry_review"},
-        "installation": {"id": 23},
-        "repository": {"full_name": "octo-org/example"},
-        "check_run": {
-            "id": 101,
-            "name": CHECK_RUN_NAME,
-            "head_sha": identity.head_sha,
-            "external_id": identity.external_id,
-            "status": "completed",
-            "conclusion": "neutral",
-            "app": {"id": 1234},
-            "output": {"title": "Review incomplete", "summary": "Retry available."},
-            "actions": [
-                {
-                    "label": "Retry review",
-                    "description": "Retry this incomplete advisory review.",
-                    "identifier": "retry_review",
-                }
-            ],
-            "pull_requests": [
-                {
-                    "number": 17,
-                    "base": {"sha": identity.base_sha},
-                    "head": {"sha": identity.head_sha},
-                }
-            ],
-        },
-    }
-
     async def post(
         client: httpx.AsyncClient,
         event: str,
@@ -577,9 +534,7 @@ def test_shutdown_stops_both_admission_paths_before_waiting_and_releases_lock_la
                 "number": 18,
                 "head": {"sha": "c" * 40},
             }})
-            retry = await post(client, "check_run", retry_payload)
             assert initial.json() == {"detail": "review service is shutting down"}
-            assert retry.json() == {"detail": "review service is shutting down"}
             release.touch()
             await shutdown
 

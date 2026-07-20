@@ -562,9 +562,8 @@ def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() ->
         raise startup_failure
 
     app = create_app(
-        repository="octo-org/example",
         webhook_secret="a" * 32,
-        manager=RecordingManager(events),
+        lifecycle=RecordingManager(events),
         startup_check=reject_startup,
     )
 
@@ -585,9 +584,8 @@ def test_application_lifespan_fails_before_accepting_traffic_when_not_ready() ->
 def test_application_lifespan_releases_production_resources_on_shutdown() -> None:
     events: list[str] = []
     app = create_app(
-        repository="octo-org/example",
         webhook_secret="a" * 32,
-        manager=RecordingManager(events),
+        lifecycle=RecordingManager(events),
         startup_check=lambda: events.append("readiness"),
         shutdown_callback=lambda: events.append("closed"),
     )
