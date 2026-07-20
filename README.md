@@ -8,12 +8,12 @@
 
 SpeCodeReview is a security-focused GitHub App that reviews the exact commit accepted from a
 signed pull-request webhook. It runs Codex in a disposable Docker Sandbox, validates and grounds
-the result, then publishes revision-bound findings through a GitHub Check Run and one pull-request
-comment.
+the result, then publishes one revision-bound pull-request comment.
 
 This is a production-oriented prototype with a deliberately narrow deployment model: one process,
-one configured repository, and one dedicated host or VM. The product is **SpeCodeReview**;
-`Review Agent` is the GitHub Check Run name, and `review-agent` is the Python package and CLI.
+one GitHub App, and one dedicated host or VM. It serves every repository authorized for that App.
+The product is **SpeCodeReview**; `review-agent` remains the transitional Python package and CLI
+until the planned clean package-identity cutover.
 
 ## Why it exists
 
@@ -23,21 +23,20 @@ SpeCodeReview makes those failure modes explicit and bounded:
 
 - Every attempt is bound to an immutable repository, pull request, base SHA, and head SHA.
 - Repository code, PR text, and repository-provided agent configuration are treated as untrusted.
-- Codex runs in an isolated child process and disposable microVM with restricted network access.
+- Codex runs in a disposable microVM with restricted network access.
 - GitHub credentials stay on the host; only the outer application can publish.
 - Candidate JSON, file paths, changed locations, process output, and runtime are validated and
   bounded.
-- Check Run updates are persisted before GitHub mutation and replayed after transient failure or
-  restart.
+- Cleanup must complete before the final comment can be published.
 
 ## How it works
 
 ```mermaid
 flowchart LR
     GH[GitHub<br>signed webhook] --> A[Admission<br>exact revision identity]
-    A --> P[Parent coordinator<br>durable Check Run state]
-    P --> C[Isolated child process]
-    C --> S[Disposable Docker Sandbox<br>Codex + fixed diff]
+    A --> P[In-process lifecycle<br>bounded capacity]
+    P --> R[Synchronous review transaction]
+    R --> S[Disposable Docker Sandbox<br>Codex + fixed diff]
     S --> V[Schema validation<br>filesystem grounding]
     V --> GH
 ```
@@ -47,8 +46,9 @@ and gives the sandbox a disposable copy. The model returns a schema-constrained 
 application verifies that every finding refers to changed repository content before rendering the
 final comment.
 
-GitHub is the durable duplicate source. A redelivery for an already active or completed identity
-does not repeat work. There is intentionally no waiting queue: the service starts up to
+The exact-revision application-owned comment is the duplicate source. A redelivery for an active
+or completed identity does not repeat work. There is intentionally no waiting queue: the service
+starts up to
 `MAX_CONCURRENT_REVIEWS` attempts and rejects distinct work at capacity.
 
 ## Key engineering decisions
@@ -57,10 +57,9 @@ does not repeat work. There is intentionally no waiting queue: the service start
 |---|---|
 | Bind work to accepted base and head SHAs | Reviewing a moving branch or reporting against the wrong revision |
 | Keep GitHub credentials outside the sandbox | Untrusted code or model tools publishing directly |
-| Persist desired Check Run state before mutation | Lost or stale status after GitHub or process failure |
 | Own one exact-revision comment | Duplicate comments across delivery and retry |
-| Return findings and incomplete runs as `neutral` | An advisory reviewer accidentally blocking merges |
-| Use one process, repository, and host ownership domain | Ambiguous coordination and split-brain recovery |
+| Cleanup before publication | A developer seeing a result from an incompletely isolated transaction |
+| Use one process and host-wide capacity limit | Queues and hidden per-repository reservations |
 
 ## Quick start
 
@@ -94,12 +93,11 @@ the sandbox.
 
 ### Configure the GitHub App
 
-Install one GitHub App only on the repository configured by `GITHUB_REPOSITORY`:
+Install the GitHub App on every repository the service should review:
 
-- **Checks:** read and write
 - **Contents:** read-only
 - **Pull requests:** read and write
-- Events: **Pull request** and **Check run**
+- Event: **Pull request**
 - Webhook URL: `https://<public-host>/webhooks/github`
 
 Use the same webhook secret for the App and `GITHUB_WEBHOOK_SECRET`. Keep the App private key on
@@ -113,42 +111,31 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` and provide the GitHub App values plus absolute host paths for
-`GITHUB_PRIVATE_KEY_PATH`, `REVIEW_KIT_PATH`, `STATE_ROOT`, and `WORKSPACE_ROOT`.
-`STATE_ROOT` is private persistent state; keep it outside the disposable `WORKSPACE_ROOT`, preserve
-it across restarts, and use a different root per repository.
+Edit `.env` with the App identity and secret, complete stable HTTPS webhook URL, model policy, and
+optional ingress values. Production paths and runtime limits are fixed by the application and
+documented in `.env.example`.
 
-`MAX_CONCURRENT_REVIEWS` is optional: it defaults to `1` and accepts values up to `10`. Size it for
-the host's CPU, memory, and Sandbox capacity.
+`MAX_CONCURRENT_REVIEWS` defaults to `3` and accepts only `1` through `5`. Size it from measured
+host behavior.
 
-Start the service and ngrok:
-
-```bash
-./scripts/run-local.sh
-```
-
-The launcher loads `.env`, starts one service process and ngrok, checks local and public readiness,
-and waits until the GitHub App webhook URL matches the tunnel. A reserved origin can be supplied as
-the first argument:
+Load the environment and start the loopback service:
 
 ```bash
-./scripts/run-local.sh https://your-domain.ngrok.app
+set -a
+source .env
+set +a
+uv run review-agent
 ```
 
 Health probes are available at `/health/live` and `/health/ready`.
 
 ## Review lifecycle
 
-The service admits `pull_request/opened` for a non-draft PR. Each attempt creates a `Review Agent`
-Check Run on the accepted head SHA:
-
-- A clean review completes with `success`.
-- Findings complete with `neutral` and publish in the revision-owned PR comment.
-- Timeout, technical failure, and publication-unknown states complete with `neutral`.
-
-Incomplete runs expose **Retry review**. A retry revalidates current GitHub state, preserves the
-incomplete run as terminal evidence, and creates a fresh Check Run for the same accepted revision.
-SpeCodeReview is advisory: **do not configure `Review Agent` as a required status check**.
+The service admits non-draft `opened`, `synchronize`, `ready_for_review`, and `reopened` pull
+requests unless they carry the `no-review` label. Preflight proves App access and exact-revision
+idempotency before capacity is consumed. Accepted work runs one cleanup-before-publication
+transaction. A clean review and a review with findings both publish one top-level comment;
+technical failures are visible only in safe structured operator logs.
 
 ## Verification
 
@@ -178,13 +165,10 @@ the guide covers prerequisites, evidence, interruption handling, and cleanup.
 
 ## Operational constraints
 
-- Run exactly one application process for one repository on one host. Multiple hosts serving the
-  same repository are unsupported.
-- Separate repository processes need distinct state roots, workspace roots, and sandbox prefixes.
-- Back up `STATE_ROOT`; it holds bounded reconciliation and active-attempt records, not credentials,
-  repository content, PR text, model output, or findings.
-- On shutdown, readiness drops before admission stops, active attempts retain their bounded
-  cleanup budget, and the parent makes a final Check Run reconciliation pass.
+- Run exactly one application process on one host. Multiple hosts serving the same repository are
+  unsupported.
+- There is no durable workflow state, retry queue, or per-repository capacity reservation.
+- On shutdown, readiness and admission close before already accepted bounded reviews are drained.
 - The project intentionally has no production Dockerfile: the orchestrator must run on a supported
   Docker Sandboxes host with its microVM and credential-proxy guarantees.
 

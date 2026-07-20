@@ -10,6 +10,7 @@ from typing import NoReturn, Protocol
 from review_agent.configuration import (
     PINNED_CODEX_VERSION,
     PINNED_SBX_VERSION,
+    ProductionServiceSettings,
     ProductionSettings,
 )
 from review_agent.process import ProcessOptions, _run_bounded_process
@@ -64,7 +65,10 @@ class ProductionReadiness:
         self._run_process = process_runner
         self._resolve_executable = executable_resolver
 
-    def check(self, settings: ProductionSettings) -> None:
+    def check(
+        self,
+        settings: ProductionSettings | ProductionServiceSettings,
+    ) -> None:
         self._verify_paths(settings)
         attempt = settings.attempt
         process_output_max_bytes = attempt.process_output_max_bytes
@@ -102,7 +106,9 @@ class ProductionReadiness:
         )
 
     @staticmethod
-    def _verify_paths(settings: ProductionSettings) -> None:
+    def _verify_paths(
+        settings: ProductionSettings | ProductionServiceSettings,
+    ) -> None:
         attempt = settings.attempt
         try:
             configured_inputs_are_valid = not (

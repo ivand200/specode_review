@@ -153,7 +153,6 @@ def test_attempt_resources_reject_root_and_outside_workspace_paths(tmp_path: Pat
 
 def test_startup_sweep_removes_only_valid_stale_owned_resources(tmp_path: Path) -> None:
     stale_id = "a" * 32
-    linked_id = "b" * 32
     stale_sandbox = "review-agent-" + stale_id
     client = RecordingSandboxResources(
         existing=[
@@ -168,7 +167,6 @@ def test_startup_sweep_removes_only_valid_stale_owned_resources(tmp_path: Path) 
         sandbox_client=client,
     )
     stale = manager.for_attempt(stale_id).workspace
-    linked = manager.for_attempt(linked_id).workspace
     malformed = stale.parent / "review-agent-workspace-not-an-attempt"
     unrelated = stale.parent / ("other-" + "c" * 32)
     outside = tmp_path / "outside"
@@ -176,13 +174,36 @@ def test_startup_sweep_removes_only_valid_stale_owned_resources(tmp_path: Path) 
     malformed.mkdir()
     unrelated.mkdir()
     outside.mkdir()
-    linked.symlink_to(outside, target_is_directory=True)
 
     manager.sweep_stale()
 
     assert not stale.exists()
     assert malformed.is_dir()
     assert unrelated.is_dir()
-    assert linked.is_symlink()
     assert outside.is_dir()
     assert client.removed == [stale_sandbox]
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "file"])
+def test_startup_sweep_fails_closed_on_ambiguous_owned_workspace(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    manager = ReviewResourceManager(
+        workspace_root=tmp_path / "workspaces",
+        sandbox_prefix="review-agent-",
+        sandbox_client=RecordingSandboxResources(),
+    )
+    workspace = manager.for_attempt("b" * 32).workspace
+    workspace.parent.mkdir()
+    if entry_kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        workspace.symlink_to(outside, target_is_directory=True)
+    else:
+        workspace.write_text("not a workspace", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="owned workspace"):
+        manager.sweep_stale()
+
+    assert workspace.exists() or workspace.is_symlink()

@@ -11,6 +11,8 @@ import pytest
 from review_agent.configuration import (
     AttemptSettings,
     ConfigurationError,
+    ProductionPaths,
+    ProductionServiceSettings,
     ProductionSettings,
     ReasoningEffort,
 )
@@ -47,6 +49,89 @@ def _valid_environment(tmp_path: Path) -> dict[str, str]:
         "SANDBOX_CLEANUP_TIMEOUT_SECONDS": "30",
         "SANDBOX_NAME_PREFIX": "review-agent-",
     }
+
+
+def _service_paths(tmp_path: Path) -> ProductionPaths:
+    private_key = tmp_path / "github-app.pem"
+    private_key.write_text("test private key", encoding="utf-8")
+    review_kit = tmp_path / "review-kit"
+    review_kit.mkdir()
+    return ProductionPaths(
+        private_key_path=private_key,
+        review_kit_path=review_kit,
+        workspace_root=tmp_path / "workspaces",
+    )
+
+
+def test_service_settings_use_the_narrow_operator_contract_and_fixed_runtime_defaults(
+    tmp_path: Path,
+) -> None:
+    settings = ProductionServiceSettings.from_environment(
+        {
+            "GITHUB_APP_ID": "1234",
+            "GITHUB_WEBHOOK_SECRET": "a" * 32,
+            "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
+            "CODEX_MODEL": "gpt-5.4",
+            "OPENAI_REASONING_EFFORT": "high",
+        },
+        paths=_service_paths(tmp_path),
+    )
+
+    assert settings.max_concurrent_reviews == 3
+    assert settings.log_level == "INFO"
+    assert settings.attempt.sandbox_resources.cpus == 2
+    assert settings.attempt.sandbox_resources.memory_mib == 2_048
+    assert settings.attempt.sandbox_resources.pids == 256
+    assert settings.attempt.workspace_root == tmp_path / "workspaces"
+    assert settings.attempt.sandbox_name_prefix == "review-agent-"
+
+
+@pytest.mark.parametrize("value", ["", "0", "6", "not-an-integer"])
+def test_service_settings_reject_out_of_range_concurrency(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    environment = {
+        "GITHUB_APP_ID": "1234",
+        "GITHUB_WEBHOOK_SECRET": "a" * 32,
+        "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
+        "CODEX_MODEL": "gpt-5.4",
+        "OPENAI_REASONING_EFFORT": "high",
+        "MAX_CONCURRENT_REVIEWS": value,
+    }
+
+    with pytest.raises(ConfigurationError, match="MAX_CONCURRENT_REVIEWS"):
+        ProductionServiceSettings.from_environment(
+            environment,
+            paths=_service_paths(tmp_path),
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://reviews.example/webhooks/github",
+        "https://reviews.example/",
+        "https://reviews.example/webhooks/github?secret=value",
+    ],
+)
+def test_service_settings_require_a_complete_stable_https_webhook_url(
+    tmp_path: Path,
+    url: str,
+) -> None:
+    environment = {
+        "GITHUB_APP_ID": "1234",
+        "GITHUB_WEBHOOK_SECRET": "a" * 32,
+        "PUBLIC_WEBHOOK_URL": url,
+        "CODEX_MODEL": "gpt-5.4",
+        "OPENAI_REASONING_EFFORT": "high",
+    }
+
+    with pytest.raises(ConfigurationError, match="PUBLIC_WEBHOOK_URL"):
+        ProductionServiceSettings.from_environment(
+            environment,
+            paths=_service_paths(tmp_path),
+        )
 
 
 def test_production_settings_accept_the_complete_bounded_configuration(
@@ -600,7 +685,7 @@ def test_application_lifespan_releases_production_resources_on_shutdown() -> Non
 
 
 class RejectingReadiness:
-    def check(self, settings: ProductionSettings) -> None:
+    def check(self, settings: ProductionServiceSettings) -> None:
         del settings
         stage = "sandbox_host_capability"
         raise StartupReadinessError(stage)
@@ -609,7 +694,16 @@ class RejectingReadiness:
 def test_production_lifespan_fails_closed_before_constructing_runtime_dependencies(
     tmp_path: Path,
 ) -> None:
-    settings = ProductionSettings.from_environment(_valid_environment(tmp_path))
+    settings = ProductionServiceSettings.from_environment(
+        {
+            "GITHUB_APP_ID": "1234",
+            "GITHUB_WEBHOOK_SECRET": "a" * 32,
+            "PUBLIC_WEBHOOK_URL": "https://reviews.example/webhooks/github",
+            "CODEX_MODEL": "gpt-5.4",
+            "OPENAI_REASONING_EFFORT": "high",
+        },
+        paths=_service_paths(tmp_path),
+    )
     app = create_production_app(settings=settings, readiness=RejectingReadiness())
 
     async def enter_lifespan() -> None:
@@ -639,19 +733,27 @@ def test_operator_configuration_documents_the_pinned_fail_closed_runtime() -> No
     live_guide = Path("tests/live/README.md").read_text(encoding="utf-8")
 
     for setting in (
+        "GITHUB_APP_ID",
+        "GITHUB_WEBHOOK_SECRET",
+        "PUBLIC_WEBHOOK_URL",
         "CODEX_MODEL",
         "OPENAI_REASONING_EFFORT",
-        "REVIEW_KIT_PATH",
-        "STATE_ROOT",
-        "SANDBOX_CPUS",
-        "SANDBOX_MEMORY_MIB",
-        "SANDBOX_PIDS",
-        "PROCESS_OUTPUT_MAX_BYTES",
-        "CANDIDATE_OUTPUT_MAX_BYTES",
-        "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
-        "SANDBOX_NAME_PREFIX",
+        "MAX_CONCURRENT_REVIEWS",
+        "LOG_LEVEL",
     ):
         assert setting in example
+    for obsolete_setting in (
+        "GITHUB_REPOSITORY=",
+        "GITHUB_PRIVATE_KEY_PATH=",
+        "REVIEW_KIT_PATH=",
+        "STATE_ROOT=",
+        "WORKSPACE_ROOT=",
+        "RECONCILIATION_INTERVAL_SECONDS=",
+        "SANDBOX_MEMORY_MIB=",
+    ):
+        assert obsolete_setting not in example
+    assert "2048 MiB" in example
+    assert "127.0.0.1:8000" in example
     assert "sbx 0.35.0" in operator_guide
     assert "Codex CLI 0.144.6" in operator_guide
     assert "Codex CLI 0.144.6" in live_guide

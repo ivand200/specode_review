@@ -137,9 +137,9 @@ class ReviewResourceManager:
             if self._owned_sandbox.fullmatch(sandbox_name) is not None:
                 self._sandbox_client.remove(sandbox_name)
         for entry in self._workspace_root.iterdir():
-            if (
-                self._owned_workspace.fullmatch(entry.name) is not None
-                and entry.is_dir()
-                and not entry.is_symlink()
-            ):
-                shutil.rmtree(entry)
+            if self._owned_workspace.fullmatch(entry.name) is None:
+                continue
+            if entry.is_symlink() or not entry.is_dir():
+                message = "owned workspace cannot be safely inspected"
+                raise ValueError(message)
+            shutil.rmtree(entry)
