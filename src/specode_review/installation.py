@@ -10,11 +10,17 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn, Protocol
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from specode_review.configuration import ConfigurationError, ProductionServiceSettings
+from specode_review.configuration import (
+    PINNED_NGROK_VERSION,
+    ConfigurationError,
+    ProductionServiceSettings,
+)
+from specode_review.verification import WebhookMismatchError, system_verifier
 
 SUPPORTED_RELEASE_TAG = "v0.1.0"
 PINNED_SBX_VERSION = "0.35.0"
@@ -60,6 +66,32 @@ Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=20min
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+_NGROK_SYSTEMD_UNIT = b"""[Unit]
+Description=SpeCodeReview reserved ngrok ingress
+Wants=network-online.target specode-review.service
+After=network-online.target specode-review.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=specode-review
+Group=specode-review
+Environment=HOME=/var/lib/specode-review
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+EnvironmentFile=/opt/specode-review/.env
+ExecStart=/usr/bin/env ngrok http --url=${NGROK_URL} http://127.0.0.1:8000
+Restart=on-failure
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 UMask=0077
@@ -121,6 +153,8 @@ class InstallationHost(Protocol):
 
     def remove_tree(self, path: Path) -> None: ...
 
+    def verify_installation(self) -> None: ...
+
 
 def _parse_environment(content: bytes) -> dict[str, str]:
     try:
@@ -161,7 +195,7 @@ class NativeHostInstaller:
             *arguments,
         )
 
-    def _check_tools(self) -> None:
+    def _check_tools(self, *, managed_ngrok: bool) -> None:
         self._host.run("uv", "sync", "--frozen", "--no-dev")
         sbx_version = self._host.run(*self._service_command("sbx", "version")).strip()
         if sbx_version != f"sbx version: v{PINNED_SBX_VERSION}":
@@ -171,6 +205,12 @@ class NativeHostInstaller:
             _fail("codex_version")
         self._host.run("git", "--version")
         self._host.run(*self._service_command("sbx", "diagnose"))
+        if managed_ngrok:
+            ngrok_version = self._host.run(
+                *self._service_command("ngrok", "version")
+            ).strip()
+            if ngrok_version != f"ngrok version {PINNED_NGROK_VERSION}":
+                _fail("ngrok_version")
 
     def _probe_sandbox_capabilities(self) -> None:
         control = _PROBE_ROOT / "control"
@@ -255,6 +295,73 @@ class NativeHostInstaller:
                 self._host.run(*self._service_command("sbx", "rm", "--force", _PROBE_NAME))
             self._host.remove_tree(_PROBE_ROOT)
 
+    @staticmethod
+    def _validated_environment(
+        environment_content: bytes,
+        private_key: bytes,
+    ) -> dict[str, str]:
+        try:
+            parsed_key = serialization.load_pem_private_key(
+                private_key,
+                password=None,
+            )
+        except (TypeError, ValueError):
+            _fail("github_app_key")
+        if not isinstance(parsed_key, rsa.RSAPrivateKey):
+            _fail("github_app_key")
+        environment = _parse_environment(environment_content)
+        if not environment.keys() <= _ALLOWED_ENVIRONMENT_NAMES:
+            _fail("environment_interface")
+        if any("replace-with" in value.lower() for value in environment.values()):
+            _fail("environment_placeholder")
+        if bool(environment.get("NGROK_URL")) != bool(environment.get("NGROK_AUTHTOKEN")):
+            _fail("environment_ngrok")
+        ngrok_url = environment.get("NGROK_URL")
+        if ngrok_url:
+            NativeHostInstaller._validate_ngrok_origin(
+                ngrok_url,
+                environment.get("PUBLIC_WEBHOOK_URL", ""),
+            )
+        try:
+            ProductionServiceSettings.from_environment(environment)
+        except ConfigurationError as error:
+            _fail(f"configuration_{error.setting}")
+        return environment
+
+    @staticmethod
+    def _validate_ngrok_origin(ngrok_url: str, public_webhook_url: str) -> None:
+        parsed_ngrok = urlsplit(ngrok_url)
+        parsed_public = urlsplit(public_webhook_url)
+        if (
+            parsed_ngrok.scheme != "https"
+            or not parsed_ngrok.netloc
+            or parsed_ngrok.path not in {"", "/"}
+            or parsed_ngrok.query
+            or parsed_ngrok.fragment
+            or parsed_ngrok.username is not None
+            or parsed_ngrok.password is not None
+            or (parsed_ngrok.scheme, parsed_ngrok.netloc)
+            != (parsed_public.scheme, parsed_public.netloc)
+        ):
+            _fail("environment_ngrok")
+
+    def _write_units(self, *, managed_ngrok: bool) -> None:
+        self._host.write_file(
+            Path("/etc/systemd/system/specode-review.service"),
+            _SYSTEMD_UNIT,
+            owner="root",
+            group="root",
+            mode=0o644,
+        )
+        if managed_ngrok:
+            self._host.write_file(
+                Path("/etc/systemd/system/specode-review-ngrok.service"),
+                _NGROK_SYSTEMD_UNIT,
+                owner="root",
+                group="root",
+                mode=0o644,
+            )
+
     def install(self, release_tag: str) -> None:
         if release_tag != SUPPORTED_RELEASE_TAG:
             _fail("release_tag")
@@ -310,37 +417,21 @@ class NativeHostInstaller:
             mode=0o640,
             max_bytes=65_536,
         )
-        try:
-            parsed_key = serialization.load_pem_private_key(
-                private_key,
-                password=None,
-            )
-        except (TypeError, ValueError):
-            _fail("github_app_key")
-        if not isinstance(parsed_key, rsa.RSAPrivateKey):
-            _fail("github_app_key")
-        environment = _parse_environment(environment_content)
-        if not environment.keys() <= _ALLOWED_ENVIRONMENT_NAMES:
-            _fail("environment_interface")
-        if any("replace-with" in value.lower() for value in environment.values()):
-            _fail("environment_placeholder")
-        if bool(environment.get("NGROK_URL")) != bool(environment.get("NGROK_AUTHTOKEN")):
-            _fail("environment_ngrok")
-        try:
-            ProductionServiceSettings.from_environment(environment)
-        except ConfigurationError as error:
-            _fail(f"configuration_{error.setting}")
-        self._host.write_file(
-            Path("/etc/systemd/system/specode-review.service"),
-            _SYSTEMD_UNIT,
-            owner="root",
-            group="root",
-            mode=0o644,
-        )
-        self._check_tools()
+        environment = self._validated_environment(environment_content, private_key)
+        ngrok_url = environment.get("NGROK_URL")
+        self._write_units(managed_ngrok=bool(ngrok_url))
+        self._check_tools(managed_ngrok=bool(ngrok_url))
         self._probe_sandbox_capabilities()
         self._host.run("systemctl", "daemon-reload")
         self._host.run("systemctl", "enable", "--now", "specode-review.service")
+        if ngrok_url:
+            self._host.run(
+                "systemctl",
+                "enable",
+                "--now",
+                "specode-review-ngrok.service",
+            )
+        self._host.verify_installation()
 
 
 class SystemInstallationHost:
@@ -540,6 +631,9 @@ class SystemInstallationHost:
         except OSError:
             _fail("probe_cleanup")
 
+    def verify_installation(self) -> None:
+        system_verifier().verify()
+
 
 def main(
     argv: Sequence[str] | None = None,
@@ -554,6 +648,13 @@ def main(
     arguments = parser.parse_args(argv)
     try:
         NativeHostInstaller(host=host or SystemInstallationHost()).install(arguments.release)
+    except WebhookMismatchError as error:
+        sys.stderr.write(
+            "installation failed: webhook_url_mismatch "
+            f"current={error.current} expected={error.expected}\n"
+            "Update the GitHub App webhook URL manually, then rerun installation.\n"
+        )
+        return 1
     except InstallationError as error:
         sys.stderr.write(f"{error}\n")
         return 1

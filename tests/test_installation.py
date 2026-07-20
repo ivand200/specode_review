@@ -45,6 +45,7 @@ class ControlledHost:
         }
     )
     file_metadata: dict[Path, tuple[str, str, int]] = field(default_factory=dict)
+    verifications: int = 0
 
     def run(self, *arguments: str) -> str:  # noqa: PLR0911 - controlled command adapter.
         self.commands.append(arguments)
@@ -54,6 +55,8 @@ class ControlledHost:
             return "sbx version: v0.35.0\n"
         if arguments[-2:] == ("codex", "--version"):
             return "codex-cli 0.144.6\n"
+        if arguments[-2:] == ("ngrok", "version"):
+            return "ngrok version 3.39.1\n"
         if arguments == ("git", "--version"):
             return "git version 2.50.1\n"
         if "sbx" in arguments and "exec" in arguments:
@@ -112,6 +115,9 @@ class ControlledHost:
             if file_path == path or path in file_path.parents:
                 del self.files[file_path]
                 self.file_metadata.pop(file_path, None)
+
+    def verify_installation(self) -> None:
+        self.verifications += 1
 
 
 def test_installer_rejects_anything_other_than_the_exact_supported_release_tag() -> None:
@@ -279,6 +285,44 @@ def test_installer_capability_tests_pinned_tools_and_converges_idempotently() ->
     assert host.commands.count(("uv", "sync", "--frozen", "--no-dev")) == 2
     assert host.commands.count(("systemctl", "daemon-reload")) == 2
     assert host.commands.count(("systemctl", "enable", "--now", "specode-review.service")) == 2
+    assert host.verifications == 2
+
+
+def test_installer_configures_the_optional_reserved_ngrok_unit() -> None:
+    host = ControlledHost()
+    host.files[Path("/opt/specode-review/.env")] = (
+        _production_environment()
+        + b"\nNGROK_URL=https://reviews.example"
+        + b"\nNGROK_AUTHTOKEN=ngrok-secret-sentinel"
+    )
+
+    NativeHostInstaller(host=host).install("v0.1.0")
+
+    unit_path = Path("/etc/systemd/system/specode-review-ngrok.service")
+    unit = host.files[unit_path].decode()
+    assert "User=specode-review" in unit
+    assert "EnvironmentFile=/opt/specode-review/.env" in unit
+    assert (
+        "ExecStart=/usr/bin/env ngrok http --url=${NGROK_URL} http://127.0.0.1:8000"
+        in unit
+    )
+    assert "Restart=on-failure" in unit
+    assert host.file_metadata[unit_path] == ("root", "root", 0o644)
+    assert ("systemctl", "enable", "--now", "specode-review-ngrok.service") in host.commands
+
+
+def test_installer_rejects_ngrok_origin_that_does_not_match_the_public_webhook() -> None:
+    host = ControlledHost()
+    host.files[Path("/opt/specode-review/.env")] = (
+        _production_environment()
+        + b"\nNGROK_URL=https://other.example"
+        + b"\nNGROK_AUTHTOKEN=ngrok-secret-sentinel"
+    )
+
+    with pytest.raises(InstallationError, match="environment_ngrok"):
+        NativeHostInstaller(host=host).install("v0.1.0")
+
+    assert host.verifications == 0
 
 
 def test_installer_command_reports_only_a_bounded_safe_failure(

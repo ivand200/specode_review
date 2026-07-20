@@ -140,9 +140,10 @@ sudo git -C /opt/specode-review fetch --tags
 sudo git -C /opt/specode-review checkout --detach v0.1.0
 ```
 
-Install `uv`, Git, `runuser`, `systemd`, `sbx 0.35.0`, and Codex CLI `0.144.6` in the system
-`PATH`. Configure Docker Sandboxes for the dedicated service identity; model credentials must use
-its host-managed credential store and must not be placed in `.env`:
+Install `uv`, Git, curl, `runuser`, `systemd`, `sbx 0.35.0`, and Codex CLI `0.144.6` in the system
+`PATH`. Managed reserved-ngrok ingress additionally requires ngrok `3.39.1`. Configure Docker
+Sandboxes for the dedicated service identity; model credentials must use its host-managed
+credential store and must not be placed in `.env`:
 
 ```bash
 sudo -u specode-review env -i \
@@ -167,7 +168,14 @@ The installer rejects branches, commits that are not exactly tagged, unsupported
 or placeholder configuration, model credentials in the application environment, unsafe secret
 files, and unpinned host tools. It converges the non-login service user and restrictive managed
 paths, installs the locked non-development environment with `uv`, runs a disposable no-model
-Sandbox capability probe, writes `specode-review.service`, and enables and starts it.
+Sandbox capability probe, writes `specode-review.service`, and enables and starts it. When
+`NGROK_URL` and `NGROK_AUTHTOKEN` are set, their reserved HTTPS origin must match
+`PUBLIC_WEBHOOK_URL`; the installer also writes and starts the separate
+`specode-review-ngrok.service`.
+
+After startup, installation waits up to ten minutes for the GitHub App webhook URL to match
+`PUBLIC_WEBHOOK_URL` and otherwise leaves both supervised units running with manual correction
+instructions. It never mutates GitHub App configuration.
 
 The unit listens through the application's fixed `127.0.0.1:8000` bind, logs to `journald`,
 restarts after failures no more than five times in five minutes, and allows up to twenty minutes
@@ -177,6 +185,9 @@ for graceful shutdown:
 sudo systemctl status specode-review
 sudo journalctl -u specode-review --since today
 sudo systemctl restart specode-review
+# Managed ngrok mode:
+sudo systemctl status specode-review-ngrok
+sudo journalctl -u specode-review-ngrok --since today
 ```
 
 Upgrade and rollback use the same operation after checking out another exact supported release
@@ -191,7 +202,24 @@ idempotency before capacity is consumed. Accepted work runs one cleanup-before-p
 transaction. A clean review and a review with findings both publish one top-level comment;
 technical failures are visible only in safe structured operator logs.
 
-## Verification
+## Installation verification
+
+Repeat the production verifier after installation, upgrade, rollback, or repair:
+
+```bash
+sudo ./scripts/verify-install.sh
+```
+
+It checks required units, local and public health, the configured GitHub App identity and webhook
+URL, pinned host tools, and the trusted review kit. It then creates, limits, mounts, executes,
+inspects, lists, and force-removes one network-denied temporary Sandbox and confirms that no
+SpeCodeReview-owned Sandbox or workspace remains. Output contains only bounded pass/fail evidence.
+The verifier never invokes Codex, spends model tokens, or publishes a GitHub review.
+
+Run verification while the service is otherwise idle so an active bounded review is not mistaken
+for a stale owned resource.
+
+## Development verification
 
 The default suite is network-free:
 
