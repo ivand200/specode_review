@@ -139,7 +139,7 @@ def _manager(  # noqa: PLR0913 - compact fixture construction seam.
         attempt_settings=settings,
         resource_manager=ReviewResourceManager(
             workspace_root=settings.workspace_root,
-            sandbox_prefix=settings.runtime.sandbox_name_prefix,
+            sandbox_prefix=settings.sandbox_name_prefix,
             sandbox_client=resolved_sandbox_resources,
         ),
         parent_environment=os.environ,

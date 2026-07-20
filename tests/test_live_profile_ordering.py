@@ -198,18 +198,16 @@ def test_checkpoint_c_shutdown_failure_prevents_resource_record_append(
     PollutedGitHub.comments = ()
     workspace_root = tmp_path / "workspace"
     resources_path = tmp_path / "resources.jsonl"
-    runtime = SimpleNamespace(
-        review_timeout_seconds=30,
-        sandbox_operation=SimpleNamespace(cleanup_timeout_seconds=5),
-        sandbox_name_prefix="review-agent-",
-    )
     settings = SimpleNamespace(
         webhook=SimpleNamespace(repository=request.repository, secret="secret"),
         attempt=SimpleNamespace(
             app_id=12345,
             private_key_path=tmp_path / "key.pem",
             workspace_root=workspace_root,
-            runtime=runtime,
+            process_output_max_bytes=1_048_576,
+            review_timeout_seconds=30,
+            sandbox_cleanup_timeout_seconds=5,
+            sandbox_name_prefix="review-agent-",
         ),
     )
 

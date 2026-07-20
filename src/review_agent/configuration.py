@@ -107,33 +107,6 @@ class SandboxOperationPolicy:
             raise ValueError(message)
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimePolicy:
-    codex_execution: CodexExecutionPolicy
-    sandbox_operation: SandboxOperationPolicy
-    review_limits: ReviewLimits
-    candidate_output_max_bytes: int
-    review_timeout_seconds: float
-    sandbox_name_prefix: str
-
-    def __post_init__(self) -> None:
-        if (
-            self.sandbox_operation.process_output_max_bytes
-            != self.review_limits.process_output_max_bytes
-        ):
-            message = "runtime process output limits must agree"
-            raise ValueError(message)
-        if not self.sandbox_operation.deny_network:
-            message = "production sandbox network access must be denied"
-            raise ValueError(message)
-        if self.candidate_output_max_bytes <= 0 or self.review_timeout_seconds <= 0:
-            message = "runtime limits must be positive"
-            raise ValueError(message)
-        if _SANDBOX_PREFIX.fullmatch(self.sandbox_name_prefix) is None:
-            message = "sandbox name prefix is invalid"
-            raise ValueError(message)
-
-
 class ConfigurationError(ValueError):
     """A normalized startup configuration failure safe for logs and stderr."""
 
@@ -257,7 +230,26 @@ class AttemptSettings:
     private_key_path: Path
     review_kit_path: Path
     workspace_root: Path
-    runtime: RuntimePolicy
+    codex_execution: CodexExecutionPolicy
+    sandbox_resources: SandboxResourceLimits
+    process_output_max_bytes: int
+    candidate_output_max_bytes: int
+    review_timeout_seconds: float
+    sandbox_cleanup_timeout_seconds: float
+    sandbox_name_prefix: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.process_output_max_bytes <= 0
+            or self.candidate_output_max_bytes <= 0
+            or self.review_timeout_seconds <= 0
+            or self.sandbox_cleanup_timeout_seconds <= 0
+        ):
+            message = "attempt runtime limits must be positive"
+            raise ValueError(message)
+        if _SANDBOX_PREFIX.fullmatch(self.sandbox_name_prefix) is None:
+            message = "sandbox name prefix is invalid"
+            raise ValueError(message)
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]) -> "AttemptSettings":
@@ -286,31 +278,25 @@ class AttemptSettings:
             "PROCESS_OUTPUT_MAX_BYTES",
             default=PROCESS_OUTPUT_MAX_BYTES,
         )
-        runtime = RuntimePolicy(
+        return cls(
+            app_id=_positive_int(environment, "GITHUB_APP_ID"),
+            private_key_path=_existing_file(environment, "GITHUB_PRIVATE_KEY_PATH"),
+            review_kit_path=_existing_directory(environment, "REVIEW_KIT_PATH"),
+            workspace_root=workspace_root,
             codex_execution=CodexExecutionPolicy(
                 model=codex_model,
                 reasoning_effort=reasoning_effort,
             ),
-            sandbox_operation=SandboxOperationPolicy(
-                process_output_max_bytes=process_output_max_bytes,
-                cleanup_timeout_seconds=_positive_float(
+            sandbox_resources=SandboxResourceLimits(
+                cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
+                memory_mib=_positive_int(
                     environment,
-                    "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
-                    default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
+                    "SANDBOX_MEMORY_MIB",
+                    default=4_096,
                 ),
+                pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
             ),
-            review_limits=ReviewLimits(
-                process_output_max_bytes=process_output_max_bytes,
-                sandbox_resources=SandboxResourceLimits(
-                    cpus=_positive_int(environment, "SANDBOX_CPUS", default=2),
-                    memory_mib=_positive_int(
-                        environment,
-                        "SANDBOX_MEMORY_MIB",
-                        default=4_096,
-                    ),
-                    pids=_positive_int(environment, "SANDBOX_PIDS", default=256),
-                ),
-            ),
+            process_output_max_bytes=process_output_max_bytes,
             candidate_output_max_bytes=_positive_int(
                 environment,
                 "CANDIDATE_OUTPUT_MAX_BYTES",
@@ -321,22 +307,19 @@ class AttemptSettings:
                 "REVIEW_TIMEOUT_SECONDS",
                 default=DEFAULT_REVIEW_TIMEOUT_SECONDS,
             ),
+            sandbox_cleanup_timeout_seconds=_positive_float(
+                environment,
+                "SANDBOX_CLEANUP_TIMEOUT_SECONDS",
+                default=DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS,
+            ),
             sandbox_name_prefix=sandbox_name_prefix,
-        )
-        return cls(
-            app_id=_positive_int(environment, "GITHUB_APP_ID"),
-            private_key_path=_existing_file(environment, "GITHUB_PRIVATE_KEY_PATH"),
-            review_kit_path=_existing_directory(environment, "REVIEW_KIT_PATH"),
-            workspace_root=workspace_root,
-            runtime=runtime,
         )
 
     def render_executor_environment(
         self,
         parent_environment: Mapping[str, str],
     ) -> dict[str, str]:
-        runtime = self.runtime
-        resources = runtime.review_limits.sandbox_resources
+        resources = self.sandbox_resources
         rendered = {
             name: value
             for name, value in parent_environment.items()
@@ -346,20 +329,20 @@ class AttemptSettings:
             {
                 "GITHUB_APP_ID": str(self.app_id),
                 "GITHUB_PRIVATE_KEY_PATH": str(self.private_key_path),
-                "CODEX_MODEL": runtime.codex_execution.model,
-                "OPENAI_REASONING_EFFORT": runtime.codex_execution.reasoning_effort.value,
+                "CODEX_MODEL": self.codex_execution.model,
+                "OPENAI_REASONING_EFFORT": self.codex_execution.reasoning_effort.value,
                 "REVIEW_KIT_PATH": str(self.review_kit_path),
                 "WORKSPACE_ROOT": str(self.workspace_root),
-                "REVIEW_TIMEOUT_SECONDS": str(runtime.review_timeout_seconds),
+                "REVIEW_TIMEOUT_SECONDS": str(self.review_timeout_seconds),
                 "SANDBOX_CPUS": str(resources.cpus),
                 "SANDBOX_MEMORY_MIB": str(resources.memory_mib),
                 "SANDBOX_PIDS": str(resources.pids),
-                "PROCESS_OUTPUT_MAX_BYTES": str(runtime.review_limits.process_output_max_bytes),
-                "CANDIDATE_OUTPUT_MAX_BYTES": str(runtime.candidate_output_max_bytes),
+                "PROCESS_OUTPUT_MAX_BYTES": str(self.process_output_max_bytes),
+                "CANDIDATE_OUTPUT_MAX_BYTES": str(self.candidate_output_max_bytes),
                 "SANDBOX_CLEANUP_TIMEOUT_SECONDS": str(
-                    runtime.sandbox_operation.cleanup_timeout_seconds
+                    self.sandbox_cleanup_timeout_seconds
                 ),
-                "SANDBOX_NAME_PREFIX": runtime.sandbox_name_prefix,
+                "SANDBOX_NAME_PREFIX": self.sandbox_name_prefix,
             }
         )
         return rendered

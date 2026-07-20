@@ -14,7 +14,7 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from review_agent.configuration import ProductionSettings
+from review_agent.configuration import ProductionSettings, SandboxOperationPolicy
 from review_agent.github import CheckRun, CheckRunStatus, GitHubAppClient, derive_review_identity
 from review_agent.live import require_fresh_live_review, verify_live_review_evidence
 from review_agent.models import AcceptedRevision, ReviewRequest
@@ -225,7 +225,12 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             head_sha=_required_environment("E2E_EXPECTED_HEAD_SHA"),
         ),
     )
-    sandbox_client = DockerSandboxClient(config=attempt.runtime.sandbox_operation)
+    sandbox_client = DockerSandboxClient(
+        config=SandboxOperationPolicy(
+            process_output_max_bytes=attempt.process_output_max_bytes,
+            cleanup_timeout_seconds=attempt.sandbox_cleanup_timeout_seconds,
+        )
+    )
     app = create_production_app(
         settings=settings,
         environment=os.environ,
@@ -251,9 +256,11 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             github,
             request,
             lambda check: check.status is CheckRunStatus.COMPLETED,
-            timeout=attempt.runtime.review_timeout_seconds
-            + attempt.runtime.sandbox_operation.cleanup_timeout_seconds
-            + 60,
+            timeout=(
+                attempt.review_timeout_seconds
+                + attempt.sandbox_cleanup_timeout_seconds
+                + 60
+            ),
         )
     verification_github = GitHubAppClient(
         repository=repository,
@@ -269,7 +276,7 @@ def test_full_live_production_lifecycle_reviews_and_publishes() -> None:
             forbidden_texts=(forbidden_instruction, forbidden_config),
             workspace_root=attempt.workspace_root,
             sandbox_client=sandbox_client,
-            sandbox_name_prefix=attempt.runtime.sandbox_name_prefix,
+            sandbox_name_prefix=attempt.sandbox_name_prefix,
             resources_path=resources_path,
         )
     finally:
