@@ -6,29 +6,29 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from review_agent.configuration import CANDIDATE_OUTPUT_MAX_BYTES, ReviewLimits
-from review_agent.core import (
+from specode_review.configuration import CANDIDATE_OUTPUT_MAX_BYTES, ReviewLimits
+from specode_review.core import (
     CandidateAcceptance,
     CandidateContract,
     GitHubRepository,
     ReviewContext,
     Reviewer,
 )
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.github import (
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.github import (
     GitHubError,
     GitHubOperation,
     ReviewComment,
     ReviewCommentGateway,
 )
-from review_agent.lifecycle_evidence import emit_lifecycle_evidence
-from review_agent.models import ReviewRequest
-from review_agent.publishing import (
+from specode_review.lifecycle_evidence import emit_lifecycle_evidence
+from specode_review.models import ReviewRequest
+from specode_review.publishing import (
     PublicationDisposition,
     PublicationReceipt,
     publish_review_result,
 )
-from review_agent.resources import AttemptResources, ReviewResourceManager
+from specode_review.resources import AttemptResources, ReviewResourceManager
 
 _GITHUB_NOT_FOUND = 404
 

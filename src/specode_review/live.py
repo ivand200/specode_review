@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
-from review_agent.github import GitHubAppClient
-from review_agent.models import AcceptedRevision, ReviewRequest
-from review_agent.publishing import owned_revision_comments
+from specode_review.github import GitHubAppClient
+from specode_review.models import AcceptedRevision, ReviewRequest
+from specode_review.publishing import owned_revision_comments
 
 
 class LiveProfilePreconditionError(Exception):

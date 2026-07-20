@@ -9,12 +9,12 @@ from typing import Literal, Protocol
 
 from pydantic import ValidationError
 
-from review_agent.configuration import ReviewLimits, SandboxResourceLimits
-from review_agent.deadline import remaining_review_time
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
-from review_agent.process import ProcessOptions, _run_bounded_process
-from review_agent.resources import AttemptResources
+from specode_review.configuration import ReviewLimits, SandboxResourceLimits
+from specode_review.deadline import remaining_review_time
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import AgentReview, DiffRange, Location, ReviewRequest, ReviewResult
+from specode_review.process import ProcessOptions, _run_bounded_process
+from specode_review.resources import AttemptResources
 
 MAX_CHANGED_FILES = 100
 MAX_CHANGED_TEXT_LINES = 5_000
@@ -360,7 +360,7 @@ class Reviewer:
             "#!/bin/sh\n"
             'case "$1" in\n'
             '  *Username*) printf "%s\\n" "x-access-token" ;;\n'
-            '  *Password*) printf "%s\\n" "$REVIEW_AGENT_GITHUB_TOKEN" ;;\n'
+            '  *Password*) printf "%s\\n" "$SPECODE_REVIEW_GITHUB_TOKEN" ;;\n'
             "  *) exit 1 ;;\n"
             "esac\n",
             encoding="utf-8",
@@ -370,7 +370,7 @@ class Reviewer:
             **os.environ,
             "GIT_ASKPASS": str(askpass),
             "GIT_TERMINAL_PROMPT": "0",
-            "REVIEW_AGENT_GITHUB_TOKEN": token,
+            "SPECODE_REVIEW_GITHUB_TOKEN": token,
         }
         try:
             self._authenticated_git(

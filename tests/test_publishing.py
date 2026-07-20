@@ -2,15 +2,15 @@ from collections.abc import Callable
 
 import pytest
 
-from review_agent.github import (
+from specode_review.github import (
     GitHubError,
     GitHubMutationError,
     GitHubOperation,
     ReviewComment,
     ReviewCommentApp,
 )
-from review_agent.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
-from review_agent.publishing import (
+from specode_review.models import DiffRange, Finding, Location, ReviewRequest, ReviewResult
+from specode_review.publishing import (
     PUBLICATION_RECHECK_DELAYS_SECONDS,
     PublicationConsistencyError,
     PublicationDisposition,
@@ -275,7 +275,7 @@ def _findings_result() -> ReviewResult:
 
 def _expected_body(result: ReviewResult | None = None) -> str:
     marker = (
-        "<!-- review-agent:v1:"
+        "<!-- specode-review:v1:"
         "b3fdc634e74cf30721e4dc24158636348334fa1c133b44a74eb401e89db2119f -->"
     )
     return f"{render_review_comment(result or _result())}\n{marker}\n"
@@ -606,7 +606,7 @@ def test_a_new_accepted_base_revision_creates_a_distinct_comment() -> None:
 
     assert len(gateway.created) == 1
     assert gateway.created[0] != old_revision.body
-    assert "<!-- review-agent:v1:" in gateway.created[0]
+    assert "<!-- specode-review:v1:" in gateway.created[0]
     assert gateway.updated == []
     assert receipt.disposition is PublicationDisposition.CREATED
 

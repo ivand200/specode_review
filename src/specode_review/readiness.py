@@ -7,12 +7,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn, Protocol
 
-from review_agent.configuration import (
+from specode_review.configuration import (
     PINNED_CODEX_VERSION,
     PINNED_SBX_VERSION,
     ProductionServiceSettings,
 )
-from review_agent.process import ProcessOptions, _run_bounded_process
+from specode_review.process import ProcessOptions, _run_bounded_process
 
 logger = logging.getLogger(__name__)
 

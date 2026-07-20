@@ -1,17 +1,17 @@
 import pytest
 
-from review_agent.github import (
+from specode_review.github import (
     ReviewComment,
     ReviewCommentApp,
     derive_review_identity,
 )
-from review_agent.live import (
+from specode_review.live import (
     LiveProfileEvidenceError,
     LiveProfilePreconditionError,
     require_fresh_live_review,
     verify_live_review_evidence,
 )
-from review_agent.models import AcceptedRevision, ReviewRequest
+from specode_review.models import AcceptedRevision, ReviewRequest
 
 
 def _request() -> ReviewRequest:

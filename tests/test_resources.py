@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-import review_agent.resources
-from review_agent.resources import AttemptResources, ReviewResourceManager
+import specode_review.resources
+from specode_review.resources import AttemptResources, ReviewResourceManager
 
 
 @dataclass
@@ -23,26 +23,26 @@ class RecordingSandboxResources:
 def test_attempt_resources_use_one_validated_identity_for_exact_names(tmp_path: Path) -> None:
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=RecordingSandboxResources(),
     )
 
     resources = manager.for_attempt("a" * 32)
 
     assert resources.attempt_id == "a" * 32
-    assert resources.workspace == tmp_path / "workspaces" / ("review-agent-workspace-" + "a" * 32)
-    assert resources.sandbox_name == "review-agent-" + "a" * 32
+    assert resources.workspace == tmp_path / "workspaces" / ("specode-review-workspace-" + "a" * 32)
+    assert resources.sandbox_name == "specode-review-" + "a" * 32
 
 
 def test_exact_cleanup_is_idempotent_and_preserves_other_attempts(tmp_path: Path) -> None:
     exact_id = "a" * 32
     other_id = "b" * 32
-    exact_sandbox = "review-agent-" + exact_id
-    other_sandbox = "review-agent-" + other_id
+    exact_sandbox = "specode-review-" + exact_id
+    other_sandbox = "specode-review-" + other_id
     client = RecordingSandboxResources(existing=[exact_sandbox, other_sandbox])
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=client,
     )
     exact = manager.for_attempt(exact_id)
@@ -64,11 +64,11 @@ def test_exact_cleanup_removes_the_sandbox_when_workspace_deletion_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempt_id = "a" * 32
-    sandbox_name = "review-agent-" + attempt_id
+    sandbox_name = "specode-review-" + attempt_id
     client = RecordingSandboxResources(existing=[sandbox_name])
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=client,
     )
     workspace = manager.for_attempt(attempt_id).workspace
@@ -79,7 +79,7 @@ def test_exact_cleanup_removes_the_sandbox_when_workspace_deletion_fails(
         message = "simulated workspace deletion failure"
         raise OSError(message)
 
-    monkeypatch.setattr(review_agent.resources.shutil, "rmtree", fail_workspace_deletion)
+    monkeypatch.setattr(specode_review.resources.shutil, "rmtree", fail_workspace_deletion)
 
     with pytest.raises(OSError, match="simulated workspace deletion failure"):
         manager.cleanup(attempt_id)
@@ -90,10 +90,10 @@ def test_exact_cleanup_removes_the_sandbox_when_workspace_deletion_fails(
 
 def test_exact_cleanup_rejects_an_owned_name_that_is_a_symlink(tmp_path: Path) -> None:
     attempt_id = "a" * 32
-    client = RecordingSandboxResources(existing=["review-agent-" + attempt_id])
+    client = RecordingSandboxResources(existing=["specode-review-" + attempt_id])
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=client,
     )
     resources = manager.for_attempt(attempt_id)
@@ -111,10 +111,10 @@ def test_exact_cleanup_rejects_an_owned_name_that_is_a_symlink(tmp_path: Path) -
 
 
 def test_exact_cleanup_rejects_a_malformed_attempt_identity(tmp_path: Path) -> None:
-    client = RecordingSandboxResources(existing=["review-agent-" + "a" * 32])
+    client = RecordingSandboxResources(existing=["specode-review-" + "a" * 32])
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=client,
     )
 
@@ -129,45 +129,45 @@ def test_attempt_resources_reject_root_and_outside_workspace_paths(tmp_path: Pat
         AttemptResources.for_attempt(
             "a" * 32,
             workspace_root=Path("/"),
-            sandbox_prefix="review-agent-",
+            sandbox_prefix="specode-review-",
         )
 
     with pytest.raises(ValueError, match="exact application-owned attempt path"):
         AttemptResources(
             attempt_id="a" * 32,
             workspace_root=tmp_path / "workspaces",
-            workspace=tmp_path / "outside" / ("review-agent-workspace-" + "a" * 32),
-            sandbox_prefix="review-agent-",
-            sandbox_name="review-agent-" + "a" * 32,
+            workspace=tmp_path / "outside" / ("specode-review-workspace-" + "a" * 32),
+            sandbox_prefix="specode-review-",
+            sandbox_name="specode-review-" + "a" * 32,
         )
 
     with pytest.raises(ValueError, match="exact application-owned attempt name"):
         AttemptResources(
             attempt_id="a" * 32,
             workspace_root=tmp_path / "workspaces",
-            workspace=tmp_path / "workspaces" / ("review-agent-workspace-" + "a" * 32),
-            sandbox_prefix="review-agent-",
+            workspace=tmp_path / "workspaces" / ("specode-review-workspace-" + "a" * 32),
+            sandbox_prefix="specode-review-",
             sandbox_name="other-" + "a" * 32,
         )
 
 
 def test_startup_sweep_removes_only_valid_stale_owned_resources(tmp_path: Path) -> None:
     stale_id = "a" * 32
-    stale_sandbox = "review-agent-" + stale_id
+    stale_sandbox = "specode-review-" + stale_id
     client = RecordingSandboxResources(
         existing=[
             stale_sandbox,
-            "review-agent-not-an-attempt",
+            "specode-review-not-an-attempt",
             "other-" + "c" * 32,
         ]
     )
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=client,
     )
     stale = manager.for_attempt(stale_id).workspace
-    malformed = stale.parent / "review-agent-workspace-not-an-attempt"
+    malformed = stale.parent / "specode-review-workspace-not-an-attempt"
     unrelated = stale.parent / ("other-" + "c" * 32)
     outside = tmp_path / "outside"
     stale.mkdir(parents=True)
@@ -191,7 +191,7 @@ def test_startup_sweep_fails_closed_on_ambiguous_owned_workspace(
 ) -> None:
     manager = ReviewResourceManager(
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
         sandbox_client=RecordingSandboxResources(),
     )
     workspace = manager.for_attempt("b" * 32).workspace

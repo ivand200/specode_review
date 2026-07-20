@@ -12,9 +12,9 @@ from fastapi.testclient import TestClient
 from httpx import Response
 from pydantic import ValidationError
 
-from review_agent.models import ReviewRequest
-from review_agent.submission import SubmissionOutcome
-from review_agent.web import create_app
+from specode_review.models import ReviewRequest
+from specode_review.submission import SubmissionOutcome
+from specode_review.web import create_app
 
 
 class ScriptedLifecycle:

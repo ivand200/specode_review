@@ -4,17 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from review_agent import (
+from specode_review import (
     CandidateAcceptance,
     FailureCategory,
     Reviewer,
     ReviewError,
     ReviewRequest,
 )
-from review_agent.configuration import SandboxOperationPolicy, SandboxResourceLimits
-from review_agent.deadline import ReviewDeadline, review_deadline_scope
-from review_agent.resources import AttemptResources, ReviewResourceManager
-from review_agent.sandbox import DockerSandboxClient
+from specode_review.configuration import SandboxOperationPolicy, SandboxResourceLimits
+from specode_review.deadline import ReviewDeadline, review_deadline_scope
+from specode_review.resources import AttemptResources, ReviewResourceManager
+from specode_review.sandbox import DockerSandboxClient
 
 from .no_model_sandbox_probe import NoModelDockerSandboxProbe
 
@@ -86,7 +86,7 @@ def test_codex_sandbox_credential_can_write_responses_without_generation(
     tmp_path: Path,
 ) -> None:
     workspace_root = tmp_path / "auth-workspaces"
-    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "review-agent-it-")
+    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "specode-review-it-")
     client = DockerSandboxClient(
         config=SandboxOperationPolicy(
             process_output_max_bytes=65_536,
@@ -151,7 +151,7 @@ def test_test_only_no_model_probe_is_fresh_bounded_and_swept(  # noqa: PLR0915
             cleanup_timeout_seconds=30,
         )
     )
-    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "review-agent-it-")
+    prefix = os.environ.get("E2E_SANDBOX_NAME_PREFIX", "specode-review-it-")
     resource_manager = ReviewResourceManager(
         workspace_root=workspace_root,
         sandbox_prefix=prefix,

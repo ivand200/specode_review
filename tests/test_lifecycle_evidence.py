@@ -4,12 +4,12 @@ import logging
 
 import pytest
 
-from review_agent import ReviewLifecycle
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import ReviewRequest
-from review_agent.publishing import PublicationDisposition
-from review_agent.review_runner import PreflightOutcome, ReviewCompletion
-from review_agent.submission import SubmissionOutcome
+from specode_review import ReviewLifecycle
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import ReviewRequest
+from specode_review.publishing import PublicationDisposition
+from specode_review.review_runner import PreflightOutcome, ReviewCompletion
+from specode_review.submission import SubmissionOutcome
 
 
 def _request(**updates: object) -> ReviewRequest:
@@ -59,7 +59,7 @@ def _records(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
     return [
         json.loads(record.getMessage())
         for record in caplog.records
-        if record.name == "review_agent.lifecycle_evidence"
+        if record.name == "specode_review.lifecycle_evidence"
     ]
 
 
@@ -74,7 +74,7 @@ def test_lifecycle_emits_correlated_single_line_json_for_success(
         async with lifecycle:
             return await lifecycle.submit(_request())
 
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     assert asyncio.run(exercise()) is SubmissionOutcome.ACCEPTED
 
@@ -105,7 +105,7 @@ def test_unexpected_preflight_failure_uses_only_safe_vocabulary(
         async with ReviewLifecycle(runner=FailingPreflightRunner()) as lifecycle:
             return await lifecycle.submit(_request())
 
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     assert asyncio.run(exercise()) is SubmissionOutcome.UNAVAILABLE
 
@@ -132,7 +132,7 @@ def test_review_failure_is_normalized_and_terminally_released(
         ) as lifecycle:
             return await lifecycle.submit(_request())
 
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     assert asyncio.run(exercise()) is SubmissionOutcome.ACCEPTED
 

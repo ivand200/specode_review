@@ -5,7 +5,7 @@ from os.path import lexists
 from pathlib import Path
 from typing import Protocol
 
-WORKSPACE_PREFIX = "review-agent-workspace-"
+WORKSPACE_PREFIX = "specode-review-workspace-"
 
 _ATTEMPT_ID = re.compile(r"^[0-9a-f]{32}$")
 _SANDBOX_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")

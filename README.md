@@ -12,8 +12,8 @@ the result, then publishes one revision-bound pull-request comment.
 
 This is a production-oriented prototype with a deliberately narrow deployment model: one process,
 one GitHub App, and one dedicated host or VM. It serves every repository authorized for that App.
-The product is **SpeCodeReview**; `review-agent` remains the transitional Python package and CLI
-until the planned clean package-identity cutover.
+The product and GitHub App are **SpeCodeReview**, the Python package and logger namespace are
+`specode_review`, and installed commands and owned runtime resources use `specode-review`.
 
 ## Why it exists
 
@@ -124,7 +124,7 @@ Load the environment and start the loopback service:
 set -a
 source .env
 set +a
-uv run review-agent
+uv run specode-review
 ```
 
 Health probes are available at `/health/live` and `/health/ready`.
@@ -147,9 +147,9 @@ uv run mypy
 uv run pytest
 ```
 
-The network-free suite includes the no-model Sandbox probe contract. The signed, model-backed
-production campaign is being refocused on the surviving comment-only path and is not exposed as
-an installable command in this intermediate refactor phase.
+The network-free suite includes the no-model Sandbox probe contract. The separately installed
+`specode-review-real-e2e` command is reserved for the signed, model-backed production campaign;
+that campaign remains unavailable until its comment-only production-path implementation lands.
 
 ## Operational constraints
 

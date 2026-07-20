@@ -7,20 +7,20 @@ from typing import Protocol, Self
 import uvicorn
 from fastapi import FastAPI
 
-from review_agent.configuration import (
+from specode_review.configuration import (
     ProductionServiceSettings,
     ReviewLimits,
     SandboxOperationPolicy,
 )
-from review_agent.github import GitHubAppClient
-from review_agent.lifecycle import ReviewLifecycle
-from review_agent.models import ReviewRequest
-from review_agent.readiness import ProductionReadiness, StartupReadinessError
-from review_agent.resources import ReviewResourceManager, SandboxResourceClient
-from review_agent.review_runner import PreflightOutcome, ReviewRunner
-from review_agent.sandbox import CodexSandboxAdapter, DockerSandboxClient, ReviewExecutionClient
-from review_agent.submission import SubmissionOutcome
-from review_agent.web import create_app
+from specode_review.github import GitHubAppClient
+from specode_review.lifecycle import ReviewLifecycle
+from specode_review.models import ReviewRequest
+from specode_review.readiness import ProductionReadiness, StartupReadinessError
+from specode_review.resources import ReviewResourceManager, SandboxResourceClient
+from specode_review.review_runner import PreflightOutcome, ReviewRunner
+from specode_review.sandbox import CodexSandboxAdapter, DockerSandboxClient, ReviewExecutionClient
+from specode_review.submission import SubmissionOutcome
+from specode_review.web import create_app
 
 
 class ReadinessCheck(Protocol):

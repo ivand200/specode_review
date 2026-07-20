@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
-from review_agent.errors import FailureCategory, ReviewError
+from specode_review.errors import FailureCategory, ReviewError
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +26,7 @@ class ReviewDeadline:
 
 
 _ACTIVE_DEADLINE: ContextVar[ReviewDeadline | None] = ContextVar(
-    "review_agent_active_deadline",
+    "specode_review_active_deadline",
     default=None,
 )
 

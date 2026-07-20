@@ -1,11 +1,11 @@
 from types import TracebackType
 from typing import Protocol, Self
 
-from review_agent.deadline import ReviewDeadline, review_deadline_scope
-from review_agent.github import ReviewCommentGateway
-from review_agent.models import ReviewRequest, ReviewResult
-from review_agent.publishing import publish_review_result
-from review_agent.submission import SubmissionOutcome
+from specode_review.deadline import ReviewDeadline, review_deadline_scope
+from specode_review.github import ReviewCommentGateway
+from specode_review.models import ReviewRequest, ReviewResult
+from specode_review.publishing import publish_review_result
+from specode_review.submission import SubmissionOutcome
 
 
 class ReviewService(Protocol):

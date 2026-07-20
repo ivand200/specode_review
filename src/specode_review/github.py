@@ -22,19 +22,19 @@ from pydantic import (
     model_validator,
 )
 
-from review_agent.deadline import remaining_review_time
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import RepositoryName, ReviewRequest, Sha, bound_description
+from specode_review.deadline import remaining_review_time
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import RepositoryName, ReviewRequest, Sha, bound_description
 
 GITHUB_API_VERSION = "2026-03-10"
 REVIEW_COMMENT_PAGE_SIZE = 100
 REVIEW_COMMENT_MAX_PAGES = 10
 GITHUB_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
-_EXTERNAL_ID_PREFIX = "review-agent:v1:"
+_EXTERNAL_ID_PREFIX = "specode-review:v1:"
 
 ExternalReviewId = Annotated[
     str,
-    StringConstraints(pattern=r"^review-agent:v1:[0-9a-f]{64}$", max_length=80),
+    StringConstraints(pattern=r"^specode-review:v1:[0-9a-f]{64}$", max_length=82),
 ]
 class GitHubOperation(StrEnum):
     INSTALLATION_READ = "installation_read"

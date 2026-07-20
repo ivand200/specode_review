@@ -8,8 +8,8 @@ from pathlib import Path, PurePosixPath
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from review_agent.models import RepositoryName, Sha
-from review_agent.process import (
+from specode_review.models import RepositoryName, Sha
+from specode_review.process import (
     ProcessOptions,
     ProcessRunner,
     _run_bounded_process,
@@ -543,7 +543,7 @@ def _checkpoint_b_files(campaign_id: str) -> tuple[FixtureFile, ...]:
     return (
         FixtureFile(
             path=f"campaign-fixtures/{campaign_id}/checkpoint-b.txt",
-            content=f"Review Agent real E2E fixture {campaign_id} checkpoint B.\n",
+            content=f"SpeCodeReview real E2E fixture {campaign_id} checkpoint B.\n",
         ),
     )
 
@@ -703,12 +703,12 @@ def prepare_campaign_fixtures(
     if _CAMPAIGN_ID.fullmatch(campaign_id) is None:
         raise FixturePreparationError(FixturePreparationStage.INPUT)
 
-    branch_b = f"review-agent-e2e/{campaign_id}/checkpoint-b"
-    branch_c = f"review-agent-e2e/{campaign_id}/checkpoint-c"
-    title_b = f"[{campaign_id}] Review Agent checkpoint B fixture"
-    title_c = f"[{campaign_id}] Review Agent checkpoint C fixture"
-    instruction_marker = f"review-agent-e2e-instruction-{campaign_id}"
-    configuration_marker = f"review-agent-e2e-config-{campaign_id}"
+    branch_b = f"specode-review-e2e/{campaign_id}/checkpoint-b"
+    branch_c = f"specode-review-e2e/{campaign_id}/checkpoint-c"
+    title_b = f"[{campaign_id}] SpeCodeReview checkpoint B fixture"
+    title_c = f"[{campaign_id}] SpeCodeReview checkpoint C fixture"
+    instruction_marker = f"specode-review-e2e-instruction-{campaign_id}"
+    configuration_marker = f"specode-review-e2e-config-{campaign_id}"
     created_resources: list[CreatedFixtureReference] = []
 
     _perform_fixture_operation(
@@ -745,7 +745,7 @@ def prepare_campaign_fixtures(
         plan=_FixturePlan(
             branch=branch_b,
             title=title_b,
-            body="Disposable Review Agent real E2E checkpoint B fixture.",
+            body="Disposable SpeCodeReview real E2E checkpoint B fixture.",
             commit_message=f"Prepare {campaign_id} checkpoint B fixture",
             files=_checkpoint_b_files(campaign_id),
             push_stage=FixturePreparationStage.CHECKPOINT_B_PUSH,
@@ -758,7 +758,7 @@ def prepare_campaign_fixtures(
         plan=_FixturePlan(
             branch=branch_c,
             title=title_c,
-            body="Disposable Review Agent real E2E checkpoint C fixture.",
+            body="Disposable SpeCodeReview real E2E checkpoint C fixture.",
             commit_message=f"Prepare {campaign_id} checkpoint C fixture",
             files=_checkpoint_c_files(
                 campaign_id,

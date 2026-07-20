@@ -117,7 +117,7 @@ github_webhook_url() {
 import os
 from pathlib import Path
 
-from review_agent.github import GitHubAppClient
+from specode_review.github import GitHubAppClient
 
 github = GitHubAppClient(
     repository="unused/unused",
@@ -212,7 +212,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 printf 'Starting review service...\n'
-uv run review-agent &
+uv run specode-review &
 SERVICE_PID=$!
 
 if ! wait_for_url "${LOCAL_HEALTH_URL}" "${SERVICE_PID}" 60 "review service"; then
@@ -247,7 +247,7 @@ if ! wait_for_github_webhook_url "${EXPECTED_WEBHOOK_URL}"; then
     exit 1
 fi
 
-printf '\nReview Agent is ready.\n'
+printf '\nSpeCodeReview is ready.\n'
 printf 'Webhook URL: %s\n' "${EXPECTED_WEBHOOK_URL}"
 if [[ -z "${REQUESTED_NGROK_URL}" ]]; then
     printf 'Ensure the GitHub App webhook URL matches the free dev-domain URL shown above.\n'

@@ -5,23 +5,23 @@ from pathlib import Path
 
 import pytest
 
-from review_agent import (
+from specode_review import (
     PreflightOutcome,
     PublicationDisposition,
     ReviewCompletion,
     ReviewResourceManager,
     ReviewRunner,
 )
-from review_agent.core import CandidateContract, ReviewContext
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.github import (
+from specode_review.core import CandidateContract, ReviewContext
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.github import (
     GitHubError,
     GitHubMutationError,
     GitHubOperation,
     ReviewComment,
     ReviewCommentApp,
 )
-from review_agent.models import ReviewRequest
+from specode_review.models import ReviewRequest
 
 
 def _request(**updates: object) -> ReviewRequest:
@@ -435,7 +435,7 @@ def test_run_emits_cleanup_and_publication_evidence(
         candidate_adapter_factory=lambda _resources: CleanCandidateAdapter(),
         source_repository=source,
     )
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     runner.run(
         _request(base_sha=base_sha, head_sha=head_sha),
@@ -445,7 +445,7 @@ def test_run_emits_cleanup_and_publication_evidence(
     records = [
         json.loads(record.getMessage())
         for record in caplog.records
-        if record.name == "review_agent.lifecycle_evidence"
+        if record.name == "specode_review.lifecycle_evidence"
     ]
     assert records == [
         {
@@ -484,7 +484,7 @@ def test_run_failure_force_cleans_and_publishes_nothing(
         candidate_adapter_factory=lambda _resources: FailingCandidateAdapter(),
         source_repository=source,
     )
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     with pytest.raises(ReviewError) as failure:
         runner.run(
@@ -503,7 +503,7 @@ def test_run_failure_force_cleans_and_publishes_nothing(
     records = [
         json.loads(record.getMessage())
         for record in caplog.records
-        if record.name == "review_agent.lifecycle_evidence"
+        if record.name == "specode_review.lifecycle_evidence"
     ]
     assert records[0]["cleanup_outcome"] == "confirmed"
     assert records[1]["publication_disposition"] == "suppressed"
@@ -528,7 +528,7 @@ def test_cleanup_failure_suppresses_publication_and_is_normalized(
         candidate_adapter_factory=lambda _resources: CleanCandidateAdapter(),
         source_repository=source,
     )
-    caplog.set_level(logging.INFO, logger="review_agent.lifecycle_evidence")
+    caplog.set_level(logging.INFO, logger="specode_review.lifecycle_evidence")
 
     with pytest.raises(ReviewError) as failure:
         runner.run(
@@ -547,7 +547,7 @@ def test_cleanup_failure_suppresses_publication_and_is_normalized(
     records = [
         json.loads(record.getMessage())
         for record in caplog.records
-        if record.name == "review_agent.lifecycle_evidence"
+        if record.name == "specode_review.lifecycle_evidence"
     ]
     assert [record["event"] for record in records] == ["cleanup", "publication"]
     assert records[0]["cleanup_outcome"] == "failed"

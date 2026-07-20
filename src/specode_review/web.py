@@ -9,8 +9,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from review_agent.models import ReviewRequest, bound_description
-from review_agent.submission import ReviewSubmissionLifecycle, SubmissionOutcome
+from specode_review.models import ReviewRequest, bound_description
+from specode_review.submission import ReviewSubmissionLifecycle, SubmissionOutcome
 
 _MAX_WEBHOOK_BODY_BYTES = 256 * 1024
 _SUPPORTED_PULL_REQUEST_ACTIONS = frozenset(

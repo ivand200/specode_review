@@ -1,4 +1,4 @@
-# Review Agent Control Workspace
+# SpeCodeReview Control Workspace
 
 This workspace is owned by the review service. Use only its `request.json`, output schema,
 trusted skills, references, and tools to control the review.

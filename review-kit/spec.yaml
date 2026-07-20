@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: mixin
-name: review-agent-code-review-v0-1
-displayName: Review Agent Code Review V0.1
+name: specode-review-code-review-v0-1
+displayName: SpeCodeReview Code Review V0.1
 description: Trusted fixed-diff review policy and tooling for the review service
 
 caps:

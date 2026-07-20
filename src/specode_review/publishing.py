@@ -7,16 +7,16 @@ from unicodedata import category
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from review_agent.deadline import remaining_review_time
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.github import (
+from specode_review.deadline import remaining_review_time
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.github import (
     GitHubError,
     GitHubMutationError,
     ReviewComment,
     ReviewCommentGateway,
     derive_review_identity,
 )
-from review_agent.models import ReviewRequest, ReviewResult
+from specode_review.models import ReviewRequest, ReviewResult
 
 GITHUB_COMMENT_MAX_BYTES = 65_536
 PUBLICATION_RECHECK_DELAYS_SECONDS = (0.0, 0.25, 1.0)

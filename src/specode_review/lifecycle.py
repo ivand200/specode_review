@@ -7,14 +7,14 @@ from enum import Enum, auto
 from types import TracebackType
 from typing import Protocol, Self
 
-from review_agent.github import ReviewIdentity, derive_review_identity
-from review_agent.lifecycle_evidence import (
+from specode_review.github import ReviewIdentity, derive_review_identity
+from specode_review.lifecycle_evidence import (
     emit_lifecycle_evidence,
     emit_normalized_failure,
 )
-from review_agent.models import ReviewRequest
-from review_agent.review_runner import PreflightOutcome, ReviewCompletion
-from review_agent.submission import SubmissionOutcome
+from specode_review.models import ReviewRequest
+from specode_review.review_runner import PreflightOutcome, ReviewCompletion
+from specode_review.submission import SubmissionOutcome
 
 DEFAULT_MAX_CONCURRENT_REVIEWS = 3
 MIN_CONCURRENT_REVIEWS = 1

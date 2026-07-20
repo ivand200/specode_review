@@ -4,13 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from review_agent.configuration import (
+from specode_review.configuration import (
     ConfigurationError,
     ProductionPaths,
     ProductionServiceSettings,
     ReasoningEffort,
 )
-from review_agent.readiness import ProductionReadiness, StartupReadinessError
+from specode_review.readiness import ProductionReadiness, StartupReadinessError
 
 
 def _paths(tmp_path: Path) -> ProductionPaths:

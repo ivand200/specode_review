@@ -1,15 +1,15 @@
-from review_agent.configuration import ReviewLimits, SandboxResourceLimits
-from review_agent.core import (
+from specode_review.configuration import ReviewLimits, SandboxResourceLimits
+from specode_review.core import (
     CandidateAcceptance,
     ChangedPathManifest,
     GitHubRepository,
     ReviewContext,
     Reviewer,
 )
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.github import GitHubAppClient, GitHubError
-from review_agent.lifecycle import ReviewLifecycle
-from review_agent.models import (
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.github import GitHubAppClient, GitHubError
+from specode_review.lifecycle import ReviewLifecycle
+from specode_review.models import (
     AgentReview,
     DiffRange,
     Finding,
@@ -17,15 +17,15 @@ from review_agent.models import (
     ReviewRequest,
     ReviewResult,
 )
-from review_agent.publishing import (
+from specode_review.publishing import (
     PublicationConsistencyError,
     PublicationDisposition,
     PublicationReceipt,
     publish_review_result,
     render_review_comment,
 )
-from review_agent.resources import AttemptResources, ReviewResourceManager
-from review_agent.review_runner import PreflightOutcome, ReviewCompletion, ReviewRunner
+from specode_review.resources import AttemptResources, ReviewResourceManager
+from specode_review.review_runner import PreflightOutcome, ReviewCompletion, ReviewRunner
 
 __all__ = [
     "AgentReview",

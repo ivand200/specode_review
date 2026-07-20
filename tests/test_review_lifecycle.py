@@ -5,11 +5,11 @@ from collections.abc import Callable
 
 import pytest
 
-from review_agent import ReviewLifecycle
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import ReviewRequest
-from review_agent.review_runner import PreflightOutcome
-from review_agent.submission import SubmissionOutcome
+from specode_review import ReviewLifecycle
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import ReviewRequest
+from specode_review.review_runner import PreflightOutcome
+from specode_review.submission import SubmissionOutcome
 
 
 def _request(**updates: object) -> ReviewRequest:

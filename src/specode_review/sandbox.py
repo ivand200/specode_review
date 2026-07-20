@@ -9,27 +9,27 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from pydantic import ValidationError
 
-from review_agent.configuration import (
+from specode_review.configuration import (
     CodexExecutionPolicy,
     SandboxOperationPolicy,
     SandboxResourceLimits,
 )
-from review_agent.core import CandidateContract, ReviewContext
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import AgentReview
-from review_agent.process import (
+from specode_review.core import CandidateContract, ReviewContext
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import AgentReview
+from specode_review.process import (
     ProcessOptions,
     ProcessOutputLimitError,
     ProcessRunner,
     _run_bounded_process,
 )
-from review_agent.resources import AttemptResources
+from specode_review.resources import AttemptResources
 
 _SANDBOX_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{2,30}-[0-9a-f]{32}$")
 _VM_CHECKOUT = "/home/agent/review/repo"
-_CODEX_PROVIDER = "review_agent_openai_https"
+_CODEX_PROVIDER = "specode_review_openai_https"
 _CODEX_PROVIDER_CONFIG = (
-    '{ name="Review Agent OpenAI HTTPS", base_url="https://api.openai.com/v1", '
+    '{ name="SpeCodeReview OpenAI HTTPS", base_url="https://api.openai.com/v1", '
     'wire_api="responses", requires_openai_auth=true, supports_websockets=false }'
 )
 _CODEX_PROMPT = (
@@ -262,8 +262,8 @@ class _SandboxLifecycle:
             (
                 "sh",
                 "-c",
-                'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
-                "review-agent-read-only-check",
+                'if touch "$1/.specode-review-write-probe"; then exit 73; fi',
+                "specode-review-read-only-check",
                 str(context.checkout),
             ),
         )

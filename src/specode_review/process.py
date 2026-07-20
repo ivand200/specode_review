@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
-from review_agent.deadline import remaining_review_time
+from specode_review.deadline import remaining_review_time
 
 
 class ProcessOutputLimitError(Exception):

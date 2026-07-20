@@ -8,16 +8,16 @@ from pathlib import Path
 import httpx
 import pytest
 
-from review_agent.configuration import (
+from specode_review.configuration import (
     CodexExecutionPolicy,
     ProductionPaths,
     ProductionServiceSettings,
     ReasoningEffort,
 )
-from review_agent.models import ReviewRequest
-from review_agent.production import create_production_app
-from review_agent.readiness import StartupReadinessError
-from review_agent.review_runner import PreflightOutcome
+from specode_review.models import ReviewRequest
+from specode_review.production import create_production_app
+from specode_review.readiness import StartupReadinessError
+from specode_review.review_runner import PreflightOutcome
 
 
 class SimulatedCleanupError(RuntimeError):
@@ -66,10 +66,10 @@ class RecordingSandboxResources:
 
     def list_names(self) -> tuple[str, ...]:
         self._events.append("sandbox_list")
-        return ("review-agent-" + "f" * 32, "foreign-" + "e" * 32)
+        return ("specode-review-" + "f" * 32, "foreign-" + "e" * 32)
 
     def remove(self, name: str) -> None:
-        assert name == "review-agent-" + "f" * 32
+        assert name == "specode-review-" + "f" * 32
         self._events.append("sandbox_remove")
         if self._fail_remove:
             raise SimulatedCleanupError

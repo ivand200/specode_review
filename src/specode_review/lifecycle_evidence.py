@@ -3,8 +3,8 @@ import logging
 import re
 from typing import Any
 
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.models import ReviewRequest
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.models import ReviewRequest
 
 logger = logging.getLogger(__name__)
 

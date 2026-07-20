@@ -2,7 +2,7 @@ from enum import Enum, auto
 from types import TracebackType
 from typing import Protocol, Self
 
-from review_agent.models import ReviewRequest
+from specode_review.models import ReviewRequest
 
 
 class SubmissionOutcome(Enum):

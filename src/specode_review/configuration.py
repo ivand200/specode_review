@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import urlsplit
 
-DEFAULT_SANDBOX_NAME_PREFIX = "review-agent-"
+DEFAULT_SANDBOX_NAME_PREFIX = "specode-review-"
 DEFAULT_SANDBOX_CLEANUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_REVIEW_TIMEOUT_SECONDS = 15 * 60
 CANDIDATE_OUTPUT_MAX_BYTES = 65_536
@@ -177,9 +177,9 @@ class AttemptSettings:
 class ProductionPaths:
     """Application-owned filesystem contract, not operator configuration."""
 
-    private_key_path: Path = Path("/opt/review-agent/.secrets/github-app.pem")
-    review_kit_path: Path = Path("/opt/review-agent/review-kit")
-    workspace_root: Path = Path("/var/lib/review-agent/workspaces")
+    private_key_path: Path = Path("/opt/specode-review/.secrets/github-app.pem")
+    review_kit_path: Path = Path("/opt/specode-review/review-kit")
+    workspace_root: Path = Path("/var/lib/specode-review/workspaces")
     sandbox_name_prefix: str = DEFAULT_SANDBOX_NAME_PREFIX
 
     def __post_init__(self) -> None:
