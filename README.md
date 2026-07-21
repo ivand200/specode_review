@@ -1,75 +1,68 @@
 <p align="center">
-  <img src="./logo.png" alt="SpeCodeReview" width="760">
+  <img src="./logo.png" alt="SpeCodeReview" width="560">
 </p>
 
-# SpeCodeReview v0.1.0
+<p align="center">
+  <a href="https://github.com/ivand200/specode_review/actions/workflows/ci.yml"><img src="https://github.com/ivand200/specode_review/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+</p>
 
-[![CI](https://github.com/ivand200/specode_review/actions/workflows/ci.yml/badge.svg)](https://github.com/ivand200/specode_review/actions/workflows/ci.yml)
+# SpeCodeReview
 
-SpeCodeReview is a security-focused GitHub App that reviews the exact commit accepted from a
-signed pull-request webhook. It runs Codex in a disposable Docker Sandbox, validates and grounds
-the result, then publishes one revision-bound pull-request comment.
+SpeCodeReview is a code review agent prototype for GitHub pull requests. It runs Codex in an
+isolated sandbox, validates findings against changed code, and publishes a review tied to the exact
+commit.
 
-This is a production-oriented prototype with a deliberately narrow deployment model: one process,
-one GitHub App, and one dedicated host or VM. It serves every repository authorized for that App.
-The product and GitHub App are **SpeCodeReview**, the Python package and logger namespace are
-`specode_review`, and installed commands and owned runtime resources use `specode-review`.
+<!--
+Replace this comment with a tightly cropped screenshot of a real review comment:
+
+![SpeCodeReview finding issues in a pull request](docs/assets/review-example.png)
+-->
 
 ## Why it exists
 
-Automated review becomes risky when a moving branch, untrusted repository instructions, leaked
-credentials, or a half-completed GitHub write can change what was reviewed or reported.
-SpeCodeReview makes those failure modes explicit and bounded:
+AI-assisted review becomes unreliable when the code moves during a review, repository content can
+change the agent's instructions, or a plausible finding refers to code that was never changed.
+SpeCodeReview keeps that boundary deliberately narrow:
 
-- Every attempt is bound to an immutable repository, pull request, base SHA, and head SHA.
-- Repository code, PR text, and repository-provided agent configuration are treated as untrusted.
-- Codex runs in a disposable microVM with restricted network access.
-- GitHub credentials stay on the host; only the outer application can publish.
-- Candidate JSON, file paths, changed locations, process output, and runtime are validated and
-  bounded.
-- Cleanup must complete before the final comment can be published.
+- every attempt is bound to an immutable base and head commit;
+- repository code, PR text, and repository-provided agent configuration are untrusted input;
+- Codex runs in a disposable Docker Sandbox without GitHub credentials;
+- every reported path and line is validated against the accepted diff;
+- cleanup completes before one revision-bound comment is published.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    GH[GitHub<br>signed webhook] --> A[Admission<br>exact revision identity]
-    A --> P[In-process lifecycle<br>bounded capacity]
-    P --> R[Synchronous review transaction]
-    R --> S[Disposable Docker Sandbox<br>Codex + fixed diff]
-    S --> V[Schema validation<br>filesystem grounding]
+    GH[GitHub<br>signed webhook] --> A[Admission<br>exact revision]
+    A --> L[Bounded<br>review lifecycle]
+    L --> S[Disposable Sandbox<br>Codex + fixed diff]
+    S --> V[Schema validation<br>diff grounding]
     V --> GH
 ```
 
-The host materializes and verifies the accepted head commit, computes a bounded merge-base diff,
-and gives the sandbox a disposable copy. The model returns a schema-constrained candidate; the
-application verifies that every finding refers to changed repository content before rendering the
-final comment.
+The host verifies the webhook and accepted revision, materializes a bounded merge-base diff, and
+gives the sandbox a disposable workspace. The model returns a schema-constrained candidate; the
+host validates and grounds it before publishing. Redelivery of an active or completed revision
+does not repeat work, and the service rejects new work when its bounded capacity is full.
 
-The exact-revision application-owned comment is the duplicate source. A redelivery for an active
-or completed identity does not repeat work. There is intentionally no waiting queue: the service
-starts up to
-`MAX_CONCURRENT_REVIEWS` attempts and rejects distinct work at capacity.
+## Design decisions
 
-## Key engineering decisions
-
-| Decision | Failure mode addressed |
+| Decision | What it prevents |
 |---|---|
 | Bind work to accepted base and head SHAs | Reviewing a moving branch or reporting against the wrong revision |
 | Keep GitHub credentials outside the sandbox | Untrusted code or model tools publishing directly |
-| Own one exact-revision comment | Duplicate comments across webhook redelivery |
-| Cleanup before publication | A developer seeing a result from an incompletely isolated transaction |
-| Use one process and host-wide capacity limit | Queues and hidden per-repository reservations |
+| Ground every finding against the accepted diff | Hallucinated files, locations, or unchanged code |
+| Clean up before idempotent publication | Duplicate or visible results from an incomplete transaction |
 
-## Quick start
+## Run the complete app locally
 
-### Prerequisites
+### 1. Install prerequisites
 
-- Python 3.12 or later and [`uv`](https://docs.astral.sh/uv/)
-- Git, curl, Node.js/npm, and [ngrok](https://ngrok.com/) for local webhook delivery
-- A host supported by
-  [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/get-started/)
-- `sbx 0.35.0` and `Codex CLI 0.144.6` (enforced at startup)
+You need Python 3.12+, [`uv`](https://docs.astral.sh/uv/), Git, curl, Node.js/npm,
+[ngrok](https://ngrok.com/), and a host supported by
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/get-started/). The service currently pins
+`sbx 0.35.0` and Codex CLI `0.144.6`.
 
 On supported macOS hosts:
 
@@ -78,39 +71,21 @@ brew trust docker/tap
 brew install docker/tap/sbx
 sbx login
 npm install --global @openai/codex@0.144.6
-```
-
-On a headless host, sign in without a browser using a Docker Personal Access Token with at least
-Read scope. Run this as the same OS user that runs SpeCodeReview:
-
-```bash
-printf '%s' "$DOCKER_PAT" | sbx login --username <your-docker-id> --password-stdin
-```
-
-Store the OpenAI credential in the Docker Sandboxes host-managed credential proxy. For OAuth:
-
-```bash
 sbx secret set -g openai --oauth
 ```
 
-For an API key, use `sbx secret set -g openai` or import `OPENAI_API_KEY` with
-`sbx secret import openai --force`, then remove it from the application environment. The
-credential proxy supplies it to trusted model transport without exposing the real value inside
-the sandbox.
+### 2. Create the GitHub App
 
-### Configure the GitHub App
-
-Install the GitHub App on every repository the service should review:
+Configure a private GitHub App with:
 
 - **Contents:** read-only
 - **Pull requests:** read and write
-- Event: **Pull request**
-- Webhook URL: `https://<public-host>/webhooks/github`
+- **Event:** pull request
 
-Use the same webhook secret for the App and `GITHUB_WEBHOOK_SECRET`. Keep the App private key on
-the host.
+Generate a private key and install the App on each repository it should review. The local launcher
+will display the exact webhook URL after ngrok starts and wait for you to set it in the App.
 
-### Configure and run
+### 3. Configure the project
 
 ```bash
 uv sync --locked
@@ -118,136 +93,29 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` with the App identity and secret, complete stable HTTPS webhook URL, model policy, and
-optional ingress values. Production paths and runtime limits are fixed by the application and
-documented in `.env.example`.
+Set the GitHub App ID, webhook secret, absolute private-key path, and model policy in `.env`. Keep
+the OpenAI credential in the Docker Sandboxes credential proxy, not in `.env`.
 
-`MAX_CONCURRENT_REVIEWS` defaults to `3` and accepts only `1` through `5`. Size it from measured
-host behavior.
-
-Load the environment and start the loopback service:
+### 4. Start the app
 
 ```bash
-set -a
-source .env
-set +a
-uv run specode-review
-```
-
-Health probes are available at `/health/live` and `/health/ready`.
-
-For local ngrok development, use the launcher instead. It starts ngrok first, discovers its HTTPS
-URL, exports the matching `PUBLIC_WEBHOOK_URL`, starts SpeCodeReview, and displays both GitHub's
-currently configured webhook URL and the expected URL until they match:
-
-```bash
-# In .env, point this at the downloaded GitHub App private key:
-# GITHUB_PRIVATE_KEY_PATH=/absolute/path/to/github-app.private-key.pem
 ./scripts/run-local.sh
 ```
 
+The launcher starts ngrok and SpeCodeReview, prints the expected GitHub webhook URL, and waits until
+the App configuration matches. Readiness is available at `http://127.0.0.1:8000/health/ready`.
 Pass a reserved ngrok origin when available:
 
 ```bash
 ./scripts/run-local.sh https://your-domain.ngrok.app
 ```
 
-Direct `uv run specode-review` startup does not create ingress and therefore requires
-`PUBLIC_WEBHOOK_URL=https://<public-host>/webhooks/github` to already be present in the environment.
+Open or update a non-draft pull request to trigger a review. Add the `no-review` label when a pull
+request should be skipped.
 
-## Production installation
+## Development
 
-The supported production target is a native Ubuntu host running `systemd`. Clone the repository
-at `/opt/specode-review`, fetch the release tags, and detach at the exact supported tag:
-
-```bash
-sudo git clone <repository-url> /opt/specode-review
-sudo git -C /opt/specode-review fetch --tags
-sudo git -C /opt/specode-review checkout --detach v0.1.0
-```
-
-Install `uv`, Git, curl, `runuser`, `systemd`, `sbx 0.35.0`, and Codex CLI `0.144.6` in the system
-`PATH`. Managed reserved-ngrok ingress additionally requires ngrok `3.39.1`. Configure Docker
-Sandboxes for the dedicated service identity; model credentials must use its host-managed
-credential store and must not be placed in `.env`:
-
-```bash
-sudo -u specode-review env -i \
-  HOME=/var/lib/specode-review \
-  PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin \
-  sbx secret set -g openai --oauth
-```
-
-On a first installation the installer creates the `specode-review` identity. If it is not yet
-present when configuring the credential, run the installer once to provision managed host state,
-configure the credential with the command above, and rerun the same installer command.
-
-Create `/opt/specode-review/.env` from `.env.example` and place the unencrypted RSA GitHub App key
-at `/opt/specode-review/.secrets/github-app.pem`. Then install or repair the selected release:
-
-```bash
-cd /opt/specode-review
-sudo ./scripts/install.sh --release v0.1.0
-```
-
-The installer rejects branches, commits that are not exactly tagged, unsupported tags, malformed
-or placeholder configuration, model credentials in the application environment, unsafe secret
-files, and unpinned host tools. It converges the non-login service user and restrictive managed
-paths, installs the locked non-development environment with `uv`, runs a disposable no-model
-Sandbox capability probe, writes `specode-review.service`, and enables and starts it. When
-`NGROK_URL` and `NGROK_AUTHTOKEN` are set, their reserved HTTPS origin must match
-`PUBLIC_WEBHOOK_URL`; the installer also writes and starts the separate
-`specode-review-ngrok.service`.
-
-After startup, installation waits up to ten minutes for the GitHub App webhook URL to match
-`PUBLIC_WEBHOOK_URL` and otherwise leaves both supervised units running with manual correction
-instructions. It never mutates GitHub App configuration.
-
-The unit listens through the application's fixed `127.0.0.1:8000` bind, logs to `journald`,
-restarts after failures no more than five times in five minutes, and allows up to twenty minutes
-for graceful shutdown:
-
-```bash
-sudo systemctl status specode-review
-sudo journalctl -u specode-review --since today
-sudo systemctl restart specode-review
-# Managed ngrok mode:
-sudo systemctl status specode-review-ngrok
-sudo journalctl -u specode-review-ngrok --since today
-```
-
-Upgrade and rollback use the same operation after checking out another exact supported release
-tag. The installer never runs `git clean`, deletes foreign Docker Sandboxes, or changes GitHub App
-configuration.
-
-## Review lifecycle
-
-The service admits non-draft `opened`, `synchronize`, `ready_for_review`, and `reopened` pull
-requests unless they carry the `no-review` label. Preflight proves App access and exact-revision
-idempotency before capacity is consumed. Accepted work runs one cleanup-before-publication
-transaction. A clean review and a review with findings both publish one top-level comment;
-technical failures are visible only in safe structured operator logs.
-
-## Installation verification
-
-Repeat the production verifier after installation, upgrade, rollback, or repair:
-
-```bash
-sudo ./scripts/verify-install.sh
-```
-
-It checks required units, local and public health, the configured GitHub App identity and webhook
-URL, pinned host tools, and the trusted review kit. It then creates, limits, mounts, executes,
-inspects, lists, and force-removes one network-denied temporary Sandbox and confirms that no
-SpeCodeReview-owned Sandbox or workspace remains. Output contains only bounded pass/fail evidence.
-The verifier never invokes Codex, spends model tokens, or publishes a GitHub review.
-
-Run verification while the service is otherwise idle so an active bounded review is not mistaken
-for a stale owned resource.
-
-## Development verification
-
-The default suite is network-free:
+The default verification suite is network-free:
 
 ```bash
 uv run ruff check .
@@ -255,89 +123,17 @@ uv run mypy
 uv run pytest
 ```
 
-Packaging is part of the release gate:
+## Current limitations
 
-```bash
-uv run pytest tests/test_packaging.py -q
-```
+- One application process on one dedicated host; multi-host coordination is not supported.
+- No durable queue or workflow state; distinct work is rejected when capacity is full.
+- Execution depends on Docker Sandboxes and its host-managed credential proxy.
 
-The network-free suite includes the no-model Sandbox probe contract.
+## Documentation
 
-## Signed production release campaign
+- [Production deployment and operations](docs/deployment.md)
+- [Signed end-to-end release validation](docs/release-validation.md)
+- [Configuration reference](.env.example)
 
-Run this cost-bearing gate only against a dedicated repository whose name contains `test`.
-Complete the network-free and packaging gates above, install the exact release, run
-`scripts/verify-install.sh`, and keep the service otherwise idle. The GitHub App must be installed
-on the test repository with the documented permissions and its configured webhook URL must equal
-`PUBLIC_WEBHOOK_URL`. The invoking operator also needs `gh` authentication with permission to
-close and reopen the fixture pull request.
-
-Prepare one fresh, open, non-draft pull request without the `no-review` label. Its accepted revision
-must add an obvious stable defect on a changed line, such as rejecting age 18 with
-`return age > 18`. Include distinct hostile repository-instruction and tool-configuration markers
-to prove they do not override application policy. Record the exact base SHA, head SHA, changed path,
-and changed line before running:
-
-```bash
-gh pr view 42 --repo example-org/specode-review-test \
-  --json baseRefOid,headRefOid,files
-```
-
-Run the separately installed command as an operator able to read the system journal and fixed
-workspace directory. If privilege elevation is needed, preserve a narrowly scoped `GH_TOKEN` for
-the `gh` close/reopen operations:
-
-```bash
-sudo --preserve-env=GH_TOKEN \
-  /opt/specode-review/.venv/bin/specode-review-real-e2e \
-  --repository example-org/specode-review-test \
-  --pr-number 42 \
-  --base-sha <40-character-base-sha> \
-  --head-sha <40-character-head-sha> \
-  --expected-finding "age 18" \
-  --expected-path campaign-fixtures/release/adult_age.py \
-  --expected-line 4 \
-  --forbid-repository-text specode-review-e2e-instruction-release \
-  --forbid-repository-text specode-review-e2e-config-release \
-  --forbid-log-text "return age > 18"
-```
-
-The command first requires a ready installed service, the configured public ngrok health endpoint,
-a matching GitHub App webhook URL, a fresh exact revision, and zero owned resources. It closes and
-reopens the PR: `closed` is ineligible, while GitHub delivers the one eligible signed `reopened`
-event through the normal public webhook. It then waits up to 21 minutes for exactly one
-SpeCodeReview-owned exact-revision comment. Success requires the expected finding at the exact
-changed path and line with `blocking` or `important` severity, no hostile marker, correlated safe
-admission/cleanup/publication/terminal journal evidence, and zero owned Sandboxes and workspaces.
-Output is one bounded JSON result containing only the pass state, comment ID, and attempt ID.
-
-The campaign intentionally leaves the review comment, PR, and branch for human inspection. After
-reviewing the evidence, manually delete the campaign comment if desired, close the PR, and delete
-its fixture branch. If interrupted after the close operation, reopen the PR manually before
-deciding whether to rerun at a fresh revision. On any failure, inspect only bounded lifecycle
-records with:
-
-```bash
-sudo journalctl -u specode-review --since today -o cat
-sudo -u specode-review sbx ls --quiet
-sudo find /var/lib/specode-review/workspaces -mindepth 1 -maxdepth 1 -print
-```
-
-Do not accept a missing, duplicate, wrong-revision, ungrounded, semantically missed, timed-out,
-technically failed, redaction-failed, or resource-unclean result. Prepare a fresh revision before
-rerunning because an accepted exact-revision comment is deliberately idempotent.
-
-## Operational constraints
-
-- Run exactly one application process on one host. Multiple hosts serving the same repository are
-  unsupported.
-- There is no durable workflow state, retry queue, or per-repository capacity reservation.
-- On shutdown, readiness and admission close before already accepted bounded reviews are drained.
-- The project intentionally has no production Dockerfile: the orchestrator must run on a supported
-  Docker Sandboxes host with its microVM and credential-proxy guarantees.
-
-## Project status and license
-
-SpeCodeReview is a v0.1.0 production-oriented prototype intended to demonstrate exact-revision
-review, explicit trust boundaries, and failure-aware GitHub integration. No license file is
-currently provided.
+SpeCodeReview is a prototype maintained by Ivan. Feedback and design discussion are welcome through
+GitHub Issues. Licensed under the [MIT License](LICENSE).
