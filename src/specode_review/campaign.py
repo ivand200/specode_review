@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.configuration import ProductionServiceSettings
 from specode_review.github import GitHubAppClient, ReviewCommentGateway
 from specode_review.live import (
@@ -20,7 +21,7 @@ from specode_review.live import (
     require_fresh_live_review,
     verify_live_review_evidence,
 )
-from specode_review.models import AcceptedRevision, RepositoryName, ReviewRequest, Sha
+from specode_review.models import RepositoryName, ReviewRequest, Sha
 from specode_review.publishing import owned_revision_comments
 
 _SERVICE_UNIT = "specode-review.service"
@@ -159,6 +160,7 @@ def _matching_lifecycle_records(
     request: ReviewRequest,
     forbidden_texts: tuple[str, ...],
 ) -> tuple[dict[str, object], ...]:
+    revision = AcceptedRevision.from_review_request(request)
     rendered = "\n".join(lines)
     if len(rendered.encode()) > _MAX_JOURNAL_BYTES:
         _fail("log_evidence")
@@ -175,9 +177,9 @@ def _matching_lifecycle_records(
             continue
         if (
             isinstance(candidate, dict)
-            and candidate.get("repository") == request.repository.lower()
-            and candidate.get("pull_request") == request.pr_number
-            and candidate.get("accepted_revision") == request.head_sha.lower()
+            and candidate.get("repository") == revision.repository
+            and candidate.get("pull_request") == revision.pr_number
+            and candidate.get("accepted_revision") == revision.head_sha
         ):
             records.append(candidate)
     return tuple(records)

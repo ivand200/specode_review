@@ -88,7 +88,14 @@ def test_ready_identity_is_scheduled_and_context_exit_drains_it() -> None:
     asyncio.run(exercise())
 
 
-def test_duplicate_identity_collapses_during_preflight_and_running() -> None:
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("base_sha", "c" * 40), ("head_sha", "d" * 40)],
+)
+def test_duplicate_identity_collapses_but_changed_range_runs(
+    changed_field: str,
+    changed_value: str,
+) -> None:
     async def exercise() -> None:
         runner = ControlledRunner()
         runner.release_preflight.clear()
@@ -103,7 +110,11 @@ def test_duplicate_identity_collapses_during_preflight_and_running() -> None:
                     request.model_copy(
                         update={
                             "repository": "OCTO-ORG/EXAMPLE",
+                            "base_sha": "A" * 40,
+                            "head_sha": "B" * 40,
                             "installation_id": 99,
+                            "title": "Changed title",
+                            "description": "Changed description",
                         }
                     )
                 )
@@ -114,10 +125,17 @@ def test_duplicate_identity_collapses_during_preflight_and_running() -> None:
             assert await first is SubmissionOutcome.ACCEPTED
             assert await asyncio.to_thread(runner.run_started.wait, 5)
             assert await lifecycle.submit(request) is SubmissionOutcome.ALREADY_RUNNING
+            assert (
+                await lifecycle.submit(
+                    request.model_copy(update={changed_field: changed_value})
+                )
+                is SubmissionOutcome.ACCEPTED
+            )
+            await _wait_until(lambda: len(runner.runs) == 2)
             runner.release_run.set()
 
-        assert len(runner.preflights) == 1
-        assert len(runner.runs) == 1
+        assert len(runner.preflights) == 2
+        assert len(runner.runs) == 2
 
     asyncio.run(exercise())
 

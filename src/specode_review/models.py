@@ -51,15 +51,6 @@ class ReviewRequest(BaseModel):
         return bound_description(value)
 
 
-class AcceptedRevision(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    repository: RepositoryName
-    pr_number: int = Field(gt=0)
-    base_sha: Sha
-    head_sha: Sha
-
-
 class DiffRange(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

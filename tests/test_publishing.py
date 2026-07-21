@@ -2,6 +2,7 @@ from collections.abc import Callable
 
 import pytest
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.github import (
     GitHubError,
     GitHubMutationError,
@@ -274,10 +275,7 @@ def _findings_result() -> ReviewResult:
 
 
 def _expected_body(result: ReviewResult | None = None) -> str:
-    marker = (
-        "<!-- specode-review:v1:"
-        "b3fdc634e74cf30721e4dc24158636348334fa1c133b44a74eb401e89db2119f -->"
-    )
+    marker = f"<!-- {AcceptedRevision.from_review_request(_request()).external_id} -->"
     return f"{render_review_comment(result or _result())}\n{marker}\n"
 
 

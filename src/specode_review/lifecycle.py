@@ -7,7 +7,7 @@ from enum import Enum, auto
 from types import TracebackType
 from typing import Protocol, Self
 
-from specode_review.github import ReviewIdentity, derive_review_identity
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.lifecycle_evidence import (
     emit_lifecycle_evidence,
     emit_normalized_failure,
@@ -64,7 +64,7 @@ class ReviewLifecycle:
         self._max_concurrent_reviews = max_concurrent_reviews
         self._attempt_id_factory = attempt_id_factory or _new_attempt_id
         self._state = _LifecycleState.CREATED
-        self._claims: dict[ReviewIdentity, _ClaimPhase] = {}
+        self._claims: dict[AcceptedRevision, _ClaimPhase] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._condition = asyncio.Condition()
 
@@ -89,7 +89,7 @@ class ReviewLifecycle:
             self._state = _LifecycleState.STOPPED
 
     async def submit(self, request: ReviewRequest) -> SubmissionOutcome:
-        identity = derive_review_identity(request)
+        identity = AcceptedRevision.from_review_request(request)
         immediate_outcome: SubmissionOutcome | None = None
         async with self._condition:
             if self._state is not _LifecycleState.ACCEPTING:
@@ -111,7 +111,7 @@ class ReviewLifecycle:
     async def _submit_claimed(  # noqa: PLR0911 - specified admission dispositions.
         self,
         request: ReviewRequest,
-        identity: ReviewIdentity,
+        identity: AcceptedRevision,
     ) -> SubmissionOutcome:
         preflight_started = time.monotonic()
         preflight = await self._preflight(request, identity)
@@ -190,7 +190,7 @@ class ReviewLifecycle:
     async def _preflight(
         self,
         request: ReviewRequest,
-        identity: ReviewIdentity,
+        identity: AcceptedRevision,
     ) -> PreflightOutcome | SubmissionOutcome:
         preflight_task = asyncio.create_task(
             asyncio.to_thread(self._runner.preflight, request)
@@ -212,7 +212,7 @@ class ReviewLifecycle:
 
     async def _run(
         self,
-        identity: ReviewIdentity,
+        identity: AcceptedRevision,
         request: ReviewRequest,
         attempt_id: str,
     ) -> None:
@@ -245,7 +245,7 @@ class ReviewLifecycle:
                 **terminal_facts,
             )
 
-    async def _release_claim(self, identity: ReviewIdentity) -> None:
+    async def _release_claim(self, identity: AcceptedRevision) -> None:
         async with self._condition:
             self._claims.pop(identity, None)
             self._condition.notify_all()

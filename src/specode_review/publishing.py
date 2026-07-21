@@ -7,6 +7,7 @@ from unicodedata import category
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.deadline import remaining_review_time
 from specode_review.errors import FailureCategory, ReviewError
 from specode_review.github import (
@@ -14,7 +15,6 @@ from specode_review.github import (
     GitHubMutationError,
     ReviewComment,
     ReviewCommentGateway,
-    derive_review_identity,
 )
 from specode_review.models import ReviewRequest, ReviewResult
 
@@ -161,8 +161,8 @@ def render_review_comment(result: ReviewResult) -> str:
 
 
 def _review_marker(request: ReviewRequest) -> str:
-    identity = derive_review_identity(request)
-    return f"<!-- {identity.external_id} -->"
+    revision = AcceptedRevision.from_review_request(request)
+    return f"<!-- {revision.external_id} -->"
 
 
 def _expected_review_comment(request: ReviewRequest, result: ReviewResult) -> str:
@@ -243,7 +243,7 @@ def _reconcile_ambiguous_mutation(
     mutation_error: GitHubMutationError,
     timing: _PublicationTiming,
 ) -> PublicationReceipt:
-    review_id = derive_review_identity(request).external_id
+    review_id = AcceptedRevision.from_review_request(request).external_id
     for index, policy_delay in enumerate(PUBLICATION_RECHECK_DELAYS_SECONDS):
         delay = (
             max(policy_delay, mutation_error.retry_after_seconds)

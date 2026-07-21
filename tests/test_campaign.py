@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.campaign import (
     CampaignError,
     CampaignEvidence,
@@ -12,7 +13,6 @@ from specode_review.campaign import (
 from specode_review.github import (
     ReviewComment,
     ReviewCommentApp,
-    derive_review_identity,
 )
 from specode_review.models import ReviewRequest
 
@@ -79,7 +79,9 @@ class ControlledHost:
             self.request.pr_number,
         )
         self.effects.append("github_reopened")
-        marker = f"<!-- {derive_review_identity(self.request).external_id} -->"
+        marker = (
+            f"<!-- {AcceptedRevision.from_review_request(self.request).external_id} -->"
+        )
         self.github.comments = (
             ReviewComment(
                 id=91,

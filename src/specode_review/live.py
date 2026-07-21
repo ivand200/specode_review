@@ -2,8 +2,9 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.github import ReviewCommentGateway
-from specode_review.models import AcceptedRevision, ReviewRequest
+from specode_review.models import ReviewRequest
 from specode_review.publishing import owned_revision_comments
 
 _ALLOWED_SEVERITY = re.compile(
@@ -37,12 +38,7 @@ def require_fresh_live_review(
     github: _LiveGitHub,
     expected: AcceptedRevision,
 ) -> None:
-    if (
-        request.repository.casefold() != expected.repository.casefold()
-        or request.pr_number != expected.pr_number
-        or request.base_sha.casefold() != expected.base_sha.casefold()
-        or request.head_sha.casefold() != expected.head_sha.casefold()
-    ):
+    if AcceptedRevision.from_review_request(request) != expected:
         message = "live pull request does not match the prepared accepted revision"
         raise LiveProfilePreconditionError(message)
 

@@ -1,4 +1,3 @@
-import hashlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -6,7 +5,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import urlencode
 
 import httpx
@@ -16,26 +15,17 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
-    StringConstraints,
     ValidationError,
-    field_validator,
-    model_validator,
 )
 
 from specode_review.deadline import remaining_review_time
 from specode_review.errors import FailureCategory, ReviewError
-from specode_review.models import RepositoryName, ReviewRequest, Sha, bound_description
+from specode_review.models import ReviewRequest, Sha, bound_description
 
 GITHUB_API_VERSION = "2026-03-10"
 REVIEW_COMMENT_PAGE_SIZE = 100
 REVIEW_COMMENT_MAX_PAGES = 10
 GITHUB_RESPONSE_MAX_BYTES = 2 * 1024 * 1024
-_EXTERNAL_ID_PREFIX = "specode-review:v1:"
-
-ExternalReviewId = Annotated[
-    str,
-    StringConstraints(pattern=r"^specode-review:v1:[0-9a-f]{64}$", max_length=82),
-]
 class GitHubOperation(StrEnum):
     INSTALLATION_READ = "installation_read"
     INSTALLATION_TOKEN = "installation_token"  # noqa: S105 - normalized operation name.
@@ -156,69 +146,6 @@ class ReviewCommentGateway(Protocol):
         installation_id: int,
         body: str,
     ) -> ReviewComment: ...
-
-
-class ReviewIdentity(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    repository: RepositoryName
-    pr_number: int = Field(gt=0)
-    base_sha: Sha
-    head_sha: Sha
-    external_id: ExternalReviewId
-
-    @field_validator("repository", mode="before")
-    @classmethod
-    def normalize_repository(cls, value: object) -> object:
-        return value.lower() if isinstance(value, str) else value
-
-    @field_validator("base_sha", "head_sha", mode="before")
-    @classmethod
-    def normalize_sha(cls, value: object) -> object:
-        return value.lower() if isinstance(value, str) else value
-
-    @model_validator(mode="after")
-    def external_id_matches_identity(self) -> "ReviewIdentity":
-        expected = _derive_external_id(
-            repository=self.repository,
-            pr_number=self.pr_number,
-            base_sha=self.base_sha,
-            head_sha=self.head_sha,
-        )
-        if self.external_id != expected:
-            message = "external_id does not match the review identity"
-            raise ValueError(message)
-        return self
-
-
-def _derive_external_id(
-    *,
-    repository: str,
-    pr_number: int,
-    base_sha: str,
-    head_sha: str,
-) -> str:
-    canonical = f"v1\n{repository.lower()}\n{pr_number}\n{base_sha.lower()}\n{head_sha.lower()}"
-    digest = hashlib.sha256(canonical.encode()).hexdigest()
-    return f"{_EXTERNAL_ID_PREFIX}{digest}"
-
-
-def derive_review_identity(request: ReviewRequest) -> ReviewIdentity:
-    repository = request.repository.lower()
-    base_sha = request.base_sha.lower()
-    head_sha = request.head_sha.lower()
-    return ReviewIdentity(
-        repository=repository,
-        pr_number=request.pr_number,
-        base_sha=base_sha,
-        head_sha=head_sha,
-        external_id=_derive_external_id(
-            repository=repository,
-            pr_number=request.pr_number,
-            base_sha=base_sha,
-            head_sha=head_sha,
-        ),
-    )
 
 
 class GitHubAppClient:

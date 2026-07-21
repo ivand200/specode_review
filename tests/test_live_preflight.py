@@ -1,9 +1,9 @@
 import pytest
 
+from specode_review.accepted_revision import AcceptedRevision
 from specode_review.github import (
     ReviewComment,
     ReviewCommentApp,
-    derive_review_identity,
 )
 from specode_review.live import (
     LiveProfileEvidenceError,
@@ -11,7 +11,7 @@ from specode_review.live import (
     require_fresh_live_review,
     verify_live_review_evidence,
 )
-from specode_review.models import AcceptedRevision, ReviewRequest
+from specode_review.models import ReviewRequest
 
 
 def _request() -> ReviewRequest:
@@ -62,7 +62,7 @@ class FreshnessGateway:
 
 def test_existing_exact_marker_app_comment_rejects_live_fixture() -> None:
     request = _request()
-    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    marker = f"<!-- {AcceptedRevision.from_review_request(request).external_id} -->"
     gateway = FreshnessGateway(
         comments=(
             ReviewComment(
@@ -88,7 +88,7 @@ def test_existing_exact_marker_app_comment_rejects_live_fixture() -> None:
 
 def test_foreign_and_unrelated_comments_do_not_pollute_live_fixture() -> None:
     request = _request()
-    identity = derive_review_identity(request)
+    identity = AcceptedRevision.from_review_request(request)
     marker = f"<!-- {identity.external_id} -->"
     gateway = FreshnessGateway(
         comments=(
@@ -147,7 +147,7 @@ def test_moved_or_substituted_fixture_is_rejected_before_freshness_reads(
 
 def test_live_evidence_requires_one_owned_comment_with_the_expected_finding() -> None:
     request = _request()
-    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    marker = f"<!-- {AcceptedRevision.from_review_request(request).external_id} -->"
     gateway = FreshnessGateway(
         comments=(
             ReviewComment(
@@ -174,7 +174,7 @@ def test_live_evidence_requires_one_owned_comment_with_the_expected_finding() ->
 
 def test_live_evidence_rejects_forbidden_repository_text() -> None:
     request = _request()
-    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    marker = f"<!-- {AcceptedRevision.from_review_request(request).external_id} -->"
     gateway = FreshnessGateway(
         comments=(
             ReviewComment(
@@ -200,7 +200,7 @@ def test_live_evidence_rejects_forbidden_repository_text() -> None:
 
 def test_live_evidence_rejects_a_finding_outside_the_allowed_severities() -> None:
     request = _request()
-    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    marker = f"<!-- {AcceptedRevision.from_review_request(request).external_id} -->"
     gateway = FreshnessGateway(
         comments=(
             ReviewComment(
@@ -230,7 +230,7 @@ def test_live_evidence_rejects_a_finding_outside_the_allowed_severities() -> Non
 
 def test_live_evidence_binds_the_allowed_severity_to_the_seeded_finding() -> None:
     request = _request()
-    marker = f"<!-- {derive_review_identity(request).external_id} -->"
+    marker = f"<!-- {AcceptedRevision.from_review_request(request).external_id} -->"
     gateway = FreshnessGateway(
         comments=(
             ReviewComment(
