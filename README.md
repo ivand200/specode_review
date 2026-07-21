@@ -80,6 +80,13 @@ sbx login
 npm install --global @openai/codex@0.144.6
 ```
 
+On a headless host, sign in without a browser using a Docker Personal Access Token with at least
+Read scope. Run this as the same OS user that runs SpeCodeReview:
+
+```bash
+printf '%s' "$DOCKER_PAT" | sbx login --username <your-docker-id> --password-stdin
+```
+
 Store the OpenAI credential in the Docker Sandboxes host-managed credential proxy. For OAuth:
 
 ```bash
@@ -128,6 +135,25 @@ uv run specode-review
 ```
 
 Health probes are available at `/health/live` and `/health/ready`.
+
+For local ngrok development, use the launcher instead. It starts ngrok first, discovers its HTTPS
+URL, exports the matching `PUBLIC_WEBHOOK_URL`, starts SpeCodeReview, and displays both GitHub's
+currently configured webhook URL and the expected URL until they match:
+
+```bash
+# In .env, point this at the downloaded GitHub App private key:
+# GITHUB_PRIVATE_KEY_PATH=/absolute/path/to/github-app.private-key.pem
+./scripts/run-local.sh
+```
+
+Pass a reserved ngrok origin when available:
+
+```bash
+./scripts/run-local.sh https://your-domain.ngrok.app
+```
+
+Direct `uv run specode-review` startup does not create ingress and therefore requires
+`PUBLIC_WEBHOOK_URL=https://<public-host>/webhooks/github` to already be present in the environment.
 
 ## Production installation
 

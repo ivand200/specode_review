@@ -1,6 +1,7 @@
 import logging
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from types import TracebackType
 from typing import Protocol, Self
 
@@ -8,6 +9,8 @@ import uvicorn
 from fastapi import FastAPI
 
 from specode_review.configuration import (
+    ConfigurationError,
+    ProductionPaths,
     ProductionServiceSettings,
     ReviewLimits,
     SandboxOperationPolicy,
@@ -165,8 +168,7 @@ def create_production_app(
     )
 
 
-def main() -> None:
-    settings = ProductionServiceSettings.from_environment(os.environ)
+def _serve(settings: ProductionServiceSettings) -> None:
     logging.basicConfig(
         level=settings.log_level,
         format="%(message)s",
@@ -177,3 +179,36 @@ def main() -> None:
         port=8000,
         workers=1,
     )
+
+
+def local_settings(
+    environment: Mapping[str, str],
+    *,
+    project_root: Path,
+) -> ProductionServiceSettings:
+    """Compose repository-local paths without widening production configuration."""
+    private_key = environment.get("GITHUB_PRIVATE_KEY_PATH", "")
+    if not private_key:
+        setting = "GITHUB_PRIVATE_KEY_PATH"
+        raise ConfigurationError(setting)
+    return ProductionServiceSettings.from_environment(
+        environment,
+        paths=ProductionPaths(
+            private_key_path=Path(private_key),
+            review_kit_path=project_root / "review-kit",
+            workspace_root=project_root / "workspaces",
+        ),
+    )
+
+
+def local_main(*, project_root: Path | None = None) -> None:
+    _serve(
+        local_settings(
+            os.environ,
+            project_root=(project_root or Path.cwd()).resolve(),
+        )
+    )
+
+
+def main() -> None:
+    _serve(ProductionServiceSettings.from_environment(os.environ))

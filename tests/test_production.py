@@ -10,12 +10,13 @@ import pytest
 
 from specode_review.configuration import (
     CodexExecutionPolicy,
+    ConfigurationError,
     ProductionPaths,
     ProductionServiceSettings,
     ReasoningEffort,
 )
 from specode_review.models import ReviewRequest
-from specode_review.production import create_production_app
+from specode_review.production import create_production_app, local_settings
 from specode_review.readiness import StartupReadinessError
 from specode_review.review_runner import PreflightOutcome
 
@@ -44,6 +45,41 @@ def _settings(tmp_path: Path, *, max_concurrent_reviews: int = 3) -> ProductionS
             workspace_root=tmp_path / "workspaces",
         ),
     )
+
+
+def _local_environment(private_key: Path) -> dict[str, str]:
+    return {
+        "GITHUB_APP_ID": "1234",
+        "GITHUB_PRIVATE_KEY_PATH": str(private_key),
+        "GITHUB_WEBHOOK_SECRET": "a" * 32,
+        "PUBLIC_WEBHOOK_URL": "https://local.example/webhooks/github",
+        "CODEX_MODEL": "gpt-5.4",
+        "OPENAI_REASONING_EFFORT": "high",
+    }
+
+
+def test_local_composition_uses_the_operator_key_and_repository_owned_paths(
+    tmp_path: Path,
+) -> None:
+    private_key = tmp_path / "github-app.pem"
+
+    settings = local_settings(
+        _local_environment(private_key),
+        project_root=tmp_path,
+    )
+
+    assert settings.public_webhook_url == "https://local.example/webhooks/github"
+    assert settings.paths.private_key_path == private_key
+    assert settings.paths.review_kit_path == tmp_path / "review-kit"
+    assert settings.paths.workspace_root == tmp_path / "workspaces"
+
+
+def test_local_composition_reports_the_missing_private_key_setting(tmp_path: Path) -> None:
+    environment = _local_environment(tmp_path / "github-app.pem")
+    environment.pop("GITHUB_PRIVATE_KEY_PATH")
+
+    with pytest.raises(ConfigurationError, match="GITHUB_PRIVATE_KEY_PATH"):
+        local_settings(environment, project_root=tmp_path)
 
 
 class RecordingReadiness:
