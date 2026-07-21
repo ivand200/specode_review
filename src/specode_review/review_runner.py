@@ -1,4 +1,3 @@
-import hashlib
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
@@ -26,6 +25,7 @@ from specode_review.models import ReviewRequest
 from specode_review.publishing import (
     PublicationDisposition,
     PublicationReceipt,
+    owned_revision_comments,
     publish_review_result,
 )
 from specode_review.resources import AttemptResources, ReviewResourceManager
@@ -107,16 +107,8 @@ class ReviewRunner:
                 stage="preflight",
             ) from None
         try:
-            comments = github.list_review_comments(
-                repository=repository,
-                pr_number=request.pr_number,
-                installation_id=request.installation_id,
-            )
-            marker = _review_marker(request)
-            if any(
-                _is_owned_revision_comment(comment, marker=marker, app_id=github.app_id)
-                for comment in comments
-            ):
+            normalized_request = request.model_copy(update={"repository": repository})
+            if owned_revision_comments(request=normalized_request, gateway=github):
                 return PreflightOutcome.ALREADY_REVIEWED
         except GitHubError as error:
             if (
@@ -267,25 +259,3 @@ def _normalized_failure(error: Exception, *, stage: str) -> ReviewError:
     if isinstance(error, TimeoutError):
         return ReviewError(FailureCategory.TIMEOUT, stage=stage)
     return ReviewError(FailureCategory.REVIEW_FAILURE, stage=stage)
-
-
-def _review_marker(request: ReviewRequest) -> str:
-    canonical = (
-        f"v1\n{request.repository.lower()}\n{request.pr_number}\n"
-        f"{request.base_sha.lower()}\n{request.head_sha.lower()}"
-    )
-    digest = hashlib.sha256(canonical.encode()).hexdigest()
-    return f"<!-- specode-review:v1:{digest} -->"
-
-
-def _is_owned_revision_comment(
-    comment: ReviewComment,
-    *,
-    marker: str,
-    app_id: int,
-) -> bool:
-    return (
-        comment.body.endswith(f"\n{marker}\n")
-        and comment.performed_via_github_app is not None
-        and comment.performed_via_github_app.id == app_id
-    )

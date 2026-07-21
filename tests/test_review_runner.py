@@ -23,6 +23,11 @@ from specode_review.github import (
 )
 from specode_review.models import ReviewRequest
 
+_REVISION_MARKER = (
+    "<!-- specode-review:v1:"
+    "b3fdc634e74cf30721e4dc24158636348334fa1c133b44a74eb401e89db2119f -->"
+)
+
 
 def _request(**updates: object) -> ReviewRequest:
     return ReviewRequest(
@@ -252,28 +257,11 @@ def test_each_repository_and_installation_uses_a_fresh_scoped_client() -> None:
 
 
 def test_exact_specode_review_app_comment_is_already_reviewed() -> None:
-    marker = (
-        "<!-- specode-review:v1:"
-        "b3fdc634e74cf30721e4dc24158636348334fa1c133b44a74eb401e89db2119f -->"
-    )
     client = ControlledPreflightClient(
         comments=(
             ReviewComment(
-                id=71,
-                body=(
-                    "historical legacy review\n\n"
-                    f"{marker.replace('specode-review', 'review-agent')}\n"
-                ),
-                performed_via_github_app=ReviewCommentApp(id=12345),
-            ),
-            ReviewComment(
-                id=72,
-                body=f"foreign review\n\n{marker}\n",
-                performed_via_github_app=ReviewCommentApp(id=54321),
-            ),
-            ReviewComment(
                 id=73,
-                body=f"SpeCodeReview result\n\n{marker}\n",
+                body=f"SpeCodeReview result\n\n{_REVISION_MARKER}\n",
                 performed_via_github_app=ReviewCommentApp(id=12345),
             ),
         )
@@ -281,6 +269,39 @@ def test_exact_specode_review_app_comment_is_already_reviewed() -> None:
     runner = ReviewRunner(github_client_factory=lambda _repository: client)
 
     assert runner.preflight(_request()) is PreflightOutcome.ALREADY_REVIEWED
+    assert client.closed
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        ReviewComment(
+            id=74,
+            body=f"foreign review\n\n{_REVISION_MARKER}\n",
+            performed_via_github_app=ReviewCommentApp(id=54321),
+        ),
+        ReviewComment(
+            id=75,
+            body=f"marker in the middle\n\n{_REVISION_MARKER}\nvisible suffix\n",
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        ),
+        ReviewComment(
+            id=76,
+            body="malformed\n\n<!-- specode-review:v1:not-a-digest -->\n",
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        ),
+        ReviewComment(
+            id=77,
+            body=f"other revision\n\n<!-- specode-review:v1:{'c' * 64} -->\n",
+            performed_via_github_app=ReviewCommentApp(id=12345),
+        ),
+    ],
+)
+def test_nonmatching_revision_comments_leave_preflight_ready(comment: ReviewComment) -> None:
+    client = ControlledPreflightClient(comments=(comment,))
+    runner = ReviewRunner(github_client_factory=lambda _repository: client)
+
+    assert runner.preflight(_request()) is PreflightOutcome.READY
     assert client.closed
 
 
