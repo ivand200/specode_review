@@ -6,11 +6,11 @@ import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-from review_agent.configuration import SandboxOperationPolicy, SandboxResourceLimits
-from review_agent.core import CandidateContract, ReviewContext
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.process import ProcessOptions, ProcessRunner, _run_bounded_process
-from review_agent.resources import AttemptResources
+from specode_review.configuration import SandboxOperationPolicy, SandboxResourceLimits
+from specode_review.core import CandidateContract, ReviewContext
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.process import ProcessOptions, ProcessRunner, _run_bounded_process
+from specode_review.resources import AttemptResources
 
 _VM_CHECKOUT = "/home/agent/review/repo"
 _SUCCESS_COMMAND = (
@@ -200,8 +200,8 @@ class NoModelDockerSandboxProbe:
             command=(
                 "sh",
                 "-c",
-                'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
-                "review-agent-read-only-check",
+                'if touch "$1/.specode-review-write-probe"; then exit 73; fi',
+                "specode-review-read-only-check",
                 str(context.checkout),
             ),
             workdir=None,

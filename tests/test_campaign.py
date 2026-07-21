@@ -1,517 +1,384 @@
 import json
-import subprocess
-from collections.abc import Mapping
 from dataclasses import dataclass, field
-from io import StringIO
-from pathlib import Path
 
 import pytest
 
-from review_agent.campaign import (
-    CampaignCleanupAction,
-    CampaignOperations,
-    CampaignStage,
-    campaign_main,
-    run_truthful_real_e2e_campaign,
-    subprocess_campaign_operations,
+from specode_review.accepted_revision import AcceptedRevision
+from specode_review.campaign import (
+    CampaignError,
+    CampaignEvidence,
+    CampaignTarget,
+    run_signed_review_campaign,
 )
-from review_agent.fixtures import (
-    CampaignFixture,
-    CampaignFixtures,
-    CreatedFixtureReference,
-    FixturePreparationError,
-    FixturePreparationStage,
+from specode_review.github import (
+    ReviewComment,
+    ReviewCommentApp,
 )
-from review_agent.process import ProcessOptions
-
-BASE_SHA = "a" * 40
-B_HEAD_SHA = "b" * 40
-C_HEAD_SHA = "c" * 40
-CAMPAIGN_ID = "release-20260719"
-REPOSITORY = "octo-org/test-example"
+from specode_review.models import ReviewRequest
 
 
-def _fixtures() -> CampaignFixtures:
-    return CampaignFixtures(
-        repository=REPOSITORY,
-        campaign_id=CAMPAIGN_ID,
-        checkpoint_b=CampaignFixture(
-            number=101,
-            url=f"https://github.com/{REPOSITORY}/pull/101",
-            branch=f"review-agent-e2e/{CAMPAIGN_ID}/checkpoint-b",
-            base_sha=BASE_SHA,
-            head_sha=B_HEAD_SHA,
-        ),
-        checkpoint_c=CampaignFixture(
-            number=102,
-            url=f"https://github.com/{REPOSITORY}/pull/102",
-            branch=f"review-agent-e2e/{CAMPAIGN_ID}/checkpoint-c",
-            base_sha=BASE_SHA,
-            head_sha=C_HEAD_SHA,
-        ),
-        expected_finding="age 18",
-        instruction_marker=f"review-agent-e2e-instruction-{CAMPAIGN_ID}",
-        configuration_marker=f"review-agent-e2e-config-{CAMPAIGN_ID}",
+def _request() -> ReviewRequest:
+    return ReviewRequest(
+        repository="octo-org/specode-review-test",
+        pr_number=42,
+        installation_id=23,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        title="Seed a stable changed-line defect",
+        description="",
     )
 
 
 @dataclass
-class ControlledCampaign:
-    effects: list[tuple[object, ...]] = field(default_factory=list)
-    fail_stage: CampaignStage | None = None
-    mismatched_evidence_stage: CampaignStage | None = None
+class ControlledGitHub:
+    request: ReviewRequest
+    comments: tuple[ReviewComment, ...] = ()
 
-    def run_stage(
-        self,
-        stage: CampaignStage,
-        environment: Mapping[str, str],
-    ) -> None:
-        captured = dict(environment)
-        self.effects.append(("stage", stage, captured))
-        if stage is self.fail_stage:
-            message = "sensitive subprocess or model output"
-            raise RuntimeError(message)
-        if stage is CampaignStage.CHECKPOINT_B:
-            Path(captured["E2E_CREATED_RESOURCES_PATH"]).write_text(
-                json.dumps(
-                    {
-                        "kind": "github_check_run_and_pull_request_comment",
-                        "repository": REPOSITORY,
-                        "pr_number": 101,
-                        "base_sha": BASE_SHA,
-                        "head_sha": (
-                            "d" * 40
-                            if self.mismatched_evidence_stage is CampaignStage.CHECKPOINT_B
-                            else B_HEAD_SHA
-                        ),
-                        "previous_check_run_id": 500,
-                        "check_run_id": 501,
-                        "comment_id": 601,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        if stage is CampaignStage.CHECKPOINT_C:
-            Path(captured["E2E_CREATED_RESOURCES_PATH"]).write_text(
-                json.dumps(
-                    {
-                        "kind": "full_live_github_resources",
-                        "repository": REPOSITORY,
-                        "pr_number": 102,
-                        "base_sha": BASE_SHA,
-                        "head_sha": (
-                            "d" * 40
-                            if self.mismatched_evidence_stage is CampaignStage.CHECKPOINT_C
-                            else C_HEAD_SHA
-                        ),
-                        "check_run_id": 502,
-                        "comment_id": 602,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+    @property
+    def app_id(self) -> int:
+        return 12345
 
-    def prepare(
+    def review_request(self, *, pr_number: int, installation_id: int) -> ReviewRequest:
+        assert (pr_number, installation_id) == (
+            self.request.pr_number,
+            self.request.installation_id,
+        )
+        return self.request
+
+    def list_review_comments(
         self,
+        *,
         repository: str,
-        configured_repository: str,
-        campaign_id: str,
-        work_root: Path,
-    ) -> CampaignFixtures:
-        self.effects.append(
-            (
-                "fixtures",
-                repository,
-                configured_repository,
-                campaign_id,
-                work_root,
+        pr_number: int,
+        installation_id: int,
+    ) -> tuple[ReviewComment, ...]:
+        assert (repository, pr_number, installation_id) == (
+            self.request.repository,
+            self.request.pr_number,
+            self.request.installation_id,
+        )
+        return self.comments
+
+
+@dataclass
+class ControlledHost:
+    github: ControlledGitHub
+    request: ReviewRequest
+    effects: list[str] = field(default_factory=list)
+
+    def require_installed_service(self) -> None:
+        self.effects.append("installed_service")
+
+    def journal_cursor(self) -> str:
+        self.effects.append("journal_cursor")
+        return "cursor-before-trigger"
+
+    def trigger_reopened_event(self, *, repository: str, pr_number: int) -> None:
+        assert (repository, pr_number) == (
+            self.request.repository,
+            self.request.pr_number,
+        )
+        self.effects.append("github_reopened")
+        marker = (
+            f"<!-- {AcceptedRevision.from_review_request(self.request).external_id} -->"
+        )
+        self.github.comments = (
+            ReviewComment(
+                id=91,
+                body=(
+                    "# Automated code review\n\n"
+                    "### Finding 1: ` Age 18 is incorrectly rejected `\n\n"
+                    "- Severity: ` important `\n"
+                    "- Locations:\n"
+                    "  - ` campaign-fixtures/release/adult_age.py:4 `\n"
+                    "- Evidence: ` The strict comparison rejects age 18. `\n\n"
+                    f"{marker}\n"
+                ),
+                performed_via_github_app=ReviewCommentApp(id=self.github.app_id),
+            ),
+        )
+
+    def journal_lines_after(self, cursor: str) -> tuple[str, ...]:
+        assert cursor == "cursor-before-trigger"
+        self.effects.append("journal")
+        common = {
+            "repository": self.request.repository,
+            "pull_request": self.request.pr_number,
+            "accepted_revision": self.request.head_sha,
+            "attempt_id": "e" * 32,
+        }
+        return tuple(
+            json.dumps({**common, **record}, separators=(",", ":"))
+            for record in (
+                {"event": "admission", "admission_disposition": "accepted"},
+                {"event": "cleanup", "cleanup_outcome": "confirmed"},
+                {"event": "publication", "publication_disposition": "created"},
+                {"event": "terminal_release", "terminal_outcome": "succeeded"},
             )
         )
-        if self.fail_stage is CampaignStage.FIXTURE_PREPARATION:
-            message = "sensitive fixture failure"
-            raise RuntimeError(message)
-        return _fixtures()
+
+    def owned_resource_names(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        self.effects.append("resources")
+        return (), ()
 
 
-def test_operator_campaign_runs_every_gate_in_order_and_reports_verified_evidence(
-    tmp_path: Path,
-) -> None:
-    controlled = ControlledCampaign()
-    resolved_evidence_root = tmp_path / "resolved-campaign-evidence"
-    resolved_evidence_root.mkdir()
-    evidence_root = tmp_path / "campaign-evidence"
-    evidence_root.symlink_to(resolved_evidence_root, target_is_directory=True)
+def test_campaign_accepts_one_grounded_signed_review_with_safe_logs_and_cleanup() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
+    host = ControlledHost(github=github, request=request)
 
-    summary = run_truthful_real_e2e_campaign(
-        repository=REPOSITORY,
-        model=None,
-        evidence_root=evidence_root,
-        campaign_id=CAMPAIGN_ID,
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-        },
-        project_root=Path.cwd(),
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=controlled.prepare,
+    evidence = run_signed_review_campaign(
+        target=CampaignTarget(
+            repository=request.repository,
+            pr_number=request.pr_number,
+            base_sha=request.base_sha,
+            head_sha=request.head_sha,
+            expected_finding="age 18",
+            expected_path="campaign-fixtures/release/adult_age.py",
+            expected_line=4,
+            forbidden_repository_text=(
+                "specode-review-e2e-instruction-release",
+                "specode-review-e2e-config-release",
+            ),
+            forbidden_log_text=(
+                "return age > 18",
+                "candidate-sentinel",
+                "prompt-sentinel",
+            ),
         ),
+        installation_id=request.installation_id,
+        github=github,
+        host=host,
+        timeout_seconds=10,
+        poll_seconds=1,
+        monotonic=lambda: 0.0,
+        sleep=lambda _: None,
     )
 
-    assert summary.succeeded
-    assert summary.failed_stage is None
-    assert summary.model == "configured-model"
-    assert [outcome.stage for outcome in summary.stages] == [
-        CampaignStage.RUFF,
-        CampaignStage.MYPY,
-        CampaignStage.PYTEST,
-        CampaignStage.DOCKER_SANDBOX,
-        CampaignStage.FIXTURE_PREPARATION,
-        CampaignStage.CHECKPOINT_B,
-        CampaignStage.CHECKPOINT_C,
-    ]
-    assert all(outcome.passed for outcome in summary.stages)
-    assert summary.fixtures == _fixtures()
-    assert summary.checkpoint_b is not None
-    assert summary.checkpoint_b.previous_check_run_id == 500
-    assert summary.checkpoint_b.check_run_id == 501
-    assert summary.checkpoint_b.comment_id == 601
-    assert summary.checkpoint_c is not None
-    assert summary.checkpoint_c.check_run_id == 502
-    assert summary.checkpoint_c.comment_id == 602
-    assert [(item.kind, item.action) for item in summary.manual_cleanup] == [
-        ("pull_request", CampaignCleanupAction.REVIEW),
-        ("pull_request", CampaignCleanupAction.REVIEW),
-        ("comment", CampaignCleanupAction.DELETE),
-        ("check_run", CampaignCleanupAction.RETAIN),
-        ("check_run", CampaignCleanupAction.RETAIN),
-        ("comment", CampaignCleanupAction.DELETE),
-        ("check_run", CampaignCleanupAction.RETAIN),
+    assert evidence == CampaignEvidence(comment_id=91, attempt_id="e" * 32)
+    assert host.effects == [
+        "installed_service",
+        "resources",
+        "journal_cursor",
+        "github_reopened",
+        "journal",
+        "resources",
     ]
 
-    assert [effect[1] for effect in controlled.effects if effect[0] == "stage"] == [
-        CampaignStage.RUFF,
-        CampaignStage.MYPY,
-        CampaignStage.PYTEST,
-        CampaignStage.DOCKER_SANDBOX,
-        CampaignStage.CHECKPOINT_B,
-        CampaignStage.CHECKPOINT_C,
-    ]
-    fixture_effect = controlled.effects[4]
-    assert fixture_effect[:4] == (
-        "fixtures",
-        REPOSITORY,
-        REPOSITORY,
-        CAMPAIGN_ID,
-    )
-    assert Path(fixture_effect[4]).is_relative_to(
-        resolved_evidence_root / CAMPAIGN_ID
-    )
 
-    stage_environments = {
-        effect[1]: effect[2]
-        for effect in controlled.effects
-        if effect[0] == "stage"
-    }
-    assert stage_environments[CampaignStage.CHECKPOINT_B]["E2E_GITHUB_PR_NUMBER"] == "101"
-    assert (
-        stage_environments[CampaignStage.CHECKPOINT_B]["E2E_EXPECTED_BASE_SHA"]
-        == BASE_SHA
-    )
-    assert (
-        stage_environments[CampaignStage.CHECKPOINT_B]["E2E_EXPECTED_HEAD_SHA"]
-        == B_HEAD_SHA
-    )
-    checkpoint_c_environment = stage_environments[CampaignStage.CHECKPOINT_C]
-    assert checkpoint_c_environment["E2E_GITHUB_PR_NUMBER"] == "102"
-    assert checkpoint_c_environment["E2E_EXPECTED_BASE_SHA"] == BASE_SHA
-    assert checkpoint_c_environment["E2E_EXPECTED_HEAD_SHA"] == C_HEAD_SHA
-    assert checkpoint_c_environment["CODEX_MODEL"] == "configured-model"
-    assert checkpoint_c_environment["ACKNOWLEDGE_MODEL_COST"] == "1"
-    assert Path(checkpoint_c_environment["STATE_ROOT"]).is_relative_to(
-        resolved_evidence_root / CAMPAIGN_ID
-    )
-    assert Path(checkpoint_c_environment["WORKSPACE_ROOT"]).is_relative_to(
-        resolved_evidence_root / CAMPAIGN_ID
-    )
-    assert checkpoint_c_environment["SANDBOX_NAME_PREFIX"].startswith(
-        f"rae2e-{CAMPAIGN_ID}"
-    )
-    assert all(
-        environment.get("CODEX_MODEL") == "configured-model"
-        for stage, environment in stage_environments.items()
-        if stage is not CampaignStage.CHECKPOINT_C
-    )
+def test_campaign_rejects_duplicate_review_execution_evidence() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
 
-    persisted = json.loads(
-        (resolved_evidence_root / CAMPAIGN_ID / "campaign-summary.json").read_text()
-    )
-    assert persisted["succeeded"] is True
-    assert persisted["checkpoint_c"]["comment_id"] == 602
+    class DuplicateAttemptHost(ControlledHost):
+        def journal_lines_after(self, cursor: str) -> tuple[str, ...]:
+            original = super().journal_lines_after(cursor)
+            duplicate = tuple(
+                line.replace("e" * 32, "f" * 32)
+                for line in original
+            )
+            return (*original, *duplicate)
 
+    host = DuplicateAttemptHost(github=github, request=request)
 
-@pytest.mark.parametrize("failed_stage", list(CampaignStage))
-def test_campaign_stops_at_first_failure_without_promoting_unverified_evidence(
-    tmp_path: Path,
-    failed_stage: CampaignStage,
-) -> None:
-    controlled = ControlledCampaign(fail_stage=failed_stage)
-
-    summary = run_truthful_real_e2e_campaign(
-        repository=REPOSITORY,
-        model=None,
-        evidence_root=tmp_path / failed_stage.value,
-        campaign_id=CAMPAIGN_ID,
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-        },
-        project_root=Path.cwd(),
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=controlled.prepare,
-        ),
-    )
-
-    assert not summary.succeeded
-    assert summary.failed_stage is failed_stage
-    assert summary.stages[-1].stage is failed_stage
-    assert not summary.stages[-1].passed
-    assert [outcome.stage for outcome in summary.stages].index(failed_stage) == (
-        len(summary.stages) - 1
-    )
-    failed_index = list(CampaignStage).index(failed_stage)
-    fixture_index = list(CampaignStage).index(CampaignStage.FIXTURE_PREPARATION)
-    assert (summary.fixtures is not None) == (failed_index > fixture_index)
-    assert (summary.checkpoint_b is not None) == (
-        failed_stage is CampaignStage.CHECKPOINT_C
-    )
-    assert summary.checkpoint_c is None
-
-    observed = [
-        effect[1] if effect[0] == "stage" else CampaignStage.FIXTURE_PREPARATION
-        for effect in controlled.effects
-    ]
-    expected = list(CampaignStage)
-    assert observed == expected[: expected.index(failed_stage) + 1]
-    persisted = (
-        tmp_path / failed_stage.value / CAMPAIGN_ID / "campaign-summary.json"
-    ).read_text()
-    assert "sensitive" not in persisted
-    assert "subprocess" not in persisted
-    assert "model output" not in persisted
+    with pytest.raises(CampaignError, match="duplicate_execution"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding="age 18",
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=host,
+            timeout_seconds=10,
+            poll_seconds=1,
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
+        )
 
 
 @pytest.mark.parametrize(
-    "stage",
-    [CampaignStage.CHECKPOINT_B, CampaignStage.CHECKPOINT_C],
+    ("replacement", "expected_finding"),
+    [
+        (("incorrectly rejected", "not discussed"), "incorrectly rejected"),
+        (("campaign-fixtures/release/adult_age.py:4", "other.py:9"), "age 18"),
+        (("important", "minor"), "age 18"),
+    ],
 )
-def test_campaign_rejects_profile_evidence_for_a_different_revision(
-    tmp_path: Path,
-    stage: CampaignStage,
+def test_campaign_rejects_semantically_invalid_comment_evidence(
+    replacement: tuple[str, str],
+    expected_finding: str,
 ) -> None:
-    controlled = ControlledCampaign(mismatched_evidence_stage=stage)
+    request = _request()
+    github = ControlledGitHub(request)
 
-    summary = run_truthful_real_e2e_campaign(
-        repository=REPOSITORY,
-        model=None,
-        evidence_root=tmp_path / stage.value,
-        campaign_id=CAMPAIGN_ID,
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-        },
-        project_root=Path.cwd(),
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=controlled.prepare,
-        ),
-    )
+    class InvalidCommentHost(ControlledHost):
+        def trigger_reopened_event(self, *, repository: str, pr_number: int) -> None:
+            super().trigger_reopened_event(repository=repository, pr_number=pr_number)
+            comment = self.github.comments[0]
+            self.github.comments = (
+                comment.model_copy(
+                    update={"body": comment.body.replace(*replacement)},
+                ),
+            )
 
-    assert not summary.succeeded
-    assert summary.failed_stage is stage
-    assert (summary.checkpoint_b is not None) == (stage is CampaignStage.CHECKPOINT_C)
-    assert summary.checkpoint_c is None
-
-
-def test_explicit_model_override_is_scoped_to_checkpoint_c(tmp_path: Path) -> None:
-    controlled = ControlledCampaign()
-
-    summary = run_truthful_real_e2e_campaign(
-        repository=None,
-        model="approved-override",
-        evidence_root=tmp_path / "override",
-        campaign_id=CAMPAIGN_ID,
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-            "RUN_FULL_LIVE_E2E": "1",
-            "ACKNOWLEDGE_MODEL_COST": "1",
-        },
-        project_root=Path.cwd(),
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=controlled.prepare,
-        ),
-    )
-
-    assert summary.succeeded
-    stage_environments = {
-        effect[1]: effect[2]
-        for effect in controlled.effects
-        if effect[0] == "stage"
-    }
-    assert stage_environments[CampaignStage.RUFF]["CODEX_MODEL"] == "configured-model"
-    assert "RUN_FULL_LIVE_E2E" not in stage_environments[CampaignStage.RUFF]
-    assert "ACKNOWLEDGE_MODEL_COST" not in stage_environments[CampaignStage.RUFF]
-    assert (
-        stage_environments[CampaignStage.CHECKPOINT_C]["CODEX_MODEL"]
-        == "approved-override"
-    )
-
-
-@dataclass
-class ControlledProcessRunner:
-    calls: list[tuple[tuple[str, ...], ProcessOptions]] = field(default_factory=list)
-
-    def __call__(
-        self,
-        arguments: tuple[str, ...],
-        options: ProcessOptions,
-    ) -> subprocess.CompletedProcess[bytes]:
-        self.calls.append((arguments, options))
-        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
-
-
-def test_subprocess_campaign_boundary_reuses_the_existing_profile_commands() -> None:
-    runner = ControlledProcessRunner()
-    operations = subprocess_campaign_operations(runner=runner)
-    environment = {"PATH": "/usr/bin", "CAMPAIGN_SENTINEL": "present"}
-
-    for stage in (
-        CampaignStage.RUFF,
-        CampaignStage.MYPY,
-        CampaignStage.PYTEST,
-        CampaignStage.DOCKER_SANDBOX,
-        CampaignStage.CHECKPOINT_B,
-        CampaignStage.CHECKPOINT_C,
-    ):
-        operations.run_stage(stage, environment)
-
-    assert [call[0] for call in runner.calls] == [
-        ("uv", "run", "ruff", "check", "."),
-        ("uv", "run", "mypy"),
-        ("uv", "run", "pytest", "-q"),
-        (
-            "uv",
-            "run",
-            "pytest",
-            "tests/integration/test_no_model_sandbox_probe.py",
-            "-q",
-            "-s",
-        ),
-        (
-            "uv",
-            "run",
-            "pytest",
-            "tests/live/test_github_live.py",
-            "-q",
-            "-s",
-        ),
-        (
-            "uv",
-            "run",
-            "pytest",
-            "tests/live/test_full_live.py",
-            "-q",
-            "-s",
-        ),
-    ]
-    assert all(call[1].env == environment for call in runner.calls)
-    assert all(call[1].output_max_bytes == 1_048_576 for call in runner.calls)
-    assert all(not call[1].use_review_deadline for call in runner.calls)
-
-
-def test_campaign_command_returns_nonzero_and_only_bounded_failure_json(
-    tmp_path: Path,
-) -> None:
-    controlled = ControlledCampaign(fail_stage=CampaignStage.CHECKPOINT_B)
-    output = StringIO()
-
-    exit_status = campaign_main(
-        [
-            "--repository",
-            REPOSITORY,
-            "--campaign-id",
-            CAMPAIGN_ID,
-            "--evidence-root",
-            str(tmp_path / "cli"),
-        ],
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-        },
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=controlled.prepare,
-        ),
-        output=output,
-    )
-
-    rendered = output.getvalue()
-    assert exit_status == 1
-    assert json.loads(rendered)["failed_stage"] == "checkpoint_b"
-    assert "sensitive" not in rendered
-    assert "model output" not in rendered
-
-
-def test_partial_fixture_failure_reports_only_bounded_created_references(
-    tmp_path: Path,
-) -> None:
-    controlled = ControlledCampaign()
-    created = CreatedFixtureReference(
-        kind="pull_request",
-        branch=f"review-agent-e2e/{CAMPAIGN_ID}/checkpoint-b",
-        number=101,
-        url=f"https://github.com/{REPOSITORY}/pull/101",
-    )
-
-    def fail_preparation(
-        repository: str,
-        configured_repository: str,
-        campaign_id: str,
-        work_root: Path,
-    ) -> CampaignFixtures:
-        del repository, configured_repository, campaign_id, work_root
-        raise FixturePreparationError(
-            FixturePreparationStage.CHECKPOINT_C_PUSH,
-            created_resources=(created,),
+    with pytest.raises(CampaignError, match="comment_evidence"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding=expected_finding,
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=InvalidCommentHost(github=github, request=request),
+            timeout_seconds=10,
+            poll_seconds=1,
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
         )
 
-    summary = run_truthful_real_e2e_campaign(
-        repository=REPOSITORY,
-        model=None,
-        evidence_root=tmp_path / "partial",
-        campaign_id=CAMPAIGN_ID,
-        environment={
-            "GITHUB_REPOSITORY": REPOSITORY,
-            "CODEX_MODEL": "configured-model",
-        },
-        project_root=Path.cwd(),
-        operations=CampaignOperations(
-            run_stage=controlled.run_stage,
-            prepare_fixtures=fail_preparation,
-        ),
-    )
 
-    assert not summary.succeeded
-    assert summary.failed_stage is CampaignStage.FIXTURE_PREPARATION
-    assert summary.created_resources == (created,)
-    assert summary.manual_cleanup[0].reference == created.url
-    assert summary.manual_cleanup[0].action is CampaignCleanupAction.REVIEW
-    persisted = (
-        tmp_path / "partial" / CAMPAIGN_ID / "campaign-summary.json"
-    ).read_text()
-    assert "checkpoint_c_push" not in persisted
+def test_campaign_rejects_sensitive_log_content() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
+
+    class UnsafeHost(ControlledHost):
+        def journal_lines_after(self, cursor: str) -> tuple[str, ...]:
+            return (*super().journal_lines_after(cursor), "prompt-sentinel")
+
+    with pytest.raises(CampaignError, match="log_redaction"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding="age 18",
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+                forbidden_log_text=("prompt-sentinel",),
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=UnsafeHost(github=github, request=request),
+            timeout_seconds=10,
+            poll_seconds=1,
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
+        )
+
+
+def test_campaign_rejects_a_completed_review_with_owned_resources_left_behind() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
+
+    class UncleanHost(ControlledHost):
+        resource_reads = 0
+
+        def owned_resource_names(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+            self.resource_reads += 1
+            if self.resource_reads == 1:
+                return super().owned_resource_names()
+            return (), ("specode-review-workspace-" + "f" * 32,)
+
+    with pytest.raises(CampaignError, match="resource_cleanup"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding="age 18",
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=UncleanHost(github=github, request=request),
+            timeout_seconds=10,
+            poll_seconds=1,
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
+        )
+
+
+def test_campaign_rejects_normalized_technical_failure_evidence() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
+
+    class FailedHost(ControlledHost):
+        def journal_lines_after(self, cursor: str) -> tuple[str, ...]:
+            records = super().journal_lines_after(cursor)
+            failed = json.loads(records[-1])
+            failed.update(
+                {
+                    "event": "normalized_failure",
+                    "stage": "review",
+                    "category": "review_failure",
+                }
+            )
+            return (*records, json.dumps(failed))
+
+    with pytest.raises(CampaignError, match="technical_failure"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding="age 18",
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=FailedHost(github=github, request=request),
+            timeout_seconds=10,
+            poll_seconds=1,
+            monotonic=lambda: 0.0,
+            sleep=lambda _: None,
+        )
+
+
+def test_campaign_times_out_when_the_signed_event_publishes_no_comment() -> None:
+    request = _request()
+    github = ControlledGitHub(request)
+    ticks = iter((0.0, 0.0, 1.0, 1.0))
+
+    class MissingCommentHost(ControlledHost):
+        def trigger_reopened_event(self, *, repository: str, pr_number: int) -> None:
+            assert (repository, pr_number) == (
+                self.request.repository,
+                self.request.pr_number,
+            )
+            self.effects.append("github_reopened")
+
+    with pytest.raises(CampaignError, match="timeout"):
+        run_signed_review_campaign(
+            target=CampaignTarget(
+                repository=request.repository,
+                pr_number=request.pr_number,
+                base_sha=request.base_sha,
+                head_sha=request.head_sha,
+                expected_finding="age 18",
+                expected_path="campaign-fixtures/release/adult_age.py",
+                expected_line=4,
+            ),
+            installation_id=request.installation_id,
+            github=github,
+            host=MissingCommentHost(github=github, request=request),
+            timeout_seconds=1,
+            poll_seconds=1,
+            monotonic=lambda: next(ticks),
+            sleep=lambda _: None,
+        )

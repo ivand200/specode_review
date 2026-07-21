@@ -4,11 +4,12 @@ Report only defects introduced or exposed by the fixed pull-request diff:
 
 - `blocking`: merging would create a critical correctness, security, data-loss, or availability
   failure with strong evidence.
-- `important`: a concrete correctness, security, performance, operability, or maintainability
-  defect that should be fixed before merge.
+- `important`: a concrete correctness, security, data-loss, compatibility, or material reliability
+  or performance defect that should be fixed before merge.
 
-Omit style, naming, formatting, speculative risks, minor improvements, praise, and summaries.
-Prefer a smaller set of high-confidence findings over broad coverage.
+Omit style, naming, formatting, maintainability preferences, test-coverage quotas, speculative
+risks, minor improvements, praise, and summaries. Prefer a smaller set of high-confidence findings
+over broad coverage.
 
 Each finding must:
 

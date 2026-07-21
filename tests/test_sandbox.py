@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from review_agent import (
+from specode_review import (
     ChangedPathManifest,
     DiffRange,
     FailureCategory,
@@ -15,15 +15,15 @@ from review_agent import (
     ReviewRequest,
     SandboxResourceLimits,
 )
-from review_agent.configuration import (
+from specode_review.configuration import (
     CodexExecutionPolicy,
     ReasoningEffort,
     SandboxOperationPolicy,
 )
-from review_agent.core import CandidateContract
-from review_agent.process import ProcessOutputLimitError
-from review_agent.resources import AttemptResources
-from review_agent.sandbox import (
+from specode_review.core import CandidateContract
+from specode_review.process import ProcessOutputLimitError
+from specode_review.resources import AttemptResources
+from specode_review.sandbox import (
     CodexSandboxAdapter,
     DockerSandboxClient,
     ProcessOptions,
@@ -49,7 +49,7 @@ def _resources(workspace_root: Path, *, attempt_id: str = "a" * 32) -> AttemptRe
     return AttemptResources.for_attempt(
         attempt_id,
         workspace_root=workspace_root,
-        sandbox_prefix="review-agent-",
+        sandbox_prefix="specode-review-",
     )
 
 
@@ -169,6 +169,7 @@ def _review_context(tmp_path: Path, *, title: str = "Safe title") -> ReviewConte
             changed_text_lines=4,
         ),
         sandbox_resources=SandboxResourceLimits(cpus=2, memory_mib=2_048, pids=64),
+        primary_diff=b"diff --git a/src/example.py b/src/example.py\n",
     )
 
 
@@ -188,7 +189,7 @@ def test_review_execution_contract_does_not_require_global_sandbox_listing() -> 
 
 def test_docker_sandbox_client_does_not_expose_generic_shell_creation() -> None:
     client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=RecordingProcessRunner(),
         environment={},
     )
@@ -231,8 +232,8 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert "--ignore-user-config" in command
     assert "--ignore-rules" in command
     provider_index = command.index("--config")
-    assert command[provider_index + 1] == 'model_provider="review_agent_openai_https"'
-    assert command[provider_index + 3].startswith("model_providers.review_agent_openai_https=")
+    assert command[provider_index + 1] == 'model_provider="specode_review_openai_https"'
+    assert command[provider_index + 3].startswith("model_providers.specode_review_openai_https=")
     assert "supports_websockets=false" in command[provider_index + 3]
     assert command[provider_index + 4 : provider_index + 6] == (
         "--config",
@@ -246,11 +247,14 @@ def test_codex_sandbox_runner_returns_only_the_schema_constrained_candidate(
     assert client.removed == [client.created[0][0]]
     request_payload = json.loads((context.workspace / "control/request.json").read_bytes())
     output_schema_bytes = (context.workspace / "control/review.schema.json").read_bytes()
+    primary_diff = (context.workspace / "control/diff.patch").read_bytes()
     assert request_payload["diff_range"] == context.diff_range.model_dump(mode="json")
     assert request_payload["changed_paths"] == ["src/example.py"]
     assert request_payload["untrusted_pull_request"]["title"] == context.request.title
     assert "installation_id" not in request_payload
     assert output_schema_bytes == contract.schema_json
+    assert primary_diff == context.primary_diff
+    assert (context.workspace / "control/diff.patch").stat().st_mode & 0o777 == 0o444
 
 
 def test_codex_sandbox_adapter_prepares_an_exact_vm_local_copy_before_codex(
@@ -268,8 +272,8 @@ def test_codex_sandbox_adapter_prepares_an_exact_vm_local_copy_before_codex(
             (
                 "sh",
                 "-c",
-                'if touch "$1/.review-agent-write-probe"; then exit 73; fi',
-                "review-agent-read-only-check",
+                'if touch "$1/.specode-review-write-probe"; then exit 73; fi',
+                "specode-review-read-only-check",
                 str(context.checkout),
             ),
             None,
@@ -316,8 +320,8 @@ def test_codex_sandbox_adapter_uses_a_fresh_sandbox_for_each_attempt(
 
     created_names = [created[0] for created in client.created]
     assert created_names == [
-        "review-agent-" + "a" * 32,
-        "review-agent-" + "b" * 32,
+        "specode-review-" + "a" * 32,
+        "specode-review-" + "b" * 32,
     ]
     assert client.removed == created_names
 
@@ -469,7 +473,7 @@ def test_codex_sandbox_adapter_fails_closed_when_the_read_only_probe_fails(
     assert failure.value.category is FailureCategory.SANDBOX_LIFECYCLE
     assert failure.value.stage == "codex_sandbox_lifecycle"
     assert len(client.executed) == 1
-    assert client.executed[0][1][3] == "review-agent-read-only-check"
+    assert client.executed[0][1][3] == "specode-review-read-only-check"
     assert client.removed == [client.created[0][0]]
 
 
@@ -666,7 +670,7 @@ def test_docker_sandbox_client_creates_codex_with_the_application_kit(
 ) -> None:
     process_runner = RecordingProcessRunner()
     client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=process_runner,
         environment={},
         config=SandboxOperationPolicy(process_output_max_bytes=4_096),
@@ -676,7 +680,7 @@ def test_docker_sandbox_client_creates_codex_with_the_application_kit(
     kit = tmp_path / "review-kit"
 
     client.create_codex(
-        name="review-agent-" + "d" * 32,
+        name="specode-review-" + "d" * 32,
         control=control,
         checkout=checkout,
         kit=kit,
@@ -686,11 +690,11 @@ def test_docker_sandbox_client_creates_codex_with_the_application_kit(
     assert process_runner.calls == [
         (
             (
-                "/opt/review-agent/bin/sbx",
+                "/opt/specode-review/bin/sbx",
                 "create",
                 "--quiet",
                 "--name",
-                "review-agent-" + "d" * 32,
+                "specode-review-" + "d" * 32,
                 "--cpus",
                 "3",
                 "--memory",
@@ -709,14 +713,14 @@ def test_docker_sandbox_client_creates_codex_with_the_application_kit(
 def test_docker_sandbox_client_executes_with_process_and_output_limits() -> None:
     process_runner = RecordingProcessRunner(stdout=b"copied-head\n")
     client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=process_runner,
         environment={},
         config=SandboxOperationPolicy(process_output_max_bytes=8_192),
     )
 
     output = client.execute(
-        name="review-agent-" + "b" * 32,
+        name="specode-review-" + "b" * 32,
         command=("git", "rev-parse", "HEAD"),
         workdir="/home/agent/review/repo",
         process_limit=72,
@@ -726,11 +730,11 @@ def test_docker_sandbox_client_executes_with_process_and_output_limits() -> None
     assert process_runner.calls == [
         (
             (
-                "/opt/review-agent/bin/sbx",
+                "/opt/specode-review/bin/sbx",
                 "exec",
                 "--workdir",
                 "/home/agent/review/repo",
-                "review-agent-" + "b" * 32,
+                "specode-review-" + "b" * 32,
                 "prlimit",
                 "--nproc=72",
                 "--",
@@ -745,10 +749,10 @@ def test_docker_sandbox_client_executes_with_process_and_output_limits() -> None
 
 def test_docker_sandbox_client_lists_names_and_forces_bounded_removal() -> None:
     process_runner = RecordingProcessRunner(
-        stdout=b"review-agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nunrelated\n"
+        stdout=b"specode-review-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nunrelated\n"
     )
     client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=process_runner,
         environment={},
         config=SandboxOperationPolicy(
@@ -758,15 +762,15 @@ def test_docker_sandbox_client_lists_names_and_forces_bounded_removal() -> None:
     )
 
     names = client.list_names()
-    client.remove("review-agent-" + "a" * 32)
+    client.remove("specode-review-" + "a" * 32)
 
     assert names == (
-        "review-agent-" + "a" * 32,
+        "specode-review-" + "a" * 32,
         "unrelated",
     )
     assert process_runner.calls == [
         (
-            ("/opt/review-agent/bin/sbx", "ls", "--quiet"),
+            ("/opt/specode-review/bin/sbx", "ls", "--quiet"),
             ProcessOptions(
                 output_max_bytes=16_384,
                 stage="sandbox_list",
@@ -777,10 +781,10 @@ def test_docker_sandbox_client_lists_names_and_forces_bounded_removal() -> None:
         ),
         (
             (
-                "/opt/review-agent/bin/sbx",
+                "/opt/specode-review/bin/sbx",
                 "rm",
                 "--force",
-                "review-agent-" + "a" * 32,
+                "specode-review-" + "a" * 32,
             ),
             ProcessOptions(
                 output_max_bytes=16_384,
@@ -801,12 +805,12 @@ def test_docker_sandbox_client_does_not_forward_raw_credentials(
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     process_runner = RecordingProcessRunner()
     client = DockerSandboxClient(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=process_runner,
     )
 
     client.create_codex(
-        name="review-agent-" + "d" * 32,
+        name="specode-review-" + "d" * 32,
         control=tmp_path / "codex-control",
         checkout=tmp_path / "codex-checkout",
         kit=tmp_path / "review-kit",

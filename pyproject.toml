@@ -1,5 +1,5 @@
 [project]
-name = "review-agent"
+name = "specode-review"
 version = "0.1.0"
 description = "Bounded, exact-revision pull request review service"
 requires-python = ">=3.12"
@@ -12,8 +12,8 @@ dependencies = [
 ]
 
 [project.scripts]
-review-agent = "review_agent.production:main"
-review-agent-real-e2e = "review_agent.campaign:campaign_main"
+specode-review = "specode_review.production:main"
+specode-review-real-e2e = "specode_review.campaign:campaign_main"
 
 [dependency-groups]
 dev = [
@@ -37,6 +37,7 @@ markers = [
 ]
 
 [tool.ruff]
+extend-exclude = ["brand", "libero", "tasks"]
 line-length = 100
 target-version = "py312"
 
@@ -53,4 +54,4 @@ ignore = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["review_agent"]
+packages = ["specode_review"]

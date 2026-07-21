@@ -8,16 +8,16 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from review_agent import (
+from specode_review import (
     DiffRange,
     ReviewRequest,
     ReviewResult,
     publish_review_result,
     render_review_comment,
 )
-from review_agent.deadline import ReviewDeadline, review_deadline_scope
-from review_agent.errors import FailureCategory, ReviewError
-from review_agent.github import GitHubAppClient, GitHubError, GitHubMutationError
+from specode_review.deadline import ReviewDeadline, review_deadline_scope
+from specode_review.errors import FailureCategory, ReviewError
+from specode_review.github import GitHubAppClient, GitHubError, GitHubMutationError
 
 
 def _private_key(tmp_path: Path) -> tuple[Path, bytes]:
@@ -61,7 +61,6 @@ def test_installation_token_is_scoped_to_the_configured_repository(tmp_path: Pat
         assert json.loads(request.content) == {
             "repositories": ["example"],
             "permissions": {
-                "checks": "write",
                 "contents": "read",
                 "pull_requests": "write",
             },
@@ -119,7 +118,7 @@ def test_successful_result_creates_one_top_level_pull_request_comment(tmp_path: 
         assert request.headers["Authorization"] == "Bearer ghs_installation_token"
         body = json.loads(request.content)["body"]
         assert body.startswith(render_review_comment(result))
-        assert "<!-- review-agent:v1:" in body
+        assert "<!-- specode-review:v1:" in body
         return httpx.Response(
             201,
             json={

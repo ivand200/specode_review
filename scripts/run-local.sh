@@ -117,10 +117,10 @@ github_webhook_url() {
 import os
 from pathlib import Path
 
-from review_agent.github import GitHubAppClient
+from specode_review.github import GitHubAppClient
 
 github = GitHubAppClient(
-    repository=os.environ["GITHUB_REPOSITORY"],
+    repository="unused/unused",
     app_id=int(os.environ["GITHUB_APP_ID"]),
     private_key_path=Path(os.environ["GITHUB_PRIVATE_KEY_PATH"]),
 )
@@ -141,15 +141,21 @@ wait_for_github_webhook_url() {
             printf 'Unable to read the GitHub App webhook configuration.\n' >&2
             return 1
         fi
-        if [[ "${configured_url}" == "${expected_url}" ]]; then
-            return 0
-        fi
         if [[ "${configured_url}" != "${last_reported_url}" ]]; then
-            printf 'GitHub App webhook URL mismatch.\n' >&2
+            if [[ "${configured_url}" == "${expected_url}" ]]; then
+                printf 'GitHub App webhook URL matches.\n' >&2
+            else
+                printf 'GitHub App webhook URL mismatch.\n' >&2
+            fi
             printf 'Configured: %s\n' "${configured_url}" >&2
             printf 'Expected:   %s\n' "${expected_url}" >&2
-            printf 'Update the GitHub App webhook URL. Waiting for it to match; press Ctrl+C to stop.\n' >&2
+            if [[ "${configured_url}" != "${expected_url}" ]]; then
+                printf 'Update the GitHub App webhook URL. Waiting for it to match; press Ctrl+C to stop.\n' >&2
+            fi
             last_reported_url="${configured_url}"
+        fi
+        if [[ "${configured_url}" == "${expected_url}" ]]; then
+            return 0
         fi
         sleep 5
     done
@@ -185,6 +191,12 @@ set -a
 source "${ENV_FILE}"
 set +a
 
+if [[ -z "${GITHUB_PRIVATE_KEY_PATH:-}" ]]; then
+    printf 'GITHUB_PRIVATE_KEY_PATH is required by the local launcher.\n' >&2
+    printf 'Set it in %s to the absolute path of your GitHub App private key.\n' "${ENV_FILE}" >&2
+    exit 2
+fi
+
 REQUESTED_NGROK_URL="${1:-${NGROK_URL:-}}"
 REQUESTED_NGROK_URL="${REQUESTED_NGROK_URL%/}"
 if [[ -n "${REQUESTED_NGROK_URL}" ]]; then
@@ -211,14 +223,6 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-printf 'Starting review service...\n'
-uv run review-agent &
-SERVICE_PID=$!
-
-if ! wait_for_url "${LOCAL_HEALTH_URL}" "${SERVICE_PID}" 60 "review service"; then
-    exit 1
-fi
-
 if [[ -n "${REQUESTED_NGROK_URL}" ]]; then
     printf 'Starting ngrok at %s...\n' "${REQUESTED_NGROK_URL}"
     ngrok http 8000 \
@@ -237,17 +241,28 @@ if ! wait_for_ngrok_url "${NGROK_PID}" 30; then
     exit 1
 fi
 
+EXPECTED_WEBHOOK_URL="${NGROK_PUBLIC_URL}/webhooks/github"
+export PUBLIC_WEBHOOK_URL="${EXPECTED_WEBHOOK_URL}"
+
+printf 'Starting review service with webhook URL %s...\n' "${EXPECTED_WEBHOOK_URL}"
+uv run python -c \
+    'from specode_review.production import local_main; local_main()' &
+SERVICE_PID=$!
+
+if ! wait_for_url "${LOCAL_HEALTH_URL}" "${SERVICE_PID}" 60 "review service"; then
+    exit 1
+fi
+
 if ! wait_for_url "${NGROK_PUBLIC_URL}/health/ready" "${NGROK_PID}" 30 "ngrok tunnel"; then
     exit 1
 fi
 
-EXPECTED_WEBHOOK_URL="${NGROK_PUBLIC_URL}/webhooks/github"
 printf 'Verifying GitHub App webhook URL...\n'
 if ! wait_for_github_webhook_url "${EXPECTED_WEBHOOK_URL}"; then
     exit 1
 fi
 
-printf '\nReview Agent is ready.\n'
+printf '\nSpeCodeReview is ready.\n'
 printf 'Webhook URL: %s\n' "${EXPECTED_WEBHOOK_URL}"
 if [[ -z "${REQUESTED_NGROK_URL}" ]]; then
     printf 'Ensure the GitHub App webhook URL matches the free dev-domain URL shown above.\n'

@@ -1,10 +1,10 @@
 import subprocess
 from pathlib import Path
 
-from review_agent import SandboxResourceLimits
-from review_agent.configuration import SandboxOperationPolicy
-from review_agent.process import ProcessOptions
-from review_agent.resources import AttemptResources
+from specode_review import SandboxResourceLimits
+from specode_review.configuration import SandboxOperationPolicy
+from specode_review.process import ProcessOptions
+from specode_review.resources import AttemptResources
 from tests.integration.no_model_sandbox_probe import NoModelDockerSandboxProbe
 
 
@@ -26,7 +26,7 @@ def test_test_only_probe_creates_a_bounded_network_denied_shell_sandbox(
 ) -> None:
     process_runner = RecordingProcessRunner()
     probe = NoModelDockerSandboxProbe(
-        executable=Path("/opt/review-agent/bin/sbx"),
+        executable=Path("/opt/specode-review/bin/sbx"),
         process_runner=process_runner,
         environment={},
         config=SandboxOperationPolicy(
@@ -37,7 +37,7 @@ def test_test_only_probe_creates_a_bounded_network_denied_shell_sandbox(
     resources = AttemptResources.for_attempt(
         "a" * 32,
         workspace_root=tmp_path / "workspaces",
-        sandbox_prefix="review-agent-it-",
+        sandbox_prefix="specode-review-it-",
     )
     control = tmp_path / "control"
     checkout = tmp_path / "checkout"
@@ -57,7 +57,7 @@ def test_test_only_probe_creates_a_bounded_network_denied_shell_sandbox(
     assert process_runner.calls == [
         (
             (
-                "/opt/review-agent/bin/sbx",
+                "/opt/specode-review/bin/sbx",
                 "create",
                 "--quiet",
                 "--name",
@@ -74,7 +74,7 @@ def test_test_only_probe_creates_a_bounded_network_denied_shell_sandbox(
         ),
         (
             (
-                "/opt/review-agent/bin/sbx",
+                "/opt/specode-review/bin/sbx",
                 "policy",
                 "deny",
                 "network",

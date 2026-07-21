@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from review_agent import (
+from specode_review import (
     AgentReview,
     CandidateAcceptance,
     DiffRange,
@@ -23,10 +23,10 @@ from review_agent import (
     publish_review_result,
     render_review_comment,
 )
-from review_agent.configuration import CANDIDATE_OUTPUT_MAX_BYTES
-from review_agent.core import CandidateContract
-from review_agent.github import ReviewComment, ReviewCommentApp
-from review_agent.resources import AttemptResources
+from specode_review.configuration import CANDIDATE_OUTPUT_MAX_BYTES
+from specode_review.core import CandidateContract
+from specode_review.github import ReviewComment, ReviewCommentApp
+from specode_review.resources import AttemptResources
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -142,7 +142,7 @@ def _acceptance(
 def _resources(
     workspace_root: Path,
     *,
-    sandbox_prefix: str = "review-agent-",
+    sandbox_prefix: str = "specode-review-",
 ) -> AttemptResources:
     return AttemptResources.for_attempt(
         "a" * 32,
@@ -381,8 +381,8 @@ def test_review_uses_the_exact_head_and_one_merge_base_range(tmp_path: Path) -> 
 def test_reviewer_construction_does_not_sweep_owned_workspaces(tmp_path: Path) -> None:
     workspace_root = tmp_path / "workspaces"
     workspace_root.mkdir()
-    owned = workspace_root / ("review-agent-workspace-" + "a" * 32)
-    similarly_named = workspace_root / "review-agent-workspace-not-a-uuid"
+    owned = workspace_root / ("specode-review-workspace-" + "a" * 32)
+    similarly_named = workspace_root / "specode-review-workspace-not-a-uuid"
     unrelated = workspace_root / ("other-" + "b" * 32)
     owned.mkdir()
     similarly_named.mkdir()
@@ -681,7 +681,7 @@ def test_review_fails_when_successful_workspace_cleanup_fails(
     def fail_cleanup(*_args: object, **_kwargs: object) -> None:
         raise OSError(cleanup_error)
 
-    monkeypatch.setattr("review_agent.core.shutil.rmtree", fail_cleanup)
+    monkeypatch.setattr("specode_review.core.shutil.rmtree", fail_cleanup)
 
     with pytest.raises(ReviewError) as failure:
         reviewer.review(request)
@@ -1018,7 +1018,7 @@ def test_reviewer_uses_only_its_assigned_attempt_workspace(tmp_path: Path) -> No
     reviewer.review(request)
 
     assert set(runner.workspaces) == {
-        tmp_path / "workspaces" / ("review-agent-workspace-" + "a" * 32)
+        tmp_path / "workspaces" / ("specode-review-workspace-" + "a" * 32)
     }
     assert all(not workspace.exists() for workspace in runner.workspaces)
 

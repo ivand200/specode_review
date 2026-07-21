@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from review_agent import (
+from specode_review import (
     AgentReview,
     CandidateAcceptance,
     ChangedPathManifest,
@@ -15,7 +15,7 @@ from review_agent import (
     ReviewRequest,
     SandboxResourceLimits,
 )
-from review_agent.core import CandidateContract
+from specode_review.core import CandidateContract
 
 
 class RecordingCandidateAdapter:
